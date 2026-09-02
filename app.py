@@ -21,14 +21,17 @@ st.markdown("El sistema leerá automáticamente todo el historial de la carpeta 
 # ========================================================
 @st.cache_resource(show_spinner="Leyendo carpeta y entrenando modelo... esto puede tomar unos segundos.")
 def cargar_y_entrenar(ruta):
+    # Limpiar la ruta para evitar problemas con caracteres de escape de Windows (\N, \D, etc.)
+    ruta = os.path.normpath(ruta.strip('"\''))
+    
     if not os.path.exists(ruta):
-        raise ValueError("La ruta de la carpeta no existe. Verifica que esté bien escrita.")
+        raise ValueError(f"La ruta no existe o no es accesible: {ruta}")
         
     patron_busqueda = os.path.join(ruta, ".xls")
     archivos_excel = glob.glob(patron_busqueda)
     
     if len(archivos_excel) == 0:
-        raise ValueError("No se encontraron archivos Excel en la carpeta.")
+        raise ValueError(f"No se encontraron archivos Excel en la ruta: {ruta}")
         
     lista_dfs = []
     
@@ -38,7 +41,7 @@ def cargar_y_entrenar(ruta):
             df_temp = pd.read_excel(archivo, engine='openpyxl')
             lista_dfs.append(df_temp)
         except Exception:
-            pass # Si un archivo falla, lo omite silenciosamente para no detener todo
+            pass # Omite archivos dañados o temporales
             
     if not lista_dfs:
         raise ValueError("Se encontraron archivos, pero ninguno se pudo leer correctamente.")
@@ -72,7 +75,7 @@ def cargar_y_entrenar(ruta):
     df_modelo = df.dropna(subset=['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras', 'Monto de ventas']).copy()
 
     if df_modelo.empty:
-        raise ValueError("Después de procesar los datos, no hay historial suficiente (se requieren al menos 3 semanas consecutivas por producto) para entrenar el modelo.")
+        raise ValueError("No hay historial suficiente (se requieren al menos 3 semanas consecutivas por producto).")
 
     # 4. Entrenamiento
     X = df_modelo[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']]
@@ -104,7 +107,6 @@ if ruta_carpeta:
     try:
         df_global, modelo_rf, wape_val, mae_val = cargar_y_entrenar(ruta_carpeta)
         
-        # Mostrar métricas de rendimiento
         st.success("¡Archivos cargados y modelo entrenado con éxito!")
         col_m1, col_m2 = st.columns(2)
         with col_m1:
@@ -114,7 +116,6 @@ if ruta_carpeta:
             
         st.markdown("---")
         
-        # Preparar lista desplegable de productos
         st.subheader("2. Simulación de Días de Inventario")
         
         df_validos = df_global.dropna(subset=['Codigo']).copy()
