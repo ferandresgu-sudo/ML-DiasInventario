@@ -1,3 +1,5 @@
+import os
+import glob
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,25 +14,34 @@ st.set_page_config(
 )
 
 st.title("📦 Simulador Predictivo de Días de Inventario")
-st.markdown("Sube tus reportes históricos para entrenar el modelo y simular proyecciones de stock.")
+st.markdown("El sistema leerá automáticamente todo el historial de la carpeta asignada para entrenar el modelo.")
 
 # ========================================================
 # FUNCIÓN CACHEADA PARA PROCESAMIENTO Y ENTRENAMIENTO
 # ========================================================
-@st.cache_resource(show_spinner="Entrenando modelo de Machine Learning... esto puede tomar unos segundos.")
-def cargar_y_entrenar(archivos):
+@st.cache_resource(show_spinner="Leyendo carpeta y entrenando modelo... esto puede tomar unos segundos.")
+def cargar_y_entrenar(ruta):
+    if not os.path.exists(ruta):
+        raise ValueError("La ruta de la carpeta no existe. Verifica que esté bien escrita.")
+        
+    patron_busqueda = os.path.join(ruta, ".xls")
+    archivos_excel = glob.glob(patron_busqueda)
+    
+    if len(archivos_excel) == 0:
+        raise ValueError("No se encontraron archivos Excel en la carpeta.")
+        
     lista_dfs = []
     
     # 1. Consolidación
-    for archivo in archivos:
+    for archivo in archivos_excel:
         try:
-            df_temp = pd.read_excel(archivo)
+            df_temp = pd.read_excel(archivo, engine='openpyxl')
             lista_dfs.append(df_temp)
-        except Exception as e:
-            st.error(f"Error al leer {archivo.name}: {e}")
+        except Exception:
+            pass # Si un archivo falla, lo omite silenciosamente para no detener todo
             
     if not lista_dfs:
-        return None, None, None, None
+        raise ValueError("Se encontraron archivos, pero ninguno se pudo leer correctamente.")
         
     df = pd.concat(lista_dfs, ignore_index=True)
     
@@ -40,16 +51,11 @@ def cargar_y_entrenar(archivos):
 
     for col in df.columns:
         col_lower = col.lower()
-        if 'descrip' in col_lower:
-            df.rename(columns={col: 'Descripcion'}, inplace=True)
-        elif 'inventario' in col_lower and 'monto' not in col_lower and 'total' not in col_lower:
-            df.rename(columns={col: 'Inventario'}, inplace=True) 
-        elif 'venta' in col_lower:
-            df.rename(columns={col: 'Monto de ventas'}, inplace=True)
-        elif 'codigo' in col_lower or 'código' in col_lower:
-            df.rename(columns={col: 'Codigo'}, inplace=True)
-        elif 'semana' in col_lower:
-            df.rename(columns={col: 'Semana'}, inplace=True)
+        if 'descrip' in col_lower: df.rename(columns={col: 'Descripcion'}, inplace=True)
+        elif 'inventario' in col_lower and 'monto' not in col_lower and 'total' not in col_lower: df.rename(columns={col: 'Inventario'}, inplace=True) 
+        elif 'venta' in col_lower: df.rename(columns={col: 'Monto de ventas'}, inplace=True)
+        elif 'codigo' in col_lower or 'código' in col_lower: df.rename(columns={col: 'Codigo'}, inplace=True)
+        elif 'semana' in col_lower: df.rename(columns={col: 'Semana'}, inplace=True)
 
     df = df.loc[:, ~df.columns.duplicated()]
 
@@ -64,6 +70,9 @@ def cargar_y_entrenar(archivos):
     df['Venta_2_Semanas_Atras'] = df.groupby('Codigo')['Monto de ventas'].shift(2)
 
     df_modelo = df.dropna(subset=['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras', 'Monto de ventas']).copy()
+
+    if df_modelo.empty:
+        raise ValueError("Después de procesar los datos, no hay historial suficiente (se requieren al menos 3 semanas consecutivas por producto) para entrenar el modelo.")
 
     # 4. Entrenamiento
     X = df_modelo[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']]
@@ -85,18 +94,18 @@ def cargar_y_entrenar(archivos):
 # ========================================================
 # INTERFAZ DE USUARIO
 # ========================================================
-archivos_subidos = st.file_uploader(
-    "1. Selecciona los archivos Excel (FCTDiasInventario)", 
-    type=["xlsx", "xls", "xlsm"], 
-    accept_multiple_files=True
+st.subheader("1. Origen de los Datos")
+ruta_carpeta = st.text_input(
+    "Ruta de la carpeta con reportes históricos:",
+    value=r"C:\Users\MXCabrerFe\OneDrive - NESTLE\DASHBOARD FLORIDO ABARROTES Y CARNES\FCTDiasInventario"
 )
 
-if archivos_subidos:
-    df_global, modelo_rf, wape_val, mae_val = cargar_y_entrenar(archivos_subidos)
-    
-    if df_global is not None and modelo_rf is not None:
+if ruta_carpeta:
+    try:
+        df_global, modelo_rf, wape_val, mae_val = cargar_y_entrenar(ruta_carpeta)
+        
         # Mostrar métricas de rendimiento
-        st.success("¡Archivos consolidados y modelo entrenado con éxito!")
+        st.success("¡Archivos cargados y modelo entrenado con éxito!")
         col_m1, col_m2 = st.columns(2)
         with col_m1:
             st.metric("Error WAPE (Global)", f"{wape_val:.2f}%")
@@ -108,11 +117,9 @@ if archivos_subidos:
         # Preparar lista desplegable de productos
         st.subheader("2. Simulación de Días de Inventario")
         
-        # Filtrar solo códigos válidos y obtener la última descripción
         df_validos = df_global.dropna(subset=['Codigo']).copy()
         df_ultimos = df_validos.sort_values('Semana').groupby('Codigo').tail(1)
         
-        # Crear diccionario para el selectbox {codigo: "codigo - descripcion"}
         opciones_productos = {}
         for _, row in df_ultimos.iterrows():
             cod = int(row['Codigo'])
@@ -137,16 +144,13 @@ if archivos_subidos:
             )
             
         if st.button("🔮 Calcular Proyección", type="primary"):
-            # Extraer datos de la última semana del producto
             df_producto = df_global[df_global['Codigo'] == codigo_seleccionado].copy()
             df_producto = df_producto[df_producto['Semana'] == df_producto['Semana'].max()]
             
             if not df_producto.empty:
-                # Preparamos las métricas para predecir (Shift de las columnas)
                 venta_actual = df_producto['Monto de ventas'].values[0]
                 venta_1_atras = df_producto['Venta_1_Semana_Atras'].values[0]
                 
-                # Para predecir el futuro, la "venta actual" pasa a ser la de 1 semana atrás
                 X_futuro = pd.DataFrame({
                     'Venta_1_Semana_Atras': [venta_actual],
                     'Venta_2_Semanas_Atras': [venta_1_atras]
@@ -161,7 +165,6 @@ if archivos_subidos:
                 inv_futuro = inv_actual + monto_enviar
                 dias_inv = (inv_futuro / prediccion) * 30
                 
-                # Tarjetas de resultados
                 st.markdown("### 📊 Resultados de la Predicción")
                 r1, r2, r3 = st.columns(3)
                 r1.info(f"*Inventario en Sistema:*\n\n${inv_actual:,.2f}")
@@ -171,3 +174,6 @@ if archivos_subidos:
                 st.progress(min(int(dias_inv), 100) / 100, text="Nivel de Cobertura (hasta 100 días)")
             else:
                 st.warning("No hay datos suficientes para realizar la predicción de este producto.")
+                
+    except Exception as e:
+        st.error(f"Error al procesar: {e}")
