@@ -1,0 +1,173 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error
+
+# ========================================================
+# CONFIGURACIÓN DE LA PÁGINA
+# ========================================================
+st.set_page_config(
+    page_title="Predicción de Inventario", page_icon="📦", layout="wide"
+)
+
+st.title("📦 Simulador Predictivo de Días de Inventario")
+st.markdown("Sube tus reportes históricos para entrenar el modelo y simular proyecciones de stock.")
+
+# ========================================================
+# FUNCIÓN CACHEADA PARA PROCESAMIENTO Y ENTRENAMIENTO
+# ========================================================
+@st.cache_resource(show_spinner="Entrenando modelo de Machine Learning... esto puede tomar unos segundos.")
+def cargar_y_entrenar(archivos):
+    lista_dfs = []
+    
+    # 1. Consolidación
+    for archivo in archivos:
+        try:
+            df_temp = pd.read_excel(archivo)
+            lista_dfs.append(df_temp)
+        except Exception as e:
+            st.error(f"Error al leer {archivo.name}: {e}")
+            
+    if not lista_dfs:
+        return None, None, None, None
+        
+    df = pd.concat(lista_dfs, ignore_index=True)
+    
+    # 2. Limpieza Extrema
+    nuevas_columnas = [str(col).strip().split('[')[-1].replace(']', '') for col in df.columns]
+    df.columns = nuevas_columnas
+
+    for col in df.columns:
+        col_lower = col.lower()
+        if 'descrip' in col_lower:
+            df.rename(columns={col: 'Descripcion'}, inplace=True)
+        elif 'inventario' in col_lower and 'monto' not in col_lower and 'total' not in col_lower:
+            df.rename(columns={col: 'Inventario'}, inplace=True) 
+        elif 'venta' in col_lower:
+            df.rename(columns={col: 'Monto de ventas'}, inplace=True)
+        elif 'codigo' in col_lower or 'código' in col_lower:
+            df.rename(columns={col: 'Codigo'}, inplace=True)
+        elif 'semana' in col_lower:
+            df.rename(columns={col: 'Semana'}, inplace=True)
+
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    # 3. Ingeniería de Características
+    df['Codigo'] = pd.to_numeric(df['Codigo'], errors='coerce')
+    df['Semana'] = pd.to_numeric(df['Semana'], errors='coerce')
+    df['Monto de ventas'] = pd.to_numeric(df['Monto de ventas'], errors='coerce')
+    df['Inventario'] = pd.to_numeric(df['Inventario'], errors='coerce')
+
+    df = df.sort_values(by=['Codigo', 'Semana'])
+    df['Venta_1_Semana_Atras'] = df.groupby('Codigo')['Monto de ventas'].shift(1)
+    df['Venta_2_Semanas_Atras'] = df.groupby('Codigo')['Monto de ventas'].shift(2)
+
+    df_modelo = df.dropna(subset=['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras', 'Monto de ventas']).copy()
+
+    # 4. Entrenamiento
+    X = df_modelo[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']]
+    y = df_modelo['Monto de ventas']
+
+    modelo = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)
+    modelo.fit(X, y)
+
+    # Evaluación
+    predicciones = modelo.predict(X)
+    suma_errores = np.sum(np.abs(y - predicciones))
+    suma_ventas = np.sum(y)
+    
+    wape = (suma_errores / suma_ventas) * 100 if suma_ventas > 0 else 0.0
+    mae = mean_absolute_error(y, predicciones)
+
+    return df, modelo, wape, mae
+
+# ========================================================
+# INTERFAZ DE USUARIO
+# ========================================================
+archivos_subidos = st.file_uploader(
+    "1. Selecciona los archivos Excel (FCTDiasInventario)", 
+    type=["xlsx", "xls", "xlsm"], 
+    accept_multiple_files=True
+)
+
+if archivos_subidos:
+    df_global, modelo_rf, wape_val, mae_val = cargar_y_entrenar(archivos_subidos)
+    
+    if df_global is not None and modelo_rf is not None:
+        # Mostrar métricas de rendimiento
+        st.success("¡Archivos consolidados y modelo entrenado con éxito!")
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            st.metric("Error WAPE (Global)", f"{wape_val:.2f}%")
+        with col_m2:
+            st.metric("Error Promedio (MAE)", f"${mae_val:,.2f} MXN")
+            
+        st.markdown("---")
+        
+        # Preparar lista desplegable de productos
+        st.subheader("2. Simulación de Días de Inventario")
+        
+        # Filtrar solo códigos válidos y obtener la última descripción
+        df_validos = df_global.dropna(subset=['Codigo']).copy()
+        df_ultimos = df_validos.sort_values('Semana').groupby('Codigo').tail(1)
+        
+        # Crear diccionario para el selectbox {codigo: "codigo - descripcion"}
+        opciones_productos = {}
+        for _, row in df_ultimos.iterrows():
+            cod = int(row['Codigo'])
+            desc = row['Descripcion'] if 'Descripcion' in df_ultimos.columns else 'Desconocido'
+            opciones_productos[cod] = f"{cod} - {desc}"
+            
+        col_sim1, col_sim2 = st.columns(2)
+        
+        with col_sim1:
+            codigo_seleccionado = st.selectbox(
+                "Selecciona el Producto a analizar:", 
+                options=list(opciones_productos.keys()),
+                format_func=lambda x: opciones_productos[x]
+            )
+            
+        with col_sim2:
+            monto_enviar = st.number_input(
+                "Monto de mercancía a enviar ($):", 
+                min_value=0.0, 
+                value=10000.0, 
+                step=1000.0
+            )
+            
+        if st.button("🔮 Calcular Proyección", type="primary"):
+            # Extraer datos de la última semana del producto
+            df_producto = df_global[df_global['Codigo'] == codigo_seleccionado].copy()
+            df_producto = df_producto[df_producto['Semana'] == df_producto['Semana'].max()]
+            
+            if not df_producto.empty:
+                # Preparamos las métricas para predecir (Shift de las columnas)
+                venta_actual = df_producto['Monto de ventas'].values[0]
+                venta_1_atras = df_producto['Venta_1_Semana_Atras'].values[0]
+                
+                # Para predecir el futuro, la "venta actual" pasa a ser la de 1 semana atrás
+                X_futuro = pd.DataFrame({
+                    'Venta_1_Semana_Atras': [venta_actual],
+                    'Venta_2_Semanas_Atras': [venta_1_atras]
+                })
+                
+                prediccion = modelo_rf.predict(X_futuro)[0]
+                prediccion = 0.01 if pd.isna(prediccion) or prediccion <= 0 else prediccion
+                
+                inv_actual = df_producto['Inventario'].values[0]
+                inv_actual = 0 if pd.isna(inv_actual) else inv_actual
+                
+                inv_futuro = inv_actual + monto_enviar
+                dias_inv = (inv_futuro / prediccion) * 30
+                
+                # Tarjetas de resultados
+                st.markdown("### 📊 Resultados de la Predicción")
+                r1, r2, r3 = st.columns(3)
+                r1.info(f"*Inventario en Sistema:*\n\n${inv_actual:,.2f}")
+                r2.info(f"*Venta Estimada (Próx. Sem):*\n\n${prediccion:,.2f}")
+                r3.success(f"*Días de Inventario Esperados:*\n\n{dias_inv:.1f} días")
+                
+                st.progress(min(int(dias_inv), 100) / 100, text="Nivel de Cobertura (hasta 100 días)")
+            else:
+                st.warning("No hay datos suficientes para realizar la predicción de este producto.")
