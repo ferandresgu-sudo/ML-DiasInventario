@@ -1,5 +1,5 @@
 streamlit
 pandas
 numpy
-openyxl
+openpyxl
 scikit-learn
