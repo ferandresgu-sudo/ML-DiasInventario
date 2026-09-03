@@ -1,45 +1,4 @@
-import os
-import glob
 import streamlit as st
-import pandas as pd
-import numpy as np
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error
-
-# ========================================================
-# CONFIGURACIÓN DE LA PÁGINA
-# ========================================================
-st.set_page_config(
-    page_title="Predicción de Inventario", page_icon="📦", layout="wide"
-)
-
-st.title("📦 Simulador Predictivo de Días de Inventario")
-st.markdown("El sistema leerá automáticamente todo el historial de la carpeta asignada para entrenar el modelo.")
-
-# ========================================================
-# FUNCIÓN CACHEADA PARA PROCESAMIENTO Y ENTRENAMIENTO
-# =====================================================…
-[10:17 a.m., 3/9/2026] Fernando Cabrera: import streamlit as st
-import pandas as pd
-import numpy as np
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error
-
-# ========================================================
-# CONFIGURACIÓN DE LA PÁGINA
-# ========================================================
-st.set_page_config(
-    page_title="Predicción de Inventario", page_icon="📦", layout="wide"
-)
-
-st.title("📦 Simulador Predictivo de Días de Inventario")
-st.markdown("Sube todos los archivos de tu carpeta histórica para entrenar el modelo automáticamente.")
-
-# ========================================================
-# FUNCIÓN CACHEADA PARA PROCESAMIENTO Y ENTRENAMIENTO
-# ========================================================
-@st.cache_resource(show_spin…
-[10:26 a.m., 3/9/2026] Fernando Cabrera: import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
@@ -58,7 +17,7 @@ st.markdown("Sube todos los archivos de tu carpeta histórica para entrenar el m
 # ========================================================
 # FUNCIÓN CACHEADA PARA PROCESAMIENTO Y ENTRENAMIENTO
 # ========================================================
-@st.cache_resource(show_spinner="Procesando archivos y entrenando modelo... esto puede tomar unos segundos.")
+@st.cache_resource(show_spinner="Procesando archivos y entrenando modelo, esto puede tomar unos segundos.")
 def cargar_y_entrenar(archivos_subidos):
     lista_dfs = []
     
@@ -71,7 +30,7 @@ def cargar_y_entrenar(archivos_subidos):
             pass # Omite archivos dañados o no compatibles
             
     if not lista_dfs:
-        raise ValueError("No se pudo leer ningún archivo correctamente.")
+        raise ValueError("No se pudo leer ningun archivo correctamente.")
         
     df = pd.concat(lista_dfs, ignore_index=True)
     
@@ -135,7 +94,7 @@ if archivos_subidos:
     try:
         df_global, modelo_rf, wape_val, mae_val = cargar_y_entrenar(archivos_subidos)
         
-        st.success("¡Archivos cargados y modelo entrenado con éxito!")
+        st.success("Archivos cargados y modelo entrenado con exito!")
         col_m1, col_m2 = st.columns(2)
         with col_m1:
             st.metric("Error WAPE (Global)", f"{wape_val:.2f}%")
@@ -144,7 +103,7 @@ if archivos_subidos:
             
         st.markdown("---")
         
-        st.subheader("2. Simulación y Tendencia de Producto")
+        st.subheader("2. Simulacion y Tendencia de Producto")
         
         df_validos = df_global.dropna(subset=['Codigo']).copy()
         df_ultimos = df_validos.sort_values('Semana').groupby('Codigo').tail(1)
@@ -166,7 +125,7 @@ if archivos_subidos:
             
         with col_sim2:
             monto_enviar = st.number_input(
-                "Monto de mercancía a enviar ($):", 
+                "Monto de mercancia a enviar ($):", 
                 min_value=0.0, 
                 value=10000.0, 
                 step=1000.0
@@ -178,7 +137,7 @@ if archivos_subidos:
         df_hist_prod = df_global[df_global['Codigo'] == codigo_seleccionado].sort_values('Semana')
         
         if not df_hist_prod.empty:
-            st.markdown("#### 📈 Comportamiento Histórico de Ventas ($)")
+            st.markdown("#### 📈 Comportamiento Historico de Ventas ($)")
             
             # Preparar datos para la gráfica
             chart_data = df_hist_prod.set_index('Semana')[['Monto de ventas']]
@@ -187,7 +146,7 @@ if archivos_subidos:
         # ----------------------------------------------------
         # BOTÓN DE SIMULACIÓN Y RESULTADOS
         # ----------------------------------------------------
-        if st.button("🔮 Calcular Proyección", type="primary"):
+        if st.button("🔮 Calcular Proyeccion", type="primary"):
             df_producto = df_global[df_global['Codigo'] == codigo_seleccionado].copy()
             df_producto = df_producto[df_producto['Semana'] == df_producto['Semana'].max()]
             
@@ -209,15 +168,15 @@ if archivos_subidos:
                 inv_futuro = inv_actual + monto_enviar
                 dias_inv = (inv_futuro / prediccion) * 30
                 
-                st.markdown("### 📊 Resultados de la Predicción")
+                st.markdown("### 📊 Resultados de la Prediccion")
                 r1, r2, r3 = st.columns(3)
                 r1.info(f"*Inventario en Sistema:*\n\n${inv_actual:,.2f}")
-                r2.info(f"*Venta Estimada (Próx. Sem):*\n\n${prediccion:,.2f}")
-                r3.success(f"*Días de Inventario Esperados:*\n\n{dias_inv:.1f} días")
+                r2.info(f"*Venta Estimada (Prox. Sem):*\n\n${prediccion:,.2f}")
+                r3.success(f"*Dias de Inventario Esperados:*\n\n{dias_inv:.1f} dias")
                 
-                st.progress(min(int(dias_inv), 100) / 100, text="Nivel de Cobertura (hasta 100 días)")
+                st.progress(min(int(dias_inv), 100) / 100, text="Nivel de Cobertura (hasta 100 dias)")
             else:
-                st.warning("No hay datos suficientes para realizar la predicción de este producto.")
+                st.warning("No hay datos suficientes para realizar la prediccion de este producto.")
                 
     except Exception as e:
         st.error(f"Error al procesar: {e}")
