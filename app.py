@@ -1,5 +1,3 @@
-import os
-import glob
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -14,38 +12,25 @@ st.set_page_config(
 )
 
 st.title("📦 Simulador Predictivo de Días de Inventario")
-st.markdown("El sistema leerá automáticamente todo el historial de la carpeta asignada para entrenar el modelo.")
+st.markdown("Sube todos los archivos de tu carpeta histórica para entrenar el modelo automáticamente.")
 
 # ========================================================
 # FUNCIÓN CACHEADA PARA PROCESAMIENTO Y ENTRENAMIENTO
 # ========================================================
-@st.cache_resource(show_spinner="Leyendo carpeta y entrenando modelo... esto puede tomar unos segundos.")
-def cargar_y_entrenar(ruta):
-    # Limpieza profunda de comillas, espacios y caracteres de escape de Windows
-    ruta = ruta.strip().strip('"').strip("'").strip()
-    ruta = os.path.normpath(ruta)
-    
-    if not os.path.exists(ruta):
-        raise ValueError(f"La ruta no existe o OneDrive la tiene oculta en la nube. Revisa que esté sincronizada localmente.\nRuta intentada: {ruta}")
-        
-    patron_busqueda = os.path.join(ruta, ".xls")
-    archivos_excel = glob.glob(patron_busqueda)
-    
-    if len(archivos_excel) == 0:
-        raise ValueError(f"La carpeta existe pero no se encontraron archivos Excel (.xls / .xlsx) adentro.\nRuta: {ruta}")
-        
+@st.cache_resource(show_spinner="Procesando archivos y entrenando modelo... esto puede tomar unos segundos.")
+def cargar_y_entrenar(archivos_subidos):
     lista_dfs = []
     
     # 1. Consolidación
-    for archivo in archivos_excel:
+    for archivo in archivos_subidos:
         try:
             df_temp = pd.read_excel(archivo, engine='openpyxl')
             lista_dfs.append(df_temp)
         except Exception:
-            pass # Omite archivos dañados o temporales
+            pass # Omite archivos dañados o no compatibles
             
     if not lista_dfs:
-        raise ValueError("Se encontraron archivos, pero ninguno se pudo leer correctamente.")
+        raise ValueError("No se pudo leer ningún archivo correctamente.")
         
     df = pd.concat(lista_dfs, ignore_index=True)
     
@@ -99,14 +84,15 @@ def cargar_y_entrenar(ruta):
 # INTERFAZ DE USUARIO
 # ========================================================
 st.subheader("1. Origen de los Datos")
-ruta_carpeta = st.text_input(
-    "Ruta de la carpeta con reportes históricos:",
-    value=r"C:\Users\MXCabrerFe\OneDrive - NESTLE\DASHBOARD FLORIDO ABARROTES Y CARNES\FCTDiasInventario"
+archivos_subidos = st.file_uploader(
+    "Selecciona o arrastra todos los archivos Excel de la carpeta (Ctrl + A para seleccionar todos):",
+    type=["xlsx", "xls", "xlsm"],
+    accept_multiple_files=True
 )
 
-if ruta_carpeta:
+if archivos_subidos:
     try:
-        df_global, modelo_rf, wape_val, mae_val = cargar_y_entrenar(ruta_carpeta)
+        df_global, modelo_rf, wape_val, mae_val = cargar_y_entrenar(archivos_subidos)
         
         st.success("¡Archivos cargados y modelo entrenado con éxito!")
         col_m1, col_m2 = st.columns(2)
