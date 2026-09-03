@@ -3,16 +3,17 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
+import altair as alt
 
 # ========================================================
 # CONFIGURACIÓN DE LA PÁGINA
 # ========================================================
 st.set_page_config(
-    page_title="Predicción de Inventario", page_icon="📦", layout="wide"
+    page_title="Prediccion de Inventario", page_icon="📦", layout="wide"
 )
 
-st.title("📦 Simulador Predictivo de Días de Inventario")
-st.markdown("Sube todos los archivos de tu carpeta histórica para entrenar el modelo y analizar el desempeño por producto.")
+st.title("📦 Simulador Predictivo de Dias de Inventario")
+st.markdown("Sube todos los archivos de tu carpeta historica para entrenar el modelo y analizar el desempeño por producto.")
 
 # ========================================================
 # FUNCIÓN CACHEADA PARA PROCESAMIENTO Y ENTRENAMIENTO
@@ -21,7 +22,7 @@ st.markdown("Sube todos los archivos de tu carpeta histórica para entrenar el m
 def cargar_y_entrenar(archivos_subidos):
     lista_dfs = []
     
-    # 1. Consolidación
+    # 1. Consolidacion
     for archivo in archivos_subidos:
         try:
             df_temp = pd.read_excel(archivo, engine='openpyxl')
@@ -48,7 +49,7 @@ def cargar_y_entrenar(archivos_subidos):
 
     df = df.loc[:, ~df.columns.duplicated()]
 
-    # 3. Ingeniería de Características
+    # 3. Ingenieria de Caracteristicas
     df['Codigo'] = pd.to_numeric(df['Codigo'], errors='coerce')
     df['Semana'] = pd.to_numeric(df['Semana'], errors='coerce')
     df['Monto de ventas'] = pd.to_numeric(df['Monto de ventas'], errors='coerce')
@@ -70,7 +71,7 @@ def cargar_y_entrenar(archivos_subidos):
     modelo = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)
     modelo.fit(X, y)
 
-    # Evaluación
+    # Evaluacion
     predicciones = modelo.predict(X)
     suma_errores = np.sum(np.abs(y - predicciones))
     suma_ventas = np.sum(y)
@@ -132,16 +133,25 @@ if archivos_subidos:
             )
 
         # ----------------------------------------------------
-        # GRÁFICA HISTÓRICA DE VENTAS SEMANALES
+        # GRÁFICA HISTÓRICA DE VENTAS SEMANALES CON MARCADORES
         # ----------------------------------------------------
         df_hist_prod = df_global[df_global['Codigo'] == codigo_seleccionado].sort_values('Semana')
         
         if not df_hist_prod.empty:
             st.markdown("#### 📈 Comportamiento Historico de Ventas ($)")
             
-            # Preparar datos para la gráfica
-            chart_data = df_hist_prod.set_index('Semana')[['Monto de ventas']]
-            st.line_chart(chart_data)
+            chart_data = df_hist_prod[['Semana', 'Monto de ventas']].copy()
+            
+            # Grafica Altair con linea y puntos (marcadores)
+            grafica = alt.Chart(chart_data).mark_line(point=True).encode(
+                x=alt.X('Semana:O', title='Semana'), # ":O" para que trate la semana como numero ordinal sin comas
+                y=alt.Y('Monto de ventas:Q', title='Monto de Ventas ($)'),
+                tooltip=['Semana', 'Monto de ventas']
+            ).properties(
+                height=350
+            ).interactive()
+            
+            st.altair_chart(grafica, use_container_width=True)
         
         # ----------------------------------------------------
         # BOTÓN DE SIMULACIÓN Y RESULTADOS
@@ -165,14 +175,18 @@ if archivos_subidos:
                 inv_actual = df_producto['Inventario'].values[0]
                 inv_actual = 0 if pd.isna(inv_actual) else inv_actual
                 
-                inv_futuro = inv_actual + monto_enviar
+                # AQUI ESTA LA SUMA QUE PEDISTE
+                inv_futuro = inv_actual + monto_enviar 
                 dias_inv = (inv_futuro / prediccion) * 30
                 
                 st.markdown("### 📊 Resultados de la Prediccion")
-                r1, r2, r3 = st.columns(3)
-                r1.info(f"*Inventario en Sistema:*\n\n${inv_actual:,.2f}")
-                r2.info(f"*Venta Estimada (Prox. Sem):*\n\n${prediccion:,.2f}")
-                r3.success(f"*Dias de Inventario Esperados:*\n\n{dias_inv:.1f} dias")
+                
+                # Ahora usamos 4 columnas para incluir el Inventario Total
+                r1, r2, r3, r4 = st.columns(4)
+                r1.info(f"*Inv. en Sistema:*\n\n${inv_actual:,.2f}")
+                r2.warning(f"*Inv. Total (Simulado):*\n\n${inv_futuro:,.2f}")
+                r3.info(f"*Venta Est. (Prox Sem):*\n\n${prediccion:,.2f}")
+                r4.success(f"*Dias de Inventario:*\n\n{dias_inv:.1f} dias")
                 
                 st.progress(min(int(dias_inv), 100) / 100, text="Nivel de Cobertura (hasta 100 dias)")
             else:
