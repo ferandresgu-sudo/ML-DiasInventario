@@ -1,3 +1,5 @@
+import os
+import glob
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,7 +14,46 @@ st.set_page_config(
 )
 
 st.title("📦 Simulador Predictivo de Días de Inventario")
+st.markdown("El sistema leerá automáticamente todo el historial de la carpeta asignada para entrenar el modelo.")
+
+# ========================================================
+# FUNCIÓN CACHEADA PARA PROCESAMIENTO Y ENTRENAMIENTO
+# =====================================================…
+[10:17 a.m., 3/9/2026] Fernando Cabrera: import streamlit as st
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error
+
+# ========================================================
+# CONFIGURACIÓN DE LA PÁGINA
+# ========================================================
+st.set_page_config(
+    page_title="Predicción de Inventario", page_icon="📦", layout="wide"
+)
+
+st.title("📦 Simulador Predictivo de Días de Inventario")
 st.markdown("Sube todos los archivos de tu carpeta histórica para entrenar el modelo automáticamente.")
+
+# ========================================================
+# FUNCIÓN CACHEADA PARA PROCESAMIENTO Y ENTRENAMIENTO
+# ========================================================
+@st.cache_resource(show_spin…
+[10:26 a.m., 3/9/2026] Fernando Cabrera: import streamlit as st
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error
+
+# ========================================================
+# CONFIGURACIÓN DE LA PÁGINA
+# ========================================================
+st.set_page_config(
+    page_title="Predicción de Inventario", page_icon="📦", layout="wide"
+)
+
+st.title("📦 Simulador Predictivo de Días de Inventario")
+st.markdown("Sube todos los archivos de tu carpeta histórica para entrenar el modelo y analizar el desempeño por producto.")
 
 # ========================================================
 # FUNCIÓN CACHEADA PARA PROCESAMIENTO Y ENTRENAMIENTO
@@ -103,7 +144,7 @@ if archivos_subidos:
             
         st.markdown("---")
         
-        st.subheader("2. Simulación de Días de Inventario")
+        st.subheader("2. Simulación y Tendencia de Producto")
         
         df_validos = df_global.dropna(subset=['Codigo']).copy()
         df_ultimos = df_validos.sort_values('Semana').groupby('Codigo').tail(1)
@@ -130,7 +171,22 @@ if archivos_subidos:
                 value=10000.0, 
                 step=1000.0
             )
+
+        # ----------------------------------------------------
+        # GRÁFICA HISTÓRICA DE VENTAS SEMANALES
+        # ----------------------------------------------------
+        df_hist_prod = df_global[df_global['Codigo'] == codigo_seleccionado].sort_values('Semana')
+        
+        if not df_hist_prod.empty:
+            st.markdown("#### 📈 Comportamiento Histórico de Ventas ($)")
             
+            # Preparar datos para la gráfica
+            chart_data = df_hist_prod.set_index('Semana')[['Monto de ventas']]
+            st.line_chart(chart_data)
+        
+        # ----------------------------------------------------
+        # BOTÓN DE SIMULACIÓN Y RESULTADOS
+        # ----------------------------------------------------
         if st.button("🔮 Calcular Proyección", type="primary"):
             df_producto = df_global[df_global['Codigo'] == codigo_seleccionado].copy()
             df_producto = df_producto[df_producto['Semana'] == df_producto['Semana'].max()]
