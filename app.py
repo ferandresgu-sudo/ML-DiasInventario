@@ -86,7 +86,7 @@ def cargar_y_entrenar(archivos_subidos):
 # ========================================================
 st.subheader("1. Origen de los Datos")
 archivos_subidos = st.file_uploader(
-    "Selecciona o arrastra todos los archivos Excel de la carpeta (Ctrl + A para seleccionar todos):",
+    "Selecciona o arrastra todos los archivos Excel de la carpeta (Ctrl + E para seleccionar todos):",
     type=["xlsx", "xls", "xlsm"],
     accept_multiple_files=True
 )
