@@ -142,11 +142,22 @@ if archivos_subidos:
             
             chart_data = df_hist_prod[['Semana', 'Monto de ventas']].copy()
             
-            # Grafica Altair con linea y puntos (marcadores)
+            # Grafica Altair con semanas horizontales y valores con comas
             grafica = alt.Chart(chart_data).mark_line(point=True).encode(
-                x=alt.X('Semana:O', title='Semana'), # ":O" para que trate la semana como numero ordinal sin comas
-                y=alt.Y('Monto de ventas:Q', title='Monto de Ventas ($)'),
-                tooltip=['Semana', 'Monto de ventas']
+                x=alt.X(
+                    'Semana:O', 
+                    title='Semana', 
+                    axis=alt.Axis(labelAngle=0)  # <-- Fuerza las semanas en horizontal
+                ),
+                y=alt.Y(
+                    'Monto de ventas:Q', 
+                    title='Monto de Ventas ($)', 
+                    axis=alt.Axis(format='$,.2f')  # <-- Agrega comas y formato de moneda
+                ),
+                tooltip=[
+                    alt.Tooltip('Semana:O', title='Semana'),
+                    alt.Tooltip('Monto de ventas:Q', title='Monto ($)', format='$,.2f')
+                ]
             ).properties(
                 height=350
             ).interactive()
@@ -175,13 +186,11 @@ if archivos_subidos:
                 inv_actual = df_producto['Inventario'].values[0]
                 inv_actual = 0 if pd.isna(inv_actual) else inv_actual
                 
-                # AQUI ESTA LA SUMA QUE PEDISTE
                 inv_futuro = inv_actual + monto_enviar 
                 dias_inv = (inv_futuro / prediccion) * 30
                 
                 st.markdown("### 📊 Resultados de la Prediccion")
                 
-                # Ahora usamos 4 columnas para incluir el Inventario Total
                 r1, r2, r3, r4 = st.columns(4)
                 r1.info(f"*Inv. en Sistema:*\n\n${inv_actual:,.2f}")
                 r2.warning(f"*Inv. Total (Simulado):*\n\n${inv_futuro:,.2f}")
