@@ -21,17 +21,18 @@ st.markdown("El sistema leerá automáticamente todo el historial de la carpeta 
 # ========================================================
 @st.cache_resource(show_spinner="Leyendo carpeta y entrenando modelo... esto puede tomar unos segundos.")
 def cargar_y_entrenar(ruta):
-    # Limpiar la ruta para evitar problemas con caracteres de escape de Windows (\N, \D, etc.)
-    ruta = os.path.normpath(ruta.strip('"\''))
+    # Limpieza profunda de comillas, espacios y caracteres de escape de Windows
+    ruta = ruta.strip().strip('"').strip("'").strip()
+    ruta = os.path.normpath(ruta)
     
     if not os.path.exists(ruta):
-        raise ValueError(f"La ruta no existe o no es accesible: {ruta}")
+        raise ValueError(f"La ruta no existe o OneDrive la tiene oculta en la nube. Revisa que esté sincronizada localmente.\nRuta intentada: {ruta}")
         
     patron_busqueda = os.path.join(ruta, ".xls")
     archivos_excel = glob.glob(patron_busqueda)
     
     if len(archivos_excel) == 0:
-        raise ValueError(f"No se encontraron archivos Excel en la ruta: {ruta}")
+        raise ValueError(f"La carpeta existe pero no se encontraron archivos Excel (.xls / .xlsx) adentro.\nRuta: {ruta}")
         
     lista_dfs = []
     
