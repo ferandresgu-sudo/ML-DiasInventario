@@ -12,7 +12,7 @@ st.set_page_config(
     page_title="Prediccion de Inventario", page_icon="📦", layout="wide"
 )
 
-st.title("📦 Simulador Predictivo de Dias de Inventario")
+st.title("📦 Prediccion de Dias de Inventario")
 st.markdown("Sube todos los archivos de tu carpeta historica para entrenar el modelo y analizar el desempeño por producto.")
 
 # ========================================================
