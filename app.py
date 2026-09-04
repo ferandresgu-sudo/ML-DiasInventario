@@ -230,7 +230,7 @@ if archivos_subidos:
                 monto_enviar = st.number_input(
                     "Monto de mercancia a enviar ($):", 
                     min_value=0.0, 
-                    value=10000.0, 
+                    value=0.0, 
                     step=1000.0
                 )
 
