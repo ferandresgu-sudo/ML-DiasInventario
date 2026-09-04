@@ -106,7 +106,7 @@ def cargar_y_entrenar(archivos_subidos):
 # ========================================================
 st.subheader("1. Origen de los Datos")
 archivos_subidos = st.file_uploader(
-    "Selecciona o arrastra todos los archivos Excel de la carpeta (Ctrl + A para seleccionar todos):",
+    "Selecciona o arrastra todos los archivos Excel de la carpeta (Ctrl + E para seleccionar todos):",
     type=["xlsx", "xls", "xlsm"],
     accept_multiple_files=True
 )
@@ -127,18 +127,7 @@ if archivos_subidos:
         # ========================================================
         # CONFIGURACIÓN DE CÓDIGOS INDEPENDIENTES
         # ========================================================
-        # 1. Códigos EXCLUSIVOS para la Tabla de Días de Inventario
-        CODIGOS_TABLA = [
-            7501058611062, 7506475104722, 7501058616548, 7506475117364, 7501059224827, 7501058618917, 7501058624635, 
-            7501058652690, 7501058620101, 7501073411173, 7501058628831, 7501000912803, 7506475108829, 7501058654205, 
-            7506475114172, 7501001600426, 7501058642134, 17501001619043, 7501058620019, 7501058624147, 7501059231962, 
-            7506475112970, 7501058620002, 7501058628473, 7506475111546, 7501058616470, 7501058652683, 7501058624130, 
-            7501059243873, 7501058624666, 7501058642141, 7891000248362, 7501058619211, 7506475103244, 7501059214590, 
-            7501058618931, 7501058620095, 7501059243880, 7501058628466, 16000135437, 7501059209657, 7506475122764, 
-            7506475128117, 7501058618924, 7501059281165, 7501058619228, 75010592096330, 7501059233980, 7501001614027, 7501058644824
-        ] 
-        
-        # 2. Códigos EXCLUSIVOS para la Simulación y Gráfica
+        # Códigos EXCLUSIVOS para la Simulación y Gráfica
         CODIGOS_PREDICCION = [
             75000011, 7506475125673, 7506475125680, 7506475117876, 7506475114172, 7506475113564, 7506475105606, 7501058610959, 7501058611857, 7501058613554, 7506475102834, 7501059295193, 7501059282117, 7501058615138, 7506475126090, 7501058611420, 
             7506475112888, 7506475112956, 7506475112895, 7506475112963, 7501059225411, 7501059225350, 7506475122955, 7506475103244, 7506475118675, 7501059233072, 7506475103053, 7506475103275, 7506475106801, 7506475106771, 7506475106153, 7506475106818, 
@@ -162,57 +151,29 @@ if archivos_subidos:
             7506475102483, 75003258, 7506475102537, 75004712, 75004705, 75004767, 75004729, 75004743, 7501000906246, 7501000906253, 7501000906284, 7501000906680, 7501058651136, 7501058651129, 7506475114073, 7506475115438, 7506475119665, 7506475119672, 
             7506475115421, 7506475122450, 7506475122436, 7506475122443, 7506475117081, 7506475122122, 7506475122139, 7506475122115, 7501058637659, 7506475122092, 7506475121996, 7891000395745, 7501000909568, 7501058626226, 7501058639493, 7506475103220, 
             7506475103213, 7501058616678, 7501058616715, 7501058614193, 7501000909612, 7501059278721, 7501059278691, 7501058626530, 7501000910526
+                             ] 
+        
+        # Códigos EXCLUSIVOS para la Tabla de Días de Inventario (al final)
+        CODIGOS_TABLA = [
+            7501058611062, 7506475104722, 7501058616548, 7506475117364, 7501059224827, 7501058618917, 7501058624635, 
+            7501058652690, 7501058620101, 7501073411173, 7501058628831, 7501000912803, 7506475108829, 7501058654205, 
+            7506475114172, 7501001600426, 7501058642134, 17501001619043, 7501058620019, 7501058624147, 7501059231962, 
+            7506475112970, 7501058620002, 7501058628473, 7506475111546, 7501058616470, 7501058652683, 7501058624130, 
+            7501059243873, 7501058624666, 7501058642141, 7891000248362, 7501058619211, 7506475103244, 7501059214590, 
+            7501058618931, 7501058620095, 7501059243880, 7501058628466, 16000135437, 7501059209657, 7506475122764, 
+            7506475128117, 7501058618924, 7501059281165, 7501058619228, 75010592096330, 7501059233980, 7501001614027, 7501058644824
         ] 
         
         # ========================================================
-        # 2. REPORTE SEMANAL DE DÍAS DE INVENTARIO
+        # 2. PREDICCIÓN Y GRÁFICA
         # ========================================================
-        st.subheader("2. Reporte Semanal (Dias de Inventario)")
-        
-        df_tabla = df_global.dropna(subset=['Codigo']).copy()
-        df_tabla = df_tabla[df_tabla['Codigo'].isin(CODIGOS_TABLA)]
-        
-        if df_tabla.empty:
-            st.warning("No se encontraron los códigos de CODIGOS_TABLA en los archivos subidos.")
-        else:
-            cols_indice = ['Codigo', 'Descripcion']
-            if 'Categoria' in df_tabla.columns:
-                cols_indice.append('Categoria')
-                
-            # Tabla dinámica usando "Dias Inv" en lugar de "Monto de ventas"
-            df_pivot = df_tabla.pivot_table(
-                index=cols_indice,
-                columns='Semana', 
-                values='Dias Inv', 
-                aggfunc='sum'
-            ).reset_index().fillna(0)
-            
-            semanas_cols = sorted([c for c in df_pivot.columns if isinstance(c, (int, float))])
-            
-            if len(semanas_cols) >= 2:
-                col_antigua = semanas_cols[0]
-                col_reciente = semanas_cols[-1]
-                df_pivot['Variacion'] = df_pivot[col_reciente] - df_pivot[col_antigua]
-            else:
-                df_pivot['Variacion'] = 0.0
-                
-            mapeo_fechas = {sem: obtener_rango_fechas(sem) for sem in semanas_cols}
-            df_pivot = df_pivot.rename(columns=mapeo_fechas)
-            
-            st.dataframe(df_pivot, use_container_width=True)
-            
-        st.markdown("---")
-        
-        # ========================================================
-        # 3. PREDICCIÓN Y GRÁFICA
-        # ========================================================
-        st.subheader("3. Simulacion y Tendencia de Producto")
+        st.subheader("2. Simulacion y Tendencia de Producto")
         
         df_pred = df_global.dropna(subset=['Codigo']).copy()
         df_pred = df_pred[df_pred['Codigo'].isin(CODIGOS_PREDICCION)]
         
         if df_pred.empty:
-            st.warning("No se encontraron los códigos de CODIGOS_PREDICCION en los archivos subidos.")
+            st.warning("No se encontraron los codigos de CODIGOS_PREDICCION en los archivos subidos.")
         else:
             df_ultimos = df_pred.sort_values('Semana').groupby('Codigo').tail(1)
             opciones_productos = {int(row['Codigo']): f"{int(row['Codigo'])} - {row.get('Descripcion', 'Desconocido')}" for _, row in df_ultimos.iterrows()}
@@ -278,6 +239,45 @@ if archivos_subidos:
                     st.progress(min(int(dias_inv), 100) / 100, text="Nivel de Cobertura (hasta 100 dias)")
                 else:
                     st.warning("No hay datos suficientes para realizar la prediccion de este producto.")
+
+        st.markdown("---")
+
+        # ========================================================
+        # 3. REPORTE SEMANAL DE DÍAS DE INVENTARIO
+        # ========================================================
+        st.subheader("3. Reporte Semanal (Dias de Inventario)")
+        
+        df_tabla = df_global.dropna(subset=['Codigo']).copy()
+        df_tabla = df_tabla[df_tabla['Codigo'].isin(CODIGOS_TABLA)]
+        
+        if df_tabla.empty:
+            st.warning("No se encontraron los codigos de CODIGOS_TABLA en los archivos subidos.")
+        else:
+            cols_indice = ['Codigo', 'Descripcion']
+            if 'Categoria' in df_tabla.columns:
+                cols_indice.append('Categoria')
+                
+            # Tabla dinámica usando "Dias Inv"
+            df_pivot = df_tabla.pivot_table(
+                index=cols_indice,
+                columns='Semana', 
+                values='Dias Inv', 
+                aggfunc='sum'
+            ).reset_index().fillna(0)
+            
+            semanas_cols = sorted([c for c in df_pivot.columns if isinstance(c, (int, float))])
+            
+            if len(semanas_cols) >= 2:
+                col_antigua = semanas_cols[0]
+                col_reciente = semanas_cols[-1]
+                df_pivot['Variacion'] = df_pivot[col_reciente] - df_pivot[col_antigua]
+            else:
+                df_pivot['Variacion'] = 0.0
+                
+            mapeo_fechas = {sem: obtener_rango_fechas(sem) for sem in semanas_cols}
+            df_pivot = df_pivot.rename(columns=mapeo_fechas)
+            
+            st.dataframe(df_pivot, use_container_width=True)
                 
     except Exception as e:
         st.error(f"Error al procesar: {e}")
