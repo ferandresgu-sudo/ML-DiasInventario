@@ -1,12 +1,13 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import datetime
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
 import altair as alt
 
 # ========================================================
-# CONFIGURACIÓN DE LA PÁGINA
+# CONFIGURACION DE LA PAGINA
 # ========================================================
 st.set_page_config(
     page_title="Prediccion de Inventario", page_icon="📦", layout="wide"
@@ -16,13 +17,28 @@ st.title("📦 Simulador Predictivo de Dias de Inventario")
 st.markdown("Sube todos los archivos de tu carpeta historica para entrenar el modelo y analizar el desempeño por producto.")
 
 # ========================================================
-# FUNCIÓN CACHEADA PARA PROCESAMIENTO Y ENTRENAMIENTO
+# FUNCION PARA CONVERTIR NUMERO DE SEMANA A RANGO DE FECHAS
+# ========================================================
+def obtener_rango_fechas(semana_num):
+    # Semana 25 corresponde al 15 de junio (como base)
+    base_date = datetime.date(2026, 6, 15)
+    semana_base = 25
+    diferencia_semanas = int(semana_num) - semana_base
+    
+    start_date = base_date + datetime.timedelta(weeks=diferencia_semanas)
+    end_date = start_date + datetime.timedelta(days=6)
+    
+    meses = {1: 'ene', 2: 'feb', 3: 'mar', 4: 'abr', 5: 'may', 6: 'jun',
+             7: 'jul', 8: 'ago', 9: 'sep', 10: 'oct', 11: 'nov', 12: 'dic'}
+             
+    return f"{start_date.day:02d} {meses[start_date.month]} - {end_date.day:02d} {meses[end_date.month]}"
+
+# ========================================================
+# FUNCION CACHEADA PARA PROCESAMIENTO Y ENTRENAMIENTO
 # ========================================================
 @st.cache_resource(show_spinner="Procesando archivos y entrenando modelo, esto puede tomar unos segundos.")
 def cargar_y_entrenar(archivos_subidos):
     lista_dfs = []
-    
-    # 1. Consolidacion
     for archivo in archivos_subidos:
         try:
             df_temp = pd.read_excel(archivo, engine='openpyxl')
@@ -35,13 +51,13 @@ def cargar_y_entrenar(archivos_subidos):
         
     df = pd.concat(lista_dfs, ignore_index=True)
     
-    # 2. Limpieza Extrema
     nuevas_columnas = [str(col).strip().split('[')[-1].replace(']', '') for col in df.columns]
     df.columns = nuevas_columnas
 
     for col in df.columns:
         col_lower = col.lower()
         if 'descrip' in col_lower: df.rename(columns={col: 'Descripcion'}, inplace=True)
+        elif 'categoria' in col_lower: df.rename(columns={col: 'Categoria'}, inplace=True)
         elif 'inventario' in col_lower and 'monto' not in col_lower and 'total' not in col_lower: df.rename(columns={col: 'Inventario'}, inplace=True) 
         elif 'venta' in col_lower: df.rename(columns={col: 'Monto de ventas'}, inplace=True)
         elif 'codigo' in col_lower or 'código' in col_lower: df.rename(columns={col: 'Codigo'}, inplace=True)
@@ -49,7 +65,6 @@ def cargar_y_entrenar(archivos_subidos):
 
     df = df.loc[:, ~df.columns.duplicated()]
 
-    # 3. Ingenieria de Caracteristicas
     df['Codigo'] = pd.to_numeric(df['Codigo'], errors='coerce')
     df['Semana'] = pd.to_numeric(df['Semana'], errors='coerce')
     df['Monto de ventas'] = pd.to_numeric(df['Monto de ventas'], errors='coerce')
@@ -62,16 +77,14 @@ def cargar_y_entrenar(archivos_subidos):
     df_modelo = df.dropna(subset=['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras', 'Monto de ventas']).copy()
 
     if df_modelo.empty:
-        raise ValueError("No hay historial suficiente (se requieren al menos 3 semanas consecutivas por producto).")
+        raise ValueError("No hay historial suficiente (se requieren al menos 3 semanas consecutivas).")
 
-    # 4. Entrenamiento
     X = df_modelo[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']]
     y = df_modelo['Monto de ventas']
 
     modelo = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)
     modelo.fit(X, y)
 
-    # Evaluacion
     predicciones = modelo.predict(X)
     suma_errores = np.sum(np.abs(y - predicciones))
     suma_ventas = np.sum(y)
@@ -104,11 +117,10 @@ if archivos_subidos:
             
         st.markdown("---")
         
-        st.subheader("2. Simulacion y Tendencia de Producto")
-        
         # ----------------------------------------------------
         # FILTRO DE CÓDIGOS ESPECÍFICOS
         # ----------------------------------------------------
+        # Reemplaza estos números con los códigos de los productos que deseas analizar
         CODIGOS_ESPECIFICOS = [75000011, 7506475125673, 7506475125680, 7506475117876, 7506475114172, 7506475113564, 7506475105606, 7501058610959, 7501058611857, 7501058613554, 7506475102834, 7501059295193, 7501059282117, 7501058615138, 7506475126090, 7501058611420, 7506475112888, 7506475112956, 7506475112895, 7506475112963, 7501059225411, 
                                7501059225350, 7506475122955, 7506475103244, 7506475118675, 7501059233072, 7506475103053, 7506475103275, 7506475106801, 7506475106771, 7506475106153, 7506475106818, 7506475106788, 7506475106146, 7501059234321, 7501001604004, 7501059240216, 7501001604387, 7501059239845, 7613034161086, 7501058615596, 
                                7501058627292, 7501059219106, 7501059242883, 7501059284623, 7501059284630, 7506475106078, 7501073419117, 7501001600198, 7501000912889, 10722776200640, 7502252484285, 7502252482694, 7502252481796, 7502252480928, 
@@ -127,22 +139,58 @@ if archivos_subidos:
                                7506475115254, 7501058646217, 7501058618924, 7501058618931, 7501058618917, 7506475114936, 7506475111119, 7506475103855, 7501058629135, 7501058629173, 7501058629159, 7506475126731, 7501058624130, 7501058624147, 7501058624154, 7501058624161, 7506475120289, 7506475120265, 7506475120272, 7501058654793, 7501058642608, 
                                7501058642592, 75013394, 75013400, 75013332, 75015374, 7506475102476, 7506475102421, 7506475102452, 75003456, 7506475102490, 7506475102469, 7501000904235, 7506475102520, 7506475102506, 7506475102483, 75003258, 7506475102537, 75004712, 75004705, 75004767, 75004729, 75004743, 7501000906246, 7501000906253, 
                                7501000906284, 7501000906680, 7501058651136, 7501058651129, 7506475114073, 7506475115438, 7506475119665, 7506475119672, 7506475115421, 7506475122450, 7506475122436, 7506475122443, 
-                               7506475117081, 7506475122122, 7506475122139, 7506475122115, 7501058637659, 7506475122092, 7506475121996, 7891000395745, 7501000909568, 7501058626226, 7501058639493, 7506475103220, 7506475103213, 7501058616678, 7501058616715, 7501058614193, 7501000909612, 7501059278721, 7501059278691, 7501058626530, 7501000910526] 
+                               7506475117081, 7506475122122, 7506475122139, 7506475122115, 7501058637659, 7506475122092, 7506475121996, 7891000395745, 7501000909568, 7501058626226, 7501058639493, 7506475103220, 7506475103213, 7501058616678, 7501058616715, 7501058614193, 7501000909612, 7501059278721, 7501059278691, 7501058626530, 7501000910526]
         
-        # Filtramos el dataframe para que solo contenga los códigos deseados
         df_validos = df_global.dropna(subset=['Codigo']).copy()
         df_validos = df_validos[df_validos['Codigo'].isin(CODIGOS_ESPECIFICOS)]
         
         if df_validos.empty:
-            st.warning("Ninguno de los códigos especificados se encontró en los archivos subidos. Revisa la lista 'CODIGOS_ESPECIFICOS' en el código.")
+            st.warning("Ninguno de los codigos especificados se encontro en los archivos. Revisa la lista 'CODIGOS_ESPECIFICOS'.")
         else:
-            df_ultimos = df_validos.sort_values('Semana').groupby('Codigo').tail(1)
+            # ========================================================
+            # TABLA TIPO MATRIZ (COMO LA SEGUNDA IMAGEN)
+            # ========================================================
+            st.subheader("2. Reporte Semanal de Ventas y Variacion")
             
-            opciones_productos = {}
-            for _, row in df_ultimos.iterrows():
-                cod = int(row['Codigo'])
-                desc = row['Descripcion'] if 'Descripcion' in df_ultimos.columns else 'Desconocido'
-                opciones_productos[cod] = f"{cod} - {desc}"
+            cols_indice = ['Codigo', 'Descripcion']
+            if 'Categoria' in df_validos.columns:
+                cols_indice.append('Categoria')
+                
+            # Crear la tabla dinamica
+            df_pivot = df_validos.pivot_table(
+                index=cols_indice,
+                columns='Semana', 
+                values='Monto de ventas',
+                aggfunc='sum'
+            ).reset_index().fillna(0)
+            
+            # Identificar las columnas que son semanas (numeros)
+            semanas_cols = sorted([c for c in df_pivot.columns if isinstance(c, (int, float))])
+            
+            # Calcular la Variacion automatica (Semana mas reciente - Semana mas antigua)
+            if len(semanas_cols) >= 2:
+                col_antigua = semanas_cols[0]
+                col_reciente = semanas_cols[-1]
+                df_pivot['Variacion'] = df_pivot[col_reciente] - df_pivot[col_antigua]
+            else:
+                df_pivot['Variacion'] = 0.0
+                
+            # Renombrar los numeros de semana a los rangos de fechas (ej. 15 jun - 21 jun)
+            mapeo_fechas = {sem: obtener_rango_fechas(sem) for sem in semanas_cols}
+            df_pivot = df_pivot.rename(columns=mapeo_fechas)
+            
+            # Mostrar tabla en la pantalla
+            st.dataframe(df_pivot, use_container_width=True)
+            
+            st.markdown("---")
+            
+            # ========================================================
+            # PREDICCION Y GRAFICA
+            # ========================================================
+            st.subheader("3. Simulacion y Tendencia de Producto")
+            
+            df_ultimos = df_validos.sort_values('Semana').groupby('Codigo').tail(1)
+            opciones_productos = {int(row['Codigo']): f"{int(row['Codigo'])} - {row.get('Descripcion', 'Desconocido')}" for _, row in df_ultimos.iterrows()}
                 
             col_sim1, col_sim2 = st.columns(2)
             
@@ -161,53 +209,31 @@ if archivos_subidos:
                     step=1000.0
                 )
 
-            # ----------------------------------------------------
-            # GRÁFICA HISTÓRICA DE VENTAS SEMANALES CON MARCADORES
-            # ----------------------------------------------------
-            df_hist_prod = df_global[df_global['Codigo'] == codigo_seleccionado].sort_values('Semana')
+            # GRÁFICA
+            df_hist_prod = df_validos[df_validos['Codigo'] == codigo_seleccionado].sort_values('Semana')
             
             if not df_hist_prod.empty:
                 st.markdown("#### 📈 Comportamiento Historico de Ventas ($)")
-                
                 chart_data = df_hist_prod[['Semana', 'Monto de ventas']].copy()
                 
                 grafica = alt.Chart(chart_data).mark_line(point=True).encode(
-                    x=alt.X(
-                        'Semana:O', 
-                        title='Semana', 
-                        axis=alt.Axis(labelAngle=0)  
-                    ),
-                    y=alt.Y(
-                        'Monto de ventas:Q', 
-                        title='Monto de Ventas ($)', 
-                        axis=alt.Axis(format='$,.2f')  
-                    ),
-                    tooltip=[
-                        alt.Tooltip('Semana:O', title='Semana'),
-                        alt.Tooltip('Monto de ventas:Q', title='Monto ($)', format='$,.2f')
-                    ]
-                ).properties(
-                    height=350
-                ).interactive()
+                    x=alt.X('Semana:O', title='Semana', axis=alt.Axis(labelAngle=0)),
+                    y=alt.Y('Monto de ventas:Q', title='Monto de Ventas ($)', axis=alt.Axis(format='$,.2f')),
+                    tooltip=[alt.Tooltip('Semana:O', title='Semana'), alt.Tooltip('Monto de ventas:Q', title='Monto ($)', format='$,.2f')]
+                ).properties(height=350).interactive()
                 
                 st.altair_chart(grafica, use_container_width=True)
             
-            # ----------------------------------------------------
-            # BOTÓN DE SIMULACIÓN Y RESULTADOS
-            # ----------------------------------------------------
+            # BOTÓN DE SIMULACIÓN
             if st.button("🔮 Calcular Proyeccion", type="primary"):
-                df_producto = df_global[df_global['Codigo'] == codigo_seleccionado].copy()
+                df_producto = df_validos[df_validos['Codigo'] == codigo_seleccionado].copy()
                 df_producto = df_producto[df_producto['Semana'] == df_producto['Semana'].max()]
                 
                 if not df_producto.empty:
                     venta_actual = df_producto['Monto de ventas'].values[0]
                     venta_1_atras = df_producto['Venta_1_Semana_Atras'].values[0]
                     
-                    X_futuro = pd.DataFrame({
-                        'Venta_1_Semana_Atras': [venta_actual],
-                        'Venta_2_Semanas_Atras': [venta_1_atras]
-                    })
-                    
+                    X_futuro = pd.DataFrame({'Venta_1_Semana_Atras': [venta_actual], 'Venta_2_Semanas_Atras': [venta_1_atras]})
                     prediccion = modelo_rf.predict(X_futuro)[0]
                     prediccion = 0.01 if pd.isna(prediccion) or prediccion <= 0 else prediccion
                     
@@ -218,7 +244,6 @@ if archivos_subidos:
                     dias_inv = (inv_futuro / prediccion) * 30
                     
                     st.markdown("### 📊 Resultados de la Prediccion")
-                    
                     r1, r2, r3, r4 = st.columns(4)
                     r1.info(f"*Inv. en Sistema:*\n\n${inv_actual:,.2f}")
                     r2.warning(f"*Inv. Total (Simulado):*\n\n${inv_futuro:,.2f}")
