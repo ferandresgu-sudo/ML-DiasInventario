@@ -53,7 +53,6 @@ def cargar_y_entrenar(archivos_subidos):
     nuevas_columnas = [str(col).strip().split('[')[-1].replace(']', '') for col in df.columns]
     df.columns = nuevas_columnas
 
-    # Limpieza e identificacion de columnas
     for col in df.columns:
         col_lower = col.lower()
         if 'descrip' in col_lower: df.rename(columns={col: 'Descripcion'}, inplace=True)
@@ -66,7 +65,6 @@ def cargar_y_entrenar(archivos_subidos):
 
     df = df.loc[:, ~df.columns.duplicated()]
 
-    # Conversion a numerico
     df['Codigo'] = pd.to_numeric(df['Codigo'], errors='coerce')
     df['Semana'] = pd.to_numeric(df['Semana'], errors='coerce')
     df['Monto de ventas'] = pd.to_numeric(df['Monto de ventas'], errors='coerce')
@@ -151,7 +149,7 @@ if archivos_subidos:
             7506475102483, 75003258, 7506475102537, 75004712, 75004705, 75004767, 75004729, 75004743, 7501000906246, 7501000906253, 7501000906284, 7501000906680, 7501058651136, 7501058651129, 7506475114073, 7506475115438, 7506475119665, 7506475119672, 
             7506475115421, 7506475122450, 7506475122436, 7506475122443, 7506475117081, 7506475122122, 7506475122139, 7506475122115, 7501058637659, 7506475122092, 7506475121996, 7891000395745, 7501000909568, 7501058626226, 7501058639493, 7506475103220, 
             7506475103213, 7501058616678, 7501058616715, 7501058614193, 7501000909612, 7501059278721, 7501059278691, 7501058626530, 7501000910526
-                             ] 
+        ] 
         
         # Códigos EXCLUSIVOS para la Tabla de Días de Inventario (al final)
         CODIGOS_TABLA = [
@@ -257,7 +255,6 @@ if archivos_subidos:
             if 'Categoria' in df_tabla.columns:
                 cols_indice.append('Categoria')
                 
-            # Tabla dinámica usando "Dias Inv"
             df_pivot = df_tabla.pivot_table(
                 index=cols_indice,
                 columns='Semana', 
@@ -267,12 +264,18 @@ if archivos_subidos:
             
             semanas_cols = sorted([c for c in df_pivot.columns if isinstance(c, (int, float))])
             
-            if len(semanas_cols) >= 2:
+            if len(semanas_cols) > 0:
                 col_antigua = semanas_cols[0]
                 col_reciente = semanas_cols[-1]
+                
+                # Variación entre la última semana y la más antigua
                 df_pivot['Variacion'] = df_pivot[col_reciente] - df_pivot[col_antigua]
+                
+                # Cálculo de % Meta en base a la última semana (60 días = 100%)
+                df_pivot['% Meta'] = (df_pivot[col_reciente] / 60 * 100).round(1).astype(str) + '%'
             else:
                 df_pivot['Variacion'] = 0.0
+                df_pivot['% Meta'] = '0%'
                 
             mapeo_fechas = {sem: obtener_rango_fechas(sem) for sem in semanas_cols}
             df_pivot = df_pivot.rename(columns=mapeo_fechas)
