@@ -4,7 +4,7 @@ import numpy as np
 import datetime
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import altair as alt
+from sklearn.model_selection import train_test_split
 
 # ========================================================
 # CONFIGURACION DE LA PAGINA
@@ -87,23 +87,30 @@ def cargar_y_entrenar(archivos_subidos):
     X = df_modelo[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']]
     y = df_modelo['Monto de ventas']
 
-    modelo = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)
-    modelo.fit(X, y)
+    # --- NUEVO: Separar el 80% para entrenar y 20% para el "examen sorpresa" ---
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    predicciones = modelo.predict(X)
+    # 1. Entrenar modelo evaluador SOLO con el 80%
+    modelo_evaluador = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)
+    modelo_evaluador.fit(X_train, y_train)
+
+    # 2. Hacer predicciones sobre el 20% que NUNCA ha visto
+    predicciones_test = modelo_evaluador.predict(X_test)
     
-    # ----------------------------------------------------
-    # NUEVAS MÉTRICAS DE EVALUACIÓN
-    # ----------------------------------------------------
-    suma_errores = np.sum(np.abs(y - predicciones))
-    suma_ventas = np.sum(y)
+    # 3. Calcular las métricas REALES
+    suma_errores = np.sum(np.abs(y_test - predicciones_test))
+    suma_ventas = np.sum(y_test)
     
     wape = (suma_errores / suma_ventas) * 100 if suma_ventas > 0 else 0.0
-    mae = mean_absolute_error(y, predicciones)
-    rmse = np.sqrt(mean_squared_error(y, predicciones))
-    r2 = r2_score(y, predicciones)
+    mae = mean_absolute_error(y_test, predicciones_test)
+    rmse = np.sqrt(mean_squared_error(y_test, predicciones_test))
+    r2 = r2_score(y_test, predicciones_test)
 
-    return df, modelo, wape, mae, rmse, r2
+    # 4. Entrenar el modelo FINAL con el 100% de los datos (Para que el usuario tenga la mejor predicción en el simulador)
+    modelo_final = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)
+    modelo_final.fit(X, y)
+
+    return df, modelo_final, wape, mae, rmse, r2
 
 # ========================================================
 # INTERFAZ DE USUARIO
@@ -117,7 +124,6 @@ archivos_subidos = st.file_uploader(
 
 if archivos_subidos:
     try:
-        # Desempaquetar las 4 métricas
         df_global, modelo_rf, wape_val, mae_val, rmse_val, r2_val = cargar_y_entrenar(archivos_subidos)
         
         st.success("Archivos cargados y modelo entrenado con exito!")
@@ -125,13 +131,15 @@ if archivos_subidos:
         # Mostrar las 4 métricas de evaluación
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         with col_m1:
-            st.metric(label="Error WAPE (Global)", value=f"{wape_val:.2f}%", help="Porcentaje de error ponderado sobre el volumen total.")
+            st.metric(label="Error WAPE (Global)", value=f"{wape_val:.2f}%", help="Porcentaje de error ponderado (Eval real: 20% datos no vistos).")
         with col_m2:
-            st.metric(label="Error Promedio (MAE)", value=f"${mae_val:,.2f}", help="Promedio absoluto del error en pesos.")
+            st.metric(label="Error Promedio (MAE)", value=f"${mae_val:,.2f}", help="Promedio absoluto del error en pesos (Eval real: 20% datos no vistos).")
         with col_m3:
-            st.metric(label="Penalización (RMSE)", value=f"${rmse_val:,.2f}", help="Mide el impacto de los errores más grandes. Entre más cerca esté al MAE, menos errores catastróficos hay.")
+            st.metric(label="Penalización (RMSE)", value=f"${rmse_val:,.2f}", help="Castiga errores grandes. Entre más alto, más atípicos tienes.")
         with col_m4:
-            st.metric(label="Explicabilidad (R²)", value=f"{r2_val:.2f}", help="De 0 a 1. Qué tanto explica el modelo el comportamiento de ventas futuras.")
+            # Añadimos formato para que si es negativo, se entienda que es 0%
+            r2_display = f"{max(0, r2_val):.2f}"
+            st.metric(label="Explicabilidad (R²)", value=r2_display, help="De 0 a 1. Ahora refleja la capacidad real del modelo en el futuro.")
             
         st.markdown("---")
         
