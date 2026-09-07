@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import datetime
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import altair as alt
 
 # ========================================================
@@ -91,13 +91,19 @@ def cargar_y_entrenar(archivos_subidos):
     modelo.fit(X, y)
 
     predicciones = modelo.predict(X)
+    
+    # ----------------------------------------------------
+    # NUEVAS MÉTRICAS DE EVALUACIÓN
+    # ----------------------------------------------------
     suma_errores = np.sum(np.abs(y - predicciones))
     suma_ventas = np.sum(y)
     
     wape = (suma_errores / suma_ventas) * 100 if suma_ventas > 0 else 0.0
     mae = mean_absolute_error(y, predicciones)
+    rmse = np.sqrt(mean_squared_error(y, predicciones))
+    r2 = r2_score(y, predicciones)
 
-    return df, modelo, wape, mae
+    return df, modelo, wape, mae, rmse, r2
 
 # ========================================================
 # INTERFAZ DE USUARIO
@@ -111,21 +117,27 @@ archivos_subidos = st.file_uploader(
 
 if archivos_subidos:
     try:
-        df_global, modelo_rf, wape_val, mae_val = cargar_y_entrenar(archivos_subidos)
+        # Desempaquetar las 4 métricas
+        df_global, modelo_rf, wape_val, mae_val, rmse_val, r2_val = cargar_y_entrenar(archivos_subidos)
         
         st.success("Archivos cargados y modelo entrenado con exito!")
-        col_m1, col_m2 = st.columns(2)
+        
+        # Mostrar las 4 métricas de evaluación
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         with col_m1:
-            st.metric("Error WAPE (Global)", f"{wape_val:.2f}%")
+            st.metric(label="Error WAPE (Global)", value=f"{wape_val:.2f}%", help="Porcentaje de error ponderado sobre el volumen total.")
         with col_m2:
-            st.metric("Error Promedio (MAE)", f"${mae_val:,.2f} MXN")
+            st.metric(label="Error Promedio (MAE)", value=f"${mae_val:,.2f}", help="Promedio absoluto del error en pesos.")
+        with col_m3:
+            st.metric(label="Penalización (RMSE)", value=f"${rmse_val:,.2f}", help="Mide el impacto de los errores más grandes. Entre más cerca esté al MAE, menos errores catastróficos hay.")
+        with col_m4:
+            st.metric(label="Explicabilidad (R²)", value=f"{r2_val:.2f}", help="De 0 a 1. Qué tanto explica el modelo el comportamiento de ventas futuras.")
             
         st.markdown("---")
         
         # ========================================================
         # CONFIGURACIÓN DE CÓDIGOS INDEPENDIENTES
         # ========================================================
-        # Códigos EXCLUSIVOS para la Simulación y Gráfica
         CODIGOS_PREDICCION = [
             75000011, 7506475125673, 7506475125680, 7506475117876, 7506475114172, 7506475113564, 7506475105606, 7501058610959, 7501058611857, 7501058613554, 7506475102834, 7501059295193, 7501059282117, 7501058615138, 7506475126090, 7501058611420, 
             7506475112888, 7506475112956, 7506475112895, 7506475112963, 7501059225411, 7501059225350, 7506475122955, 7506475103244, 7506475118675, 7501059233072, 7506475103053, 7506475103275, 7506475106801, 7506475106771, 7506475106153, 7506475106818, 
@@ -151,7 +163,6 @@ if archivos_subidos:
             7506475103213, 7501058616678, 7501058616715, 7501058614193, 7501000909612, 7501059278721, 7501059278691, 7501058626530, 7501000910526
         ] 
         
-        # Códigos EXCLUSIVOS para la Tabla de Días de Inventario (al final)
         CODIGOS_TABLA = [
             7501058611062, 7506475104722, 7501058616548, 7506475117364, 7501059224827, 7501058618917, 7501058624635, 
             7501058652690, 7501058620101, 7501073411173, 7501058628831, 7501000912803, 7506475108829, 7501058654205, 
@@ -229,10 +240,10 @@ if archivos_subidos:
                     
                     st.markdown("### 📊 Resultados de la Prediccion")
                     r1, r2, r3, r4 = st.columns(4)
-                    r1.info(f"*Inv. en Sistema:*\n\n${inv_actual:,.2f}")
-                    r2.warning(f"*Inv. Total (Simulado):*\n\n${inv_futuro:,.2f}")
-                    r3.info(f"*Venta Est. (Prox Sem):*\n\n${prediccion:,.2f}")
-                    r4.success(f"*Dias de Inventario:*\n\n{dias_inv:.1f} dias")
+                    r1.info(f"Inv. en Sistema:\n\n${inv_actual:,.2f}")
+                    r2.warning(f"Inv. Total (Simulado):\n\n${inv_futuro:,.2f}")
+                    r3.info(f"Venta Est. (Prox Sem):\n\n${prediccion:,.2f}")
+                    r4.success(f"Dias de Inventario:\n\n{dias_inv:.1f} dias")
                     
                     st.progress(min(int(dias_inv), 100) / 100, text="Nivel de Cobertura (hasta 100 dias)")
                 else:
@@ -268,10 +279,7 @@ if archivos_subidos:
                 col_antigua = semanas_cols[0]
                 col_reciente = semanas_cols[-1]
                 
-                # Variación entre la última semana y la más antigua
                 df_pivot['Variacion'] = df_pivot[col_reciente] - df_pivot[col_antigua]
-                
-                # Cálculo de % Meta en base a la última semana (60 días = 100%)
                 df_pivot['% Meta'] = (df_pivot[col_reciente] / 60 * 100).round(1).astype(str) + '%'
             else:
                 df_pivot['Variacion'] = 0.0
