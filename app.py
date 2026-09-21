@@ -297,6 +297,17 @@ if archivos_subidos:
         st.subheader("4. Proyeccion Masiva de Inventario (Todos los Productos)")
         st.markdown("Tabla con el cálculo de días de inventario ya aplicado para todos los productos de tu lista, tomando en cuenta la mercancía a enviar simulada.")
         
+        # --- NUEVO FILTRO PARA LA TABLA MASIVA ---
+        # Agregamos la opción "Todos" al inicio de las opciones
+        opciones_filtro_tabla = ["Todos"] + list(opciones_productos.keys())
+        
+        filtro_seleccionado = st.selectbox(
+            "Filtra la tabla por un producto especifico (o selecciona 'Todos'):",
+            options=opciones_filtro_tabla,
+            format_func=lambda x: "Todos los productos" if x == "Todos" else opciones_productos[x],
+            key="filtro_seccion_4"
+        )
+        
         resultados_masivos = []
         df_ultimos_masivo = df_pred.sort_values('Semana').groupby('Codigo').tail(1)
         
@@ -328,6 +339,10 @@ if archivos_subidos:
             })
             
         df_resultados = pd.DataFrame(resultados_masivos)
+        
+        # --- APLICAMOS EL FILTRO AL DATAFRAME ---
+        if filtro_seleccionado != "Todos":
+            df_resultados = df_resultados[df_resultados['Codigo'] == filtro_seleccionado]
         
         # Formateo de la tabla para que se lea en moneda y decimales correctamente
         st.dataframe(df_resultados.style.format({
