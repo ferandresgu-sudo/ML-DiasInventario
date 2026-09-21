@@ -88,17 +88,13 @@ def cargar_y_entrenar(archivos_subidos):
     X = df_modelo[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']]
     y = df_modelo['Monto de ventas']
 
-    # --- NUEVO: Separar el 80% para entrenar y 20% para el "examen sorpresa" ---
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    # 1. Entrenar modelo evaluador SOLO con el 80%
     modelo_evaluador = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)
     modelo_evaluador.fit(X_train, y_train)
 
-    # 2. Hacer predicciones sobre el 20% que NUNCA ha visto
     predicciones_test = modelo_evaluador.predict(X_test)
     
-    # 3. Calcular las métricas REALES
     suma_errores = np.sum(np.abs(y_test - predicciones_test))
     suma_ventas = np.sum(y_test)
     
@@ -107,7 +103,6 @@ def cargar_y_entrenar(archivos_subidos):
     rmse = np.sqrt(mean_squared_error(y_test, predicciones_test))
     r2 = r2_score(y_test, predicciones_test)
 
-    # 4. Entrenar el modelo FINAL con el 100% de los datos (Para que el usuario tenga la mejor predicción en el simulador)
     modelo_final = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)
     modelo_final.fit(X, y)
 
@@ -129,7 +124,6 @@ if archivos_subidos:
         
         st.success("Archivos cargados y modelo entrenado con exito!")
         
-        # Mostrar las 4 métricas de evaluación
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         with col_m1:
             st.metric(label="Error WAPE (Global)", value=f"{wape_val:.2f}%", help="Porcentaje de error ponderado (Eval real: 20% datos no vistos).")
@@ -138,15 +132,11 @@ if archivos_subidos:
         with col_m3:
             st.metric(label="Penalización (RMSE)", value=f"${rmse_val:,.2f}", help="Castiga errores grandes. Entre más alto, más atípicos tienes.")
         with col_m4:
-            # Añadimos formato para que si es negativo, se entienda que es 0%
             r2_display = f"{max(0, r2_val):.2f}"
             st.metric(label="Explicabilidad (R²)", value=r2_display, help="De 0 a 1. Ahora refleja la capacidad real del modelo en el futuro.")
             
         st.markdown("---")
         
-        # ========================================================
-        # CONFIGURACIÓN DE CÓDIGOS INDEPENDIENTES
-        # ========================================================
         CODIGOS_PREDICCION = [
             75000011, 7506475125673, 7506475125680, 7506475117876, 7506475114172, 7506475113564, 7506475105606, 7501058610959, 7501058611857, 7501058613554, 7506475102834, 7501059295193, 7501059282117, 7501058615138, 7506475126090, 7501058611420, 
             7506475112888, 7506475112956, 7506475112895, 7506475112963, 7501059225411, 7501059225350, 7506475122955, 7506475103244, 7506475118675, 7501059233072, 7506475103053, 7506475103275, 7506475106801, 7506475106771, 7506475106153, 7506475106818, 
@@ -298,6 +288,54 @@ if archivos_subidos:
             df_pivot = df_pivot.rename(columns=mapeo_fechas)
             
             st.dataframe(df_pivot, use_container_width=True)
+
+        st.markdown("---")
+
+        # ========================================================
+        # 4. TABLA GENERAL DE PREDICCIONES (TODOS LOS PRODUCTOS)
+        # ========================================================
+        st.subheader("4. Proyeccion Masiva de Inventario (Todos los Productos)")
+        st.markdown("Tabla con el cálculo de días de inventario ya aplicado para todos los productos de tu lista, tomando en cuenta la mercancía a enviar simulada.")
+        
+        resultados_masivos = []
+        df_ultimos_masivo = df_pred.sort_values('Semana').groupby('Codigo').tail(1)
+        
+        for _, row in df_ultimos_masivo.iterrows():
+            codigo = int(row['Codigo'])
+            descripcion = row.get('Descripcion', 'Desconocido')
+            venta_actual = row['Monto de ventas']
+            venta_1_atras = row['Venta_1_Semana_Atras']
+            
+            inv_actual = row['Inventario']
+            inv_actual = 0.0 if pd.isna(inv_actual) else inv_actual
+            
+            # Predicción para la próxima semana
+            X_futuro = pd.DataFrame({'Venta_1_Semana_Atras': [venta_actual], 'Venta_2_Semanas_Atras': [venta_1_atras]})
+            pred = modelo_rf.predict(X_futuro)[0]
+            pred = 0.01 if pd.isna(pred) or pred <= 0 else pred
+            
+            # Cálculo de los días de inventario considerando el input "monto_enviar" de la sección 2
+            inv_futuro = inv_actual + monto_enviar
+            dias_inv = (inv_futuro / pred) * 30
+            
+            resultados_masivos.append({
+                'Codigo': codigo,
+                'Descripcion': descripcion,
+                'Inv. Actual ($)': inv_actual,
+                'Inv. Simulado ($)': inv_futuro,
+                'Venta Est. ($)': pred,
+                'Dias de Inventario': dias_inv
+            })
+            
+        df_resultados = pd.DataFrame(resultados_masivos)
+        
+        # Formateo de la tabla para que se lea en moneda y decimales correctamente
+        st.dataframe(df_resultados.style.format({
+            'Inv. Actual ($)': '${:,.2f}',
+            'Inv. Simulado ($)': '${:,.2f}',
+            'Venta Est. ($)': '${:,.2f}',
+            'Dias de Inventario': '{:.1f}'
+        }), use_container_width=True)
                 
     except Exception as e:
         st.error(f"Error al procesar: {e}")
