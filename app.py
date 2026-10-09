@@ -165,7 +165,7 @@ if archivos_subidos:
         st.markdown("---")
         
         CODIGOS_PREDICCION = [
-            7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+           7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -217,7 +217,7 @@ if archivos_subidos:
         ]
 
         CODIGOS_TABLA = [
-            7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -420,13 +420,18 @@ if archivos_subidos:
         st.markdown("---")
 
         # ========================================================
-        # 4. TABLA GENERAL DE PREDICCIONES (TODOS LOS PRODUCTOS)
+        # 4. TABLA GENERAL DE PREDICCIONES (CÓDIGOS PERMITIDOS)
         # ========================================================
-        st.subheader("4. Proyeccion Masiva de Inventario (Todos los Productos)")
-        st.markdown("Tabla con el cálculo de ventas proyectadas y cobertura de inventario para todo el catálogo general.")
+        st.subheader("4. Proyeccion Masiva de Inventario (Codigos Seleccionados)")
+        st.markdown("Tabla con el cálculo de ventas proyectadas y cobertura de inventario exclusiva para los códigos analizados.")
         
-        # PREPARAR DATA COMPLETA (NO SOLO LOS CODIGOS FILTRADOS DE LA SECCION 2)
+        # COMBINAR AMBAS LISTAS Y FILTRAR SOLO ESOS CÓDIGOS
+        CODIGOS_PERMITIDOS = list(set(CODIGOS_PREDICCION + CODIGOS_TABLA))
+        
         df_todos = df_global.dropna(subset=['Codigo']).copy()
+        # Filtramos explícitamente para que solo entren los códigos permitidos
+        df_todos = df_todos[df_todos['Codigo'].isin(CODIGOS_PERMITIDOS)]
+        
         df_ultimos_masivo = df_todos.sort_values('Semana').groupby('Codigo').tail(1)
         
         opciones_todos = {int(row['Codigo']): f"{int(row['Codigo'])} - {row.get('Descripcion', 'Desconocido')}" for _, row in df_ultimos_masivo.iterrows()}
@@ -451,11 +456,11 @@ if archivos_subidos:
                 key="filtro_seccion_4"
             )
         
-        # SPINNER MIENTRAS CALCULA TODOS LOS PRODUCTOS
+        # SPINNER MIENTRAS CALCULA
         with st.spinner("Calculando proyecciones... esto puede tomar unos segundos."):
             resultados_masivos = []
             
-            # Si se filtró, solo procesamos ese para mayor velocidad
+            # Si se filtró un código específico de la lista permitida, solo procesamos ese
             df_a_procesar = df_ultimos_masivo if filtro_seleccionado == "Todos" else df_ultimos_masivo[df_ultimos_masivo['Codigo'] == filtro_seleccionado]
             
             for _, row in df_a_procesar.iterrows():
@@ -505,11 +510,6 @@ if archivos_subidos:
                 st.dataframe(df_resultados.style.format(format_dict), use_container_width=True)
             else:
                 st.info("No hay información de productos para predecir.")
-                
-    except Exception as e:
-        st.error(f"Error al procesar: {e}")
-        
-        st.dataframe(df_resultados.style.format(format_dict), use_container_width=True)
                 
     except Exception as e:
         st.error(f"Error al procesar: {e}")
