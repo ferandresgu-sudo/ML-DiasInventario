@@ -153,19 +153,19 @@ if archivos_subidos:
         
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         with col_m1:
-            st.metric(label="Error WAPE (Global)", value=f"{wape_val:.2f}%", help="Porcentaje de error ponderado (Eval real: 20% datos no vistos).")
+            st.metric(label="Error WAPE (Global)", value=f"{wape_val:.2f}%", help="Porcentaje de error ponderado.")
         with col_m2:
-            st.metric(label="Error Promedio (MAE)", value=f"${mae_val:,.2f}", help="Promedio absoluto del error en pesos (Eval real: 20% datos no vistos).")
+            st.metric(label="Error Promedio (MAE)", value=f"${mae_val:,.2f}", help="Promedio absoluto del error.")
         with col_m3:
-            st.metric(label="Penalización (RMSE)", value=f"${rmse_val:,.2f}", help="Castiga errores grandes. Entre más alto, más atípicos tienes.")
+            st.metric(label="Penalización (RMSE)", value=f"${rmse_val:,.2f}", help="Castiga errores grandes.")
         with col_m4:
             r2_display = f"{max(0, r2_val):.2f}"
-            st.metric(label="Explicabilidad (R²)", value=r2_display, help="De 0 a 1. Ahora refleja la capacidad real del modelo en el futuro.")
+            st.metric(label="Explicabilidad (R²)", value=r2_display, help="De 0 a 1. Capacidad real del modelo.")
             
         st.markdown("---")
         
         CODIGOS_PREDICCION = [
-           7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+            7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -214,11 +214,10 @@ if archivos_subidos:
             7502252484247, 7502252482038, 7502252482045, 7502252480263, 7502252480287, 7502252483929, 7502252483936, 
             7502252483943, 7502252484469, 7502252482236, 7502252482359, 7502252482250, 7502252487637, 7502252487675, 
             7502252488184, 7502252488214, 7502252488887, 7502252488894, 7502252488900, 7502252480584, 7502252485077
-
         ]
 
         CODIGOS_TABLA = [
-           7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+            7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -302,14 +301,13 @@ if archivos_subidos:
                 
             with col_sim3:
                 semanas_proyectar = st.slider(
-                    "Semanas a proyectar al futuro:",
+                    "Semanas a proyectar al futuro (Gráfica):",
                     min_value=1,
                     max_value=8,
                     value=4,
-                    help="Numero de semanas futuras que se predeciran en cadena."
+                    key="slider_grafica"
                 )
 
-            # OBTENER DATOS DEL PRODUCTO
             df_hist_prod = df_pred[df_pred['Codigo'] == codigo_seleccionado].sort_values('Semana')
             
             if not df_hist_prod.empty:
@@ -319,10 +317,8 @@ if archivos_subidos:
                 venta_actual = df_ultimo_registro['Monto de ventas']
                 venta_1_atras = df_ultimo_registro['Venta_1_Semana_Atras']
                 
-                # CALCULAR PREDICCIONES FUTURAS RECURSIVAS
                 preds_futuras = predecir_futuro_recursivo(modelo_rf, venta_actual, venta_1_atras, semanas_proyectar)
                 
-                # CREAR DATAFRAME COMBINADO DE REALES + PROYECCIONES
                 df_real = df_hist_prod[['Semana', 'Monto de ventas']].copy()
                 df_real['Tipo'] = 'Historico Real'
                 
@@ -335,7 +331,6 @@ if archivos_subidos:
                         'Tipo': f'Proyeccion ({idx}a sem)'
                     })
                 
-                # Punto de conexion para la grafica continua
                 filas_futuras.insert(0, {
                     'Semana': semana_max,
                     'Monto de ventas': venta_actual,
@@ -367,12 +362,10 @@ if archivos_subidos:
                 
                 st.altair_chart(grafica, use_container_width=True)
 
-                # RESULTADOS DE LA PREDICCIÓN
                 inv_actual = df_ultimo_registro['Inventario']
                 inv_actual = 0 if pd.isna(inv_actual) else inv_actual
                 inv_futuro = inv_actual + monto_enviar
                 
-                # Venta promedio estimada en el horizonte proyectado
                 venta_prom_est = np.mean(preds_futuras)
                 dias_inv = (inv_futuro / venta_prom_est) * 30 if venta_prom_est > 0 else 0
                 
@@ -430,68 +423,91 @@ if archivos_subidos:
         # 4. TABLA GENERAL DE PREDICCIONES (TODOS LOS PRODUCTOS)
         # ========================================================
         st.subheader("4. Proyeccion Masiva de Inventario (Todos los Productos)")
-        st.markdown("Tabla con el cálculo acumulado de ventas proyectadas y cobertura de inventario.")
+        st.markdown("Tabla con el cálculo de ventas proyectadas y cobertura de inventario para todo el catálogo general.")
         
-        opciones_filtro_tabla = ["Todos"] + list(opciones_productos.keys())
+        # PREPARAR DATA COMPLETA (NO SOLO LOS CODIGOS FILTRADOS DE LA SECCION 2)
+        df_todos = df_global.dropna(subset=['Codigo']).copy()
+        df_ultimos_masivo = df_todos.sort_values('Semana').groupby('Codigo').tail(1)
         
-        filtro_seleccionado = st.selectbox(
-            "Filtra la tabla por un producto especifico (o selecciona 'Todos'):",
-            options=opciones_filtro_tabla,
-            format_func=lambda x: "Todos los productos" if x == "Todos" else opciones_productos[x],
-            key="filtro_seccion_4"
-        )
+        opciones_todos = {int(row['Codigo']): f"{int(row['Codigo'])} - {row.get('Descripcion', 'Desconocido')}" for _, row in df_ultimos_masivo.iterrows()}
+        opciones_filtro_tabla = ["Todos"] + list(opciones_todos.keys())
         
-        resultados_masivos = []
-        df_ultimos_masivo = df_pred.sort_values('Semana').groupby('Codigo').tail(1)
+        col_masiva1, col_masiva2 = st.columns(2)
         
-        for _, row in df_ultimos_masivo.iterrows():
-            codigo = int(row['Codigo'])
-            descripcion = row.get('Descripcion', 'Desconocido')
-            venta_actual = row['Monto de ventas']
-            venta_1_atras = row['Venta_1_Semana_Atras']
+        with col_masiva1:
+            semanas_proyectar_masivo = st.slider(
+                "Semanas a predecir en la tabla masiva:",
+                min_value=1,
+                max_value=12,
+                value=4,
+                key="slider_masiva"
+            )
             
-            inv_actual = row['Inventario']
-            inv_actual = 0.0 if pd.isna(inv_actual) else inv_actual
+        with col_masiva2:
+            filtro_seleccionado = st.selectbox(
+                "Filtra la tabla por un producto (o selecciona 'Todos'):",
+                options=opciones_filtro_tabla,
+                format_func=lambda x: "Todos los productos" if x == "Todos" else opciones_todos[x],
+                key="filtro_seccion_4"
+            )
+        
+        # SPINNER MIENTRAS CALCULA TODOS LOS PRODUCTOS
+        with st.spinner("Calculando proyecciones... esto puede tomar unos segundos."):
+            resultados_masivos = []
             
-            # Predicciones encadenadas para el horizonte elegido
-            preds_futuras = predecir_futuro_recursivo(modelo_rf, venta_actual, venta_1_atras, semanas_proyectar)
-            venta_est_prox = preds_futuras[0]               
-            venta_prom_horizonte = np.mean(preds_futuras)     
+            # Si se filtró, solo procesamos ese para mayor velocidad
+            df_a_procesar = df_ultimos_masivo if filtro_seleccionado == "Todos" else df_ultimos_masivo[df_ultimos_masivo['Codigo'] == filtro_seleccionado]
             
-            inv_futuro = inv_actual + monto_enviar
-            dias_inv = (inv_futuro / venta_prom_horizonte) * 30 if venta_prom_horizonte > 0 else 0
-            
-            res_dict = {
-                'Codigo': codigo,
-                'Descripcion': descripcion,
-                'Inv. Actual ($)': inv_actual,
-                'Inv. Simulado ($)': inv_futuro,
-                'Venta Est. Sem +1 ($)': venta_est_prox,
-                f'Venta Prom. ({semanas_proyectar} sem) ($)': venta_prom_horizonte,
-                'Dias de Inventario': dias_inv
-            }
-            
-            # Agregar columnas por cada semana proyectada
-            for sem_idx, p_val in enumerate(preds_futuras, start=1):
-                res_dict[f'Pred. Sem +{sem_idx} ($)'] = p_val
+            for _, row in df_a_procesar.iterrows():
+                codigo = int(row['Codigo'])
+                descripcion = row.get('Descripcion', 'Desconocido')
                 
-            resultados_masivos.append(res_dict)
+                # Manejar valores vacíos con 0
+                venta_actual = row['Monto de ventas'] if pd.notna(row['Monto de ventas']) else 0.0
+                venta_1_atras = row['Venta_1_Semana_Atras'] if pd.notna(row['Venta_1_Semana_Atras']) else 0.0
+                inv_actual = row['Inventario'] if pd.notna(row['Inventario']) else 0.0
+                
+                # Predicciones encadenadas exclusivas para esta tabla
+                preds_futuras = predecir_futuro_recursivo(modelo_rf, venta_actual, venta_1_atras, semanas_proyectar_masivo)
+                venta_est_prox = preds_futuras[0]               
+                venta_prom_horizonte = np.mean(preds_futuras)     
+                
+                dias_inv = (inv_actual / venta_prom_horizonte) * 30 if venta_prom_horizonte > 0 else 0
+                
+                res_dict = {
+                    'Codigo': codigo,
+                    'Descripcion': descripcion,
+                    'Inv. Actual ($)': inv_actual,
+                    'Venta Est. Sem +1 ($)': venta_est_prox,
+                    f'Venta Prom. ({semanas_proyectar_masivo} sem) ($)': venta_prom_horizonte,
+                    'Dias de Inventario (Proyectados)': dias_inv
+                }
+                
+                # Agregar dinámicamente columnas según el slider
+                for sem_idx, p_val in enumerate(preds_futuras, start=1):
+                    res_dict[f'Pred. Sem +{sem_idx} ($)'] = p_val
+                    
+                resultados_masivos.append(res_dict)
+                
+            df_resultados = pd.DataFrame(resultados_masivos)
             
-        df_resultados = pd.DataFrame(resultados_masivos)
-        
-        if filtro_seleccionado != "Todos":
-            df_resultados = df_resultados[df_resultados['Codigo'] == filtro_seleccionado]
-            
-        # Formato dinamico de moneda/decimales
-        format_dict = {
-            'Inv. Actual ($)': '${:,.2f}',
-            'Inv. Simulado ($)': '${:,.2f}',
-            'Venta Est. Sem +1 ($)': '${:,.2f}',
-            f'Venta Prom. ({semanas_proyectar} sem) ($)': '${:,.2f}',
-            'Dias de Inventario': '{:.1f}'
-        }
-        for sem_idx in range(1, semanas_proyectar + 1):
-            format_dict[f'Pred. Sem +{sem_idx} ($)'] = '${:,.2f}'
+            if not df_resultados.empty:
+                # Formato dinamico de moneda/decimales
+                format_dict = {
+                    'Inv. Actual ($)': '${:,.2f}',
+                    'Venta Est. Sem +1 ($)': '${:,.2f}',
+                    f'Venta Prom. ({semanas_proyectar_masivo} sem) ($)': '${:,.2f}',
+                    'Dias de Inventario (Proyectados)': '{:.1f}'
+                }
+                for sem_idx in range(1, semanas_proyectar_masivo + 1):
+                    format_dict[f'Pred. Sem +{sem_idx} ($)'] = '${:,.2f}'
+                
+                st.dataframe(df_resultados.style.format(format_dict), use_container_width=True)
+            else:
+                st.info("No hay información de productos para predecir.")
+                
+    except Exception as e:
+        st.error(f"Error al procesar: {e}")
         
         st.dataframe(df_resultados.style.format(format_dict), use_container_width=True)
                 
