@@ -165,7 +165,7 @@ if archivos_subidos:
         st.markdown("---")
         
         CODIGOS_PREDICCION = [
-          7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+           7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -423,9 +423,9 @@ if archivos_subidos:
         # 4. TABLA GENERAL DE PREDICCIONES (CÓDIGOS PERMITIDOS)
         # ========================================================
         st.subheader("4. Proyeccion Masiva de Inventario (Codigos Seleccionados)")
-        st.markdown("Tabla con ventas y *días de inventario proyectados por semana*, asumiendo que el inventario se va agotando con las ventas.")
+        st.markdown("Tabla que muestra el inventario inicial simulado restando las ventas semana a semana para identificar quiebres de stock.")
         
-        # Combinar ambas listas y filtrar (cumpliendo con tu instrucción anterior)
+        # Combinar ambas listas y filtrar
         CODIGOS_PERMITIDOS = list(set(CODIGOS_PREDICCION + CODIGOS_TABLA))
         df_todos = df_global.dropna(subset=['Codigo']).copy()
         df_todos = df_todos[df_todos['Codigo'].isin(CODIGOS_PERMITIDOS)]
@@ -468,30 +468,27 @@ if archivos_subidos:
                 inv_actual = row['Inventario'] if pd.notna(row['Inventario']) else 0.0
                 
                 preds_futuras = predecir_futuro_recursivo(modelo_rf, venta_actual, venta_1_atras, semanas_proyectar_masivo)
-                venta_est_prox = preds_futuras[0]               
-                venta_prom_horizonte = np.mean(preds_futuras)     
-                
-                dias_inv_promedio = (inv_actual / venta_prom_horizonte) * 30 if venta_prom_horizonte > 0 else 0
                 
                 res_dict = {
                     'Codigo': codigo,
                     'Descripcion': descripcion,
-                    'Inv. Actual ($)': inv_actual,
-                    'Venta Est. Sem +1 ($)': venta_est_prox,
-                    f'Venta Prom. ({semanas_proyectar_masivo} sem) ($)': venta_prom_horizonte,
-                    'Dias Inv (Global Promedio)': dias_inv_promedio
+                    'Inv. Actual (Inicial)': inv_actual
                 }
                 
                 # Proyección dinámica semana a semana
                 inv_simulado = inv_actual
                 for sem_idx, p_val in enumerate(preds_futuras, start=1):
+                    # 1. Registrar Inventario disponible para esa semana
+                    res_dict[f'Inv. Sem +{sem_idx} ($)'] = inv_simulado
+                    
+                    # 2. Registrar Venta esperada
                     res_dict[f'Pred. Sem +{sem_idx} ($)'] = p_val
                     
-                    # Calcular los días de inventario restantes con el ritmo de esta semana en específico
+                    # 3. Calcular Días de Inventario basados en ese inventario y esa venta
                     dias_inv_semana = (inv_simulado / p_val) * 30 if p_val > 0 else 0
                     res_dict[f'Dias Inv Sem +{sem_idx}'] = dias_inv_semana
                     
-                    # Restar la venta proyectada al inventario para que la siguiente semana tenga menos stock
+                    # 4. Restar la venta al inventario (para que la siguiente semana arranque con menos)
                     inv_simulado = max(0, inv_simulado - p_val)
                     
                 resultados_masivos.append(res_dict)
@@ -499,15 +496,14 @@ if archivos_subidos:
             df_resultados = pd.DataFrame(resultados_masivos)
             
             if not df_resultados.empty:
+                # Formato dinámico para acomodar todas las columnas generadas
                 format_dict = {
-                    'Inv. Actual ($)': '${:,.2f}',
-                    'Venta Est. Sem +1 ($)': '${:,.2f}',
-                    f'Venta Prom. ({semanas_proyectar_masivo} sem) ($)': '${:,.2f}',
-                    'Dias Inv (Global Promedio)': '{:.1f}'
+                    'Inv. Actual (Inicial)': '${:,.2f}'
                 }
                 for sem_idx in range(1, semanas_proyectar_masivo + 1):
+                    format_dict[f'Inv. Sem +{sem_idx} ($)'] = '${:,.2f}'
                     format_dict[f'Pred. Sem +{sem_idx} ($)'] = '${:,.2f}'
-                    format_dict[f'Dias Inv Sem +{sem_idx}'] = '{:.1f}'  # Formato para la nueva columna
+                    format_dict[f'Dias Inv Sem +{sem_idx}'] = '{:.1f}'
                 
                 st.dataframe(df_resultados.style.format(format_dict), use_container_width=True)
             else:
