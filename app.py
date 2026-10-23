@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import datetime
-from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import altair as alt
 
@@ -17,13 +17,10 @@ st.title("📦 Simulador Predictivo de Dias de Inventario")
 st.markdown("Sube todos los archivos de tu carpeta historica para entrenar el modelo y analizar el desempeño por producto.")
 
 # ========================================================
-# CONSTANTES: FEATURES DEL MODELO
+# CONSTANTES: 3 FEATURES MINIMALISTAS
 # ========================================================
-FEATURES = [
-    'Venta_lag1', 'Venta_lag2', 'Venta_lag3',
-    'Venta_MA3', 'Venta_STD3',
-    'Venta_mean_codigo', 'Inv_lag1',
-]
+FEATURES = ['Venta_lag1', 'Venta_lag2', 'Venta_MA3']
+
 
 # ========================================================
 # FUNCIONES AUXILIARES
@@ -40,74 +37,63 @@ def obtener_rango_fechas(semana_num):
 
 
 def construir_features(df):
-    """Agrega lags, medias moviles, volatilidad, media historica y lag de inventario."""
+    """Version minimalista: solo 3 features para no perder filas por NaN."""
     df = df.sort_values(['Codigo', 'Semana']).copy()
-    for lag in [1, 2, 3]:
-        df[f'Venta_lag{lag}'] = df.groupby('Codigo')['Monto de ventas'].shift(lag)
+    df['Venta_lag1'] = df.groupby('Codigo')['Monto de ventas'].shift(1)
+    df['Venta_lag2'] = df.groupby('Codigo')['Monto de ventas'].shift(2)
     df['Venta_MA3'] = df.groupby('Codigo')['Monto de ventas'].transform(
-        lambda s: s.shift(1).rolling(3, min_periods=1).mean()
+        lambda s: s.shift(1).rolling(3, min_periods=2).mean()
     )
-    df['Venta_STD3'] = df.groupby('Codigo')['Monto de ventas'].transform(
-        lambda s: s.shift(1).rolling(3, min_periods=2).std()
-    ).fillna(0)
-    df['Venta_mean_codigo'] = df.groupby('Codigo')['Monto de ventas'].transform(
-        lambda s: s.shift(1).expanding().mean()
-    )
-    if 'Inventario' in df.columns:
-        df['Inv_lag1'] = df.groupby('Codigo')['Inventario'].shift(1).fillna(df['Inventario'])
-    else:
-        df['Inv_lag1'] = 0.0
     return df
 
 
-def es_bajo_volumen(hist_ventas, umbral_ceros=0.4):
-    """True si >40% de semanas son cero o casi cero -> usar mediana simple."""
+def es_bajo_volumen(hist_ventas, umbral_ceros=0.6):
+    """True si >60% de semanas son cero/casi cero -> usar mediana simple."""
     if len(hist_ventas) == 0:
         return False
     return float((hist_ventas <= 0.01).mean()) > umbral_ceros
 
 
-def construir_modelo_hgb():
-    """HistGradientBoosting con loss MAE (con fallback si la version no lo soporta)."""
-    try:
-        return HistGradientBoostingRegressor(
-            max_iter=400, max_depth=6, learning_rate=0.05,
-            min_samples_leaf=5, l2_regularization=1.0,
-            loss='absolute_error', random_state=42,
-        )
-    except TypeError:
-        return HistGradientBoostingRegressor(
-            max_iter=400, max_depth=6, learning_rate=0.05,
-            min_samples_leaf=5, l2_regularization=1.0,
-            random_state=42,
-        )
+def construir_modelo_conservador():
+    """RandomForest pensado para datos escasos (18 semanas)."""
+    return RandomForestRegressor(
+        n_estimators=300,
+        max_depth=6,
+        min_samples_leaf=8,
+        min_samples_split=12,
+        max_features=1.0,
+        criterion='absolute_error',
+        random_state=42,
+        n_jobs=-1,
+    )
 
 
 def entrenar_modelos_directos(df, max_horizonte, min_filas=15):
     """
     Entrena UN modelo por horizonte h = 1..max_horizonte.
-    Cada modelo aprende: features(t) -> venta(t+h). Sin realimentacion.
+    Devuelve (modelos_dict, filas_por_horizonte_dict).
     """
     df_fe = construir_features(df)
     modelos = {}
+    filas_por_horizonte = {}
+
     for h in range(1, max_horizonte + 1):
         target = f'target_h{h}'
         df_fe[target] = df_fe.groupby('Codigo')['Monto de ventas'].shift(-h)
         sub = df_fe.dropna(subset=FEATURES + [target])
+        filas_por_horizonte[h] = len(sub)
         if len(sub) < min_filas:
             continue
-        m = construir_modelo_hgb()
+        m = construir_modelo_conservador()
         m.fit(sub[FEATURES], sub[target])
         modelos[h] = m
-    return modelos
+
+    return modelos, filas_por_horizonte
 
 
 def predecir_directo(modelos, df_historial, codigo, n_semanas):
     """
-    Predice n_semanas SIN realimentar. Aplica:
-      - fallback a media si el horizonte no tiene modelo
-      - tratamiento de bajo volumen (mediana simple)
-      - clipping al rango historico [min*0.3, max*1.5]
+    Predice sin realimentar. Aplica bajo volumen y clipping amplio [0.5x, 2x].
     """
     df_fe = construir_features(df_historial)
     estado = df_fe[df_fe['Codigo'] == codigo].sort_values('Semana').tail(1)
@@ -116,13 +102,13 @@ def predecir_directo(modelos, df_historial, codigo, n_semanas):
     if estado.empty or len(hist) == 0:
         return [0.01] * n_semanas
 
-    if es_bajo_volumen(hist):
+    if es_bajo_volumen(hist, umbral_ceros=0.6):
         mediana = float(hist[hist > 0].median()) if (hist > 0).any() else 0.01
         return [max(0.01, mediana)] * n_semanas
 
     X_input = estado[FEATURES]
-    piso = max(0.01, float(hist.min()) * 0.3)
-    techo = float(hist.max()) * 1.5
+    piso = max(0.01, float(hist.min()) * 0.5)
+    techo = float(hist.max()) * 2.0
     media = float(hist.mean())
 
     preds = []
@@ -134,15 +120,14 @@ def predecir_directo(modelos, df_historial, codigo, n_semanas):
                 p = media
         else:
             p = media
-        p = float(np.clip(p, piso, techo))
-        preds.append(max(0.01, p))
+        preds.append(max(0.01, float(np.clip(p, piso, techo))))
     return preds
 
 
 # ========================================================
 # CARGA Y ENTRENAMIENTO GLOBAL
 # ========================================================
-@st.cache_resource(show_spinner="Procesando archivos y entrenando modelos directos, esto puede tomar unos segundos.")
+@st.cache_resource(show_spinner="Procesando archivos y entrenando modelos, esto puede tomar unos segundos.")
 def cargar_y_entrenar(archivos_subidos):
     lista_dfs = []
     for archivo in archivos_subidos:
@@ -182,20 +167,22 @@ def cargar_y_entrenar(archivos_subidos):
 
     df = df.sort_values(['Codigo', 'Semana']).reset_index(drop=True)
 
-    # Compatibilidad con partes visuales que usan lags simples
+    # Compatibilidad para secciones visuales
     df['Venta_1_Semana_Atras'] = df.groupby('Codigo')['Monto de ventas'].shift(1)
     df['Venta_2_Semanas_Atras'] = df.groupby('Codigo')['Monto de ventas'].shift(2)
 
     if df.dropna(subset=['Monto de ventas']).empty:
         raise ValueError("No hay datos de ventas validos.")
 
-    # Entrenar modelos directos hasta 12 horizontes
-    modelos_directos = entrenar_modelos_directos(df, max_horizonte=12)
+    # Entrenar modelos directos (1..12 horizontes)
+    modelos_directos, filas_por_horizonte = entrenar_modelos_directos(
+        df, max_horizonte=12, min_filas=10
+    )
 
     if not modelos_directos:
         raise ValueError("No hay suficientes datos para entrenar (se necesitan al menos 5-6 semanas por producto).")
 
-    # Metricas IN-SAMPLE (referencia rapida, sesgadas). El backtest es la fuente honesta
+    # Metricas in-sample (referencia rapida, sesgadas)
     df_fe = construir_features(df)
     df_fe['target_h1'] = df_fe.groupby('Codigo')['Monto de ventas'].shift(-1)
     sub = df_fe.dropna(subset=FEATURES + ['target_h1'])
@@ -212,7 +199,7 @@ def cargar_y_entrenar(archivos_subidos):
     else:
         wape = mae = rmse = r2 = 0.0
 
-    return df, modelos_directos, wape, mae, rmse, r2
+    return df, modelos_directos, filas_por_horizonte, wape, mae, rmse, r2
 
 
 # ========================================================
@@ -240,9 +227,11 @@ def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
     df_train = pd.concat(train_rows, ignore_index=True)
     df_held = pd.concat(held_rows, ignore_index=True) if held_rows else pd.DataFrame()
 
-    modelos_bt = entrenar_modelos_directos(df_train, max_horizonte=n_semanas_holdout, min_filas=8)
+    modelos_bt, filas_bt = entrenar_modelos_directos(
+        df_train, max_horizonte=n_semanas_holdout, min_filas=6
+    )
 
-    return modelos_bt, df_held, df_train
+    return modelos_bt, df_held, df_train, filas_bt
 
 
 # ========================================================
@@ -257,12 +246,14 @@ archivos_subidos = st.file_uploader(
 
 if archivos_subidos:
     try:
-        df_global, modelos_directos, wape_val, mae_val, rmse_val, r2_val = cargar_y_entrenar(archivos_subidos)
+        df_global, modelos_directos, filas_por_horizonte, wape_val, mae_val, rmse_val, r2_val = cargar_y_entrenar(archivos_subidos)
 
         st.success("Archivos cargados y modelos entrenados con exito!")
 
         st.markdown("##### Metricas de Ajuste (in-sample — referencia rapida)")
-        st.caption("⚠️ Estas metricas son IN-SAMPLE (suelen ser optimistas). Usa la seccion 1.5 (Backtest) para la evaluacion honesta out-of-sample.")
+        st.caption(
+            "⚠️ Estas metricas son IN-SAMPLE (optimistas). Usa la seccion 1.5 (Backtest) para la evaluacion honesta out-of-sample."
+        )
 
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         with col_m1:
@@ -274,10 +265,23 @@ if archivos_subidos:
         with col_m4:
             st.metric(label="R² (in-sample)", value=f"{max(0, r2_val):.2f}")
 
+        # Diagnostico de horizontes entrenados
+        with st.expander("🔧 Diagnostico del modelo (horizontes entrenados)"):
+            horizontes_ok = sorted(modelos_directos.keys())
+            st.write(f"**Horizontes entrenados**: {horizontes_ok}")
+            st.write(f"**Total productos**: {df_global['Codigo'].nunique()}")
+            st.write(f"**Total semanas historicas**: {df_global['Semana'].nunique()}")
+            df_filas = pd.DataFrame({
+                'Horizonte': list(filas_por_horizonte.keys()),
+                'Filas utiles': list(filas_por_horizonte.values()),
+                'Entrenado': [h in modelos_directos for h in filas_por_horizonte.keys()],
+            })
+            st.dataframe(df_filas, use_container_width=True, hide_index=True)
+
         st.markdown("---")
 
         CODIGOS_PREDICCION = [
-          7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+      7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -327,7 +331,7 @@ if archivos_subidos:
             7502252483943, 7502252484469, 7502252482236, 7502252482359, 7502252482250, 7502252487637, 7502252487675, 
             7502252488184, 7502252488214, 7502252488887, 7502252488894, 7502252488900, 7502252480584, 7502252485077]
         CODIGOS_TABLA = [
-         7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+        7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -399,14 +403,17 @@ if archivos_subidos:
             )
 
         try:
-            modelos_bt, df_held_bt, df_train_bt = entrenar_backtest(
+            modelos_bt, df_held_bt, df_train_bt, filas_bt = entrenar_backtest(
                 df_global, semanas_holdout, tuple(CODIGOS_PREDICCION)
             )
 
             if df_held_bt.empty:
                 st.warning("No hay suficientes semanas historicas por producto para hacer el backtest.")
             elif not modelos_bt:
-                st.warning("No hay datos suficientes para entrenar ningun modelo directo en el backtest.")
+                st.warning(
+                    "No hay datos suficientes para entrenar ningun modelo en el backtest. "
+                    "Prueba con menos semanas reservadas (ej. 2-3)."
+                )
             else:
                 resultados_bt = []
                 for codigo, group in df_held_bt.groupby('Codigo'):
@@ -463,6 +470,16 @@ if archivos_subidos:
                             f"Total de predicciones evaluadas: **{len(y_true)}** "
                             f"({df_bt_filt['Codigo'].nunique()} productos × semanas seleccionadas)"
                         )
+
+                        # Diagnostico backtest: que horizontes se pudieron entrenar
+                        with st.expander("🔧 Diagnostico del backtest (horizontes entrenados)"):
+                            st.write(f"**Horizontes entrenados en backtest**: {sorted(modelos_bt.keys())}")
+                            df_filas_bt = pd.DataFrame({
+                                'Horizonte': list(filas_bt.keys()),
+                                'Filas utiles': list(filas_bt.values()),
+                                'Entrenado': [h in modelos_bt for h in filas_bt.keys()],
+                            })
+                            st.dataframe(df_filas_bt, use_container_width=True, hide_index=True)
 
                         st.markdown("##### 🔍 Comparativa Real vs Predicho (suma agregada por semana)")
                         df_chart = df_bt_filt.groupby('Semana_Predecida').agg({
