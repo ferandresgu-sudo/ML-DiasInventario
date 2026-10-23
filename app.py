@@ -4,6 +4,7 @@ import numpy as np
 import datetime
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
 import altair as alt
 
 # ========================================================
@@ -17,13 +18,7 @@ st.title("📦 Simulador Predictivo de Dias de Inventario")
 st.markdown("Sube todos los archivos de tu carpeta historica para entrenar el modelo y analizar el desempeño por producto.")
 
 # ========================================================
-# CONSTANTES: 3 FEATURES MINIMALISTAS
-# ========================================================
-FEATURES = ['Venta_lag1', 'Venta_lag2', 'Venta_MA3']
-
-
-# ========================================================
-# FUNCIONES AUXILIARES
+# FUNCION PARA CONVERTIR NUMERO DE SEMANA A RANGO DE FECHAS
 # ========================================================
 def obtener_rango_fechas(semana_num):
     base_date = datetime.date(2026, 6, 15)
@@ -35,99 +30,87 @@ def obtener_rango_fechas(semana_num):
              7:'jul',8:'ago',9:'sep',10:'oct',11:'nov',12:'dic'}
     return f"{start_date.day:02d} {meses[start_date.month]} - {end_date.day:02d} {meses[end_date.month]}"
 
-
-def construir_features(df):
-    """Version minimalista: solo 3 features para no perder filas por NaN."""
-    df = df.sort_values(['Codigo', 'Semana']).copy()
-    df['Venta_lag1'] = df.groupby('Codigo')['Monto de ventas'].shift(1)
-    df['Venta_lag2'] = df.groupby('Codigo')['Monto de ventas'].shift(2)
-    df['Venta_MA3'] = df.groupby('Codigo')['Monto de ventas'].transform(
-        lambda s: s.shift(1).rolling(3, min_periods=2).mean()
-    )
-    return df
-
-
-def es_bajo_volumen(hist_ventas, umbral_ceros=0.6):
-    """True si >60% de semanas son cero/casi cero -> usar mediana simple."""
-    if len(hist_ventas) == 0:
-        return False
-    return float((hist_ventas <= 0.01).mean()) > umbral_ceros
-
-
-def construir_modelo_conservador():
-    """RandomForest pensado para datos escasos (18 semanas)."""
-    return RandomForestRegressor(
-        n_estimators=300,
-        max_depth=6,
-        min_samples_leaf=8,
-        min_samples_split=12,
-        max_features=1.0,
-        criterion='absolute_error',
-        random_state=42,
-        n_jobs=-1,
-    )
-
-
-def entrenar_modelos_directos(df, max_horizonte, min_filas=15):
+# ========================================================
+# CLASIFICACION DE PRODUCTOS POR COMPORTAMIENTO
+# ========================================================
+def clasificar_producto(hist_ventas):
     """
-    Entrena UN modelo por horizonte h = 1..max_horizonte.
-    Devuelve (modelos_dict, filas_por_horizonte_dict).
+    Devuelve uno de: 'estable', 'volatil', 'intermitente'.
+    - Intermitente: >50% de las semanas son cero/casi cero.
+    - Volatil: CV (std/mean) >= 0.4.
+    - Estable: CV < 0.4.
     """
-    df_fe = construir_features(df)
-    modelos = {}
-    filas_por_horizonte = {}
-
-    for h in range(1, max_horizonte + 1):
-        target = f'target_h{h}'
-        df_fe[target] = df_fe.groupby('Codigo')['Monto de ventas'].shift(-h)
-        sub = df_fe.dropna(subset=FEATURES + [target])
-        filas_por_horizonte[h] = len(sub)
-        if len(sub) < min_filas:
-            continue
-        m = construir_modelo_conservador()
-        m.fit(sub[FEATURES], sub[target])
-        modelos[h] = m
-
-    return modelos, filas_por_horizonte
-
-
-def predecir_directo(modelos, df_historial, codigo, n_semanas):
-    """
-    Predice sin realimentar. Aplica bajo volumen y clipping amplio [0.5x, 2x].
-    """
-    df_fe = construir_features(df_historial)
-    estado = df_fe[df_fe['Codigo'] == codigo].sort_values('Semana').tail(1)
-    hist = df_historial[df_historial['Codigo'] == codigo]['Monto de ventas'].dropna()
-
-    if estado.empty or len(hist) == 0:
-        return [0.01] * n_semanas
-
-    if es_bajo_volumen(hist, umbral_ceros=0.6):
-        mediana = float(hist[hist > 0].median()) if (hist > 0).any() else 0.01
-        return [max(0.01, mediana)] * n_semanas
-
-    X_input = estado[FEATURES]
-    piso = max(0.01, float(hist.min()) * 0.5)
-    techo = float(hist.max()) * 2.0
-    media = float(hist.mean())
-
-    preds = []
-    for h in range(1, n_semanas + 1):
-        if h in modelos:
-            try:
-                p = float(modelos[h].predict(X_input)[0])
-            except Exception:
-                p = media
-        else:
-            p = media
-        preds.append(max(0.01, float(np.clip(p, piso, techo))))
-    return preds
-
+    hist = pd.Series(hist_ventas).dropna()
+    if len(hist) < 4:
+        return 'volatil'
+    pct_ceros = float((hist <= 0.01).mean())
+    if pct_ceros > 0.5:
+        return 'intermitente'
+    mean_val = float(hist.mean())
+    if mean_val <= 0:
+        return 'intermitente'
+    cv = float(hist.std() / mean_val) if len(hist) > 1 else 0.0
+    return 'estable' if cv < 0.4 else 'volatil'
 
 # ========================================================
-# CARGA Y ENTRENAMIENTO GLOBAL
+# PREDICCION RECURSIVA (MODELO ESTABLE — TU ORIGINAL)
 # ========================================================
-@st.cache_resource(show_spinner="Procesando archivos y entrenando modelos, esto puede tomar unos segundos.")
+def predecir_futuro_recursivo(modelo, venta_actual, venta_1_atras, n_semanas):
+    predicciones = []
+    v_prev1 = venta_actual
+    v_prev2 = venta_1_atras
+    for _ in range(n_semanas):
+        X_input = pd.DataFrame({
+            'Venta_1_Semana_Atras': [v_prev1],
+            'Venta_2_Semanas_Atras': [v_prev2]
+        })
+        pred = modelo.predict(X_input)[0]
+        pred = 0.01 if pd.isna(pred) or pred <= 0 else float(pred)
+        predicciones.append(pred)
+        v_prev2 = v_prev1
+        v_prev1 = pred
+    return predicciones
+
+# ========================================================
+# PREDICCION POR SEGMENTO (NUEVA)
+# ========================================================
+def predecir_por_segmento(modelo_rf, df_historial, codigo, n_semanas):
+    """
+    Elige el metodo segun el comportamiento del producto:
+      - estable      -> RandomForest recursivo (modelo original)
+      - volatil      -> media movil simple (ultimas 3 semanas)
+      - intermitente -> Croston simplificado (mediana de valores positivos)
+    Devuelve (lista_predicciones, segmento).
+    """
+    df_prod = df_historial[df_historial['Codigo'] == codigo].sort_values('Semana')
+    hist = df_prod['Monto de ventas'].dropna()
+
+    if len(hist) == 0:
+        return [0.01] * n_semanas, 'intermitente'
+
+    segmento = clasificar_producto(hist)
+
+    if segmento == 'intermitente':
+        positivos = hist[hist > 0.01]
+        base = float(positivos.median()) if len(positivos) > 0 else 0.01
+        return [max(0.01, base)] * n_semanas, segmento
+
+    if segmento == 'volatil':
+        ultimas = hist.tail(3)
+        base = float(ultimas.mean()) if len(ultimas) > 0 else 0.01
+        return [max(0.01, base)] * n_semanas, segmento
+
+    # Estable: RandomForest recursivo (modelo original)
+    ultimo = df_prod.iloc[-1]
+    venta_actual = ultimo['Monto de ventas'] if pd.notna(ultimo['Monto de ventas']) else 0.0
+    venta_1_atras = ultimo['Venta_1_Semana_Atras'] if pd.notna(ultimo['Venta_1_Semana_Atras']) else 0.0
+    preds = predecir_futuro_recursivo(modelo_rf, venta_actual, venta_1_atras, n_semanas)
+    return preds, segmento
+
+# ========================================================
+# CARGA Y ENTRENAMIENTO GLOBAL (MODELO RF ORIGINAL)
+# ========================================================
+@st.cache_resource(show_spinner="Procesando archivos y entrenando modelo, esto puede tomar unos segundos.")
 def cargar_y_entrenar(archivos_subidos):
     lista_dfs = []
     for archivo in archivos_subidos:
@@ -139,10 +122,8 @@ def cargar_y_entrenar(archivos_subidos):
     if not lista_dfs:
         raise ValueError("No se pudo leer ningun archivo correctamente.")
     df = pd.concat(lista_dfs, ignore_index=True)
-
     nuevas_columnas = [str(col).strip().split('[')[-1].replace(']', '') for col in df.columns]
     df.columns = nuevas_columnas
-
     for col in df.columns:
         col_lower = col.lower()
         if 'descrip' in col_lower: df.rename(columns={col: 'Descripcion'}, inplace=True)
@@ -152,58 +133,39 @@ def cargar_y_entrenar(archivos_subidos):
         elif 'codigo' in col_lower or 'código' in col_lower: df.rename(columns={col: 'Codigo'}, inplace=True)
         elif 'semana' in col_lower: df.rename(columns={col: 'Semana'}, inplace=True)
         elif 'dias' in col_lower and 'inv' in col_lower: df.rename(columns={col: 'Dias Inv'}, inplace=True)
-
     df = df.loc[:, ~df.columns.duplicated()]
-
     df['Codigo'] = pd.to_numeric(df['Codigo'], errors='coerce')
     df['Semana'] = pd.to_numeric(df['Semana'], errors='coerce')
     df['Monto de ventas'] = pd.to_numeric(df['Monto de ventas'], errors='coerce')
     df['Inventario'] = pd.to_numeric(df['Inventario'], errors='coerce')
-
     if 'Dias Inv' in df.columns:
         df['Dias Inv'] = pd.to_numeric(df['Dias Inv'], errors='coerce')
     else:
         df['Dias Inv'] = 0.0
-
-    df = df.sort_values(['Codigo', 'Semana']).reset_index(drop=True)
-
-    # Compatibilidad para secciones visuales
+    df = df.sort_values(by=['Codigo', 'Semana'])
     df['Venta_1_Semana_Atras'] = df.groupby('Codigo')['Monto de ventas'].shift(1)
     df['Venta_2_Semanas_Atras'] = df.groupby('Codigo')['Monto de ventas'].shift(2)
-
-    if df.dropna(subset=['Monto de ventas']).empty:
-        raise ValueError("No hay datos de ventas validos.")
-
-    # Entrenar modelos directos (1..12 horizontes)
-    modelos_directos, filas_por_horizonte = entrenar_modelos_directos(
-        df, max_horizonte=12, min_filas=10
-    )
-
-    if not modelos_directos:
-        raise ValueError("No hay suficientes datos para entrenar (se necesitan al menos 5-6 semanas por producto).")
-
-    # Metricas in-sample (referencia rapida, sesgadas)
-    df_fe = construir_features(df)
-    df_fe['target_h1'] = df_fe.groupby('Codigo')['Monto de ventas'].shift(-1)
-    sub = df_fe.dropna(subset=FEATURES + ['target_h1'])
-
-    if len(sub) > 0 and 1 in modelos_directos:
-        y_pred = modelos_directos[1].predict(sub[FEATURES])
-        y_true = sub['target_h1'].values
-        suma_abs_err = float(np.sum(np.abs(y_true - y_pred)))
-        suma_real = float(np.sum(np.abs(y_true)))
-        wape = (suma_abs_err / suma_real) * 100 if suma_real > 0 else 0.0
-        mae = float(mean_absolute_error(y_true, y_pred))
-        rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-        r2 = float(r2_score(y_true, y_pred))
-    else:
-        wape = mae = rmse = r2 = 0.0
-
-    return df, modelos_directos, filas_por_horizonte, wape, mae, rmse, r2
-
+    df_modelo = df.dropna(subset=['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras', 'Monto de ventas']).copy()
+    if df_modelo.empty:
+        raise ValueError("No hay historial suficiente (se requieren al menos 3 semanas consecutivas).")
+    X = df_modelo[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']]
+    y = df_modelo['Monto de ventas']
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    modelo_evaluador = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)
+    modelo_evaluador.fit(X_train, y_train)
+    predicciones_test = modelo_evaluador.predict(X_test)
+    suma_errores = np.sum(np.abs(y_test - predicciones_test))
+    suma_ventas = np.sum(y_test)
+    wape = (suma_errores / suma_ventas) * 100 if suma_ventas > 0 else 0.0
+    mae = mean_absolute_error(y_test, predicciones_test)
+    rmse = np.sqrt(mean_squared_error(y_test, predicciones_test))
+    r2 = r2_score(y_test, predicciones_test)
+    modelo_final = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)
+    modelo_final.fit(X, y)
+    return df, modelo_final, wape, mae, rmse, r2
 
 # ========================================================
-# BACKTEST CON MODELOS DIRECTOS
+# BACKTEST CON HOLDOUT (MODELO RF ORIGINAL)
 # ========================================================
 @st.cache_resource(show_spinner=False)
 def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
@@ -212,14 +174,15 @@ def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
     df_work = df_work[df_work['Codigo'].isin(codigos_filtro)]
     df_work = df_work.sort_values(['Codigo', 'Semana']).reset_index(drop=True)
 
-    train_rows, held_rows = [], []
+    train_rows = []
+    held_rows = []
     for codigo, group in df_work.groupby('Codigo'):
         group = group.sort_values('Semana').reset_index(drop=True)
         if len(group) <= n_semanas_holdout + 2:
             train_rows.append(group)
-        else:
-            train_rows.append(group.iloc[:-n_semanas_holdout])
-            held_rows.append(group.iloc[-n_semanas_holdout:])
+            continue
+        train_rows.append(group.iloc[:-n_semanas_holdout])
+        held_rows.append(group.iloc[-n_semanas_holdout:])
 
     if not train_rows:
         raise ValueError("No hay datos de entrenamiento suficientes.")
@@ -227,12 +190,21 @@ def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
     df_train = pd.concat(train_rows, ignore_index=True)
     df_held = pd.concat(held_rows, ignore_index=True) if held_rows else pd.DataFrame()
 
-    modelos_bt, filas_bt = entrenar_modelos_directos(
-        df_train, max_horizonte=n_semanas_holdout, min_filas=6
+    df_train = df_train.sort_values(['Codigo', 'Semana'])
+    df_train['Venta_1_Semana_Atras'] = df_train.groupby('Codigo')['Monto de ventas'].shift(1)
+    df_train['Venta_2_Semanas_Atras'] = df_train.groupby('Codigo')['Monto de ventas'].shift(2)
+
+    df_train_model = df_train.dropna(
+        subset=['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras', 'Monto de ventas']
     )
+    if df_train_model.empty:
+        raise ValueError("Sin datos suficientes para entrenar el modelo de backtest.")
 
-    return modelos_bt, df_held, df_train, filas_bt
-
+    X = df_train_model[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']]
+    y = df_train_model['Monto de ventas']
+    modelo = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)
+    modelo.fit(X, y)
+    return modelo, df_held, df_train
 
 # ========================================================
 # INTERFAZ DE USUARIO
@@ -246,56 +218,155 @@ archivos_subidos = st.file_uploader(
 
 if archivos_subidos:
     try:
-        df_global, modelos_directos, filas_por_horizonte, wape_val, mae_val, rmse_val, r2_val = cargar_y_entrenar(archivos_subidos)
+        df_global, modelo_rf, wape_val, mae_val, rmse_val, r2_val = cargar_y_entrenar(archivos_subidos)
+        st.success("Archivos cargados y modelo entrenado con exito!")
 
-        st.success("Archivos cargados y modelos entrenados con exito!")
-
-        st.markdown("##### Metricas de Ajuste (in-sample — referencia rapida)")
-        st.caption(
-            "⚠️ Estas metricas son IN-SAMPLE (optimistas). Usa la seccion 1.5 (Backtest) para la evaluacion honesta out-of-sample."
-        )
-
+        st.markdown("##### Metricas de Ajuste del Modelo (Split Aleatorio)")
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         with col_m1:
-            st.metric(label="WAPE (in-sample)", value=f"{wape_val:.2f}%")
+            st.metric(label="Error WAPE (Global)", value=f"{wape_val:.2f}%", help="Porcentaje de error ponderado.")
         with col_m2:
-            st.metric(label="MAE (in-sample)", value=f"${mae_val:,.2f}")
+            st.metric(label="Error Promedio (MAE)", value=f"${mae_val:,.2f}", help="Promedio absoluto del error.")
         with col_m3:
-            st.metric(label="RMSE (in-sample)", value=f"${rmse_val:,.2f}")
+            st.metric(label="Penalización (RMSE)", value=f"${rmse_val:,.2f}", help="Castiga errores grandes.")
         with col_m4:
-            st.metric(label="R² (in-sample)", value=f"{max(0, r2_val):.2f}")
+            r2_display = f"{max(0, r2_val):.2f}"
+            st.metric(label="Explicabilidad (R²)", value=r2_display, help="De 0 a 1. Capacidad real del modelo.")
 
-        # Diagnostico de horizontes entrenados
-        with st.expander("🔧 Diagnostico del modelo (horizontes entrenados)"):
-            horizontes_ok = sorted(modelos_directos.keys())
-            st.write(f"**Horizontes entrenados**: {horizontes_ok}")
-            st.write(f"**Total productos**: {df_global['Codigo'].nunique()}")
-            st.write(f"**Total semanas historicas**: {df_global['Semana'].nunique()}")
-            df_filas = pd.DataFrame({
-                'Horizonte': list(filas_por_horizonte.keys()),
-                'Filas utiles': list(filas_por_horizonte.values()),
-                'Entrenado': [h in modelos_directos for h in filas_por_horizonte.keys()],
-            })
-            st.dataframe(df_filas, use_container_width=True, hide_index=True)
+        # --- Diagnostico de segmentos por producto ---
+        with st.expander("🧭 Segmentacion de productos por comportamiento"):
+            seg_rows = []
+            for codigo, g in df_global.groupby('Codigo'):
+                hist = g.sort_values('Semana')['Monto de ventas'].dropna()
+                if len(hist) == 0:
+                    continue
+                seg = clasificar_producto(hist)
+                seg_rows.append({
+                    'Codigo': int(codigo),
+                    'Descripcion': g.get('Descripcion', pd.Series(['Desconocido'])).iloc[0],
+                    'Semanas historicas': len(hist),
+                    'CV': round(float(hist.std() / hist.mean()) if hist.mean() > 0 else 0, 3),
+                    '% ceros': round(float((hist <= 0.01).mean()) * 100, 1),
+                    'Segmento': seg,
+                })
+            df_seg = pd.DataFrame(seg_rows).sort_values('Segmento')
+            conteo = df_seg['Segmento'].value_counts().to_dict()
+            c_seg1, c_seg2, c_seg3 = st.columns(3)
+            c_seg1.metric("Estables", conteo.get('estable', 0))
+            c_seg2.metric("Volatiles", conteo.get('volatil', 0))
+            c_seg3.metric("Intermitentes", conteo.get('intermitente', 0))
+            st.dataframe(df_seg, use_container_width=True, hide_index=True)
 
         st.markdown("---")
 
         CODIGOS_PREDICCION = [
-7506475104722, 7501058631961, 7506475112093, 7506475113861, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 7501059234321, 7501058611062, 7506475100250, 7501000913367, 7501058628831, 7501059240681, 7501058619228, 7501059235038, 7501058619211, 7501000913299, 7501058619235, 7501058655172, 7506475117364, 7501058654205, 7501058642127, 7501058642134, 7501058642141, 7501058642165, 7506475108829, 7506475112970, 7506475122764, 7506475101981, 7501058644824, 7501058644862, 7501000912803, 7501058620101, 7501058620095, 7501059224827, 7501058624635, 7506475110112, 7506475114998, 7501058620002, 7501058620019, 7501000912605, 7501058616548, 7501058628466, 7501058628473, 7501058616470, 7506475110105, 7501058646217, 7501058618924, 7501058618931, 7501058618917, 7506475103855, 7501058629135, 7501058629173, 7501058629159, 7501058624130, 7501058624147, 7501058642608, 7501058642592, 7501058618597, 7506475128292, 7501059214590, 7501059214385, 7501059229211, 7501059229228, 7501059239630, 7506475125673, 7506475125680, 7506475117876, 7506475114172, 7506475113564, 7506475105606, 7501058610959, 7501058611857, 7501058613554, 7506475102834, 7501073411173, 7501058624666, 7501059233980, 7501059289659, 7613287216458, 7613037012637, 8585002432315, 88169052054, 7501001604318, 7501001604325, 7501058628664, 7501058628503, 7501059240742, 7501001604103, 7501001604110, 7501059297586, 7506475130325, 7506475130332, 7506475130318, 7506475114356, 7506475102476, 7506475102421, 7506475102452, 7506475102490, 7506475102469, 7506475102520, 7506475102506, 7506475102483, 7506475102537, 75004712, 75004705, 75004767, 75004729, 7501000906246, 7501000906253, 7501000906284, 7501000906680, 7501058651136, 7501058651129, 7506475114073, 7506475115438, 7506475119665, 7506475119672, 7506475115421, 7506475122450, 7506475122436, 7506475122443, 7506475117081, 7506475122139, 7506475122115, 7501058637659, 7891000395745, 7501000909568, 7501058626226, 7501058639493, 7506475103220, 7506475103213, 7501059278691, 7613030884361, 7506475106917, 7501058625212, 7501058623256, 7506475106924, 7501058625229, 7501058623249, 7501058625205, 7501058625236, 7501058623232, 7506475106801, 7506475106771, 7506475106153, 7506475106818, 7506475106788, 7506475106146, 7506475103053, 7506475103275, 7501059275133, 7501059282117, 7501059234390, 7506475112888, 7506475112956, 7506475112895, 7506475112963, 7501059225411, 7501059225350, 7506475103244, 7501059233072, 7501058652683, 7501058651273, 7501058637727, 7501059243880, 7501059243873, 7501058637734, 7501059241060, 7501058637758, 7501058637741, 7501058652652, 16000135437, 16000221284, 7501001625337, 7501058652690, 7506475111546, 7501001625214, 7506475117197, 7506475128117, 7506475128285, 7501001604004, 7501059240216, 7501001604387, 7501059239845, 7613034161086, 7501058615596, 7501058627292, 7501059219106, 7501059242883, 7501059284623, 7501059284630, 7501073419117, 7501001600198, 7501000912889, 10722776200640, 7501059281165, 7501058618566, 7501058617736, 3800020423547, 7891000277119, 7501059288904, 7501059223905, 28000170707, 7891000248362, 7501058623348, 7501058656247, 7501058638090, 7502252484285, 7502252482694, 7502252481796, 7502252480928, 7502252480676, 7502252484247, 7502252482038, 7502252482045, 7502252483929, 7502252483936, 7502252483943, 7502252484469, 7502252482236, 7502252482359, 7502252482250, 7502252487637, 7502252487675, 7502252488184, 7502252488214, 7502252488887, 7502252488894, 7502252488900
-
-        ]
+          7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+            7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
+            7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
+            7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
+            7501059240681, 7501058619228, 7506475113915, 7501059235038, 7501058619211, 7501058632227, 7501000913299, 
+            7501058619235, 7501058645296, 7501058645302, 7501058655172, 7506475121156, 7506475117364, 7501058654205, 
+            7501058642127, 7501058642134, 7501058642141, 7501058642165, 7506475130295, 7501058642172, 7501058642158, 
+            7506475108829, 7506475112970, 7506475122764, 7506475101981, 7506475101264, 7506475120500, 7506475127158, 
+            7501058655219, 7501058644848, 7501058644824, 7501058644862, 7501000912803, 7501058620101, 7506475123051, 
+            7501058620095, 7501000912612, 7501059224827, 7506475131438, 7506475125253, 7506475113946, 7506475102353, 
+            7501058610942, 7501058624635, 7506475110112, 7506475114998, 7506475125543, 7506475113700, 7501059284111, 
+            7501058620002, 7501058620019, 7501000912605, 7506475123389, 7501058616548, 7506475128162, 7501058622099, 
+            7506475123792, 7501059231962, 7501059298941, 7501058628466, 7501058628473, 7501058616470, 7501058648020, 
+            7506475110105, 7506475115254, 7501058646217, 7501058618924, 7501058618931, 7501058618917, 7506475114936, 
+            7506475111119, 7506475103855, 7501058629135, 7501058629173, 7501058629159, 7506475126731, 7501058624130, 
+            7501058624147, 7501058624154, 7501058624161, 7506475120289, 7506475120265, 7506475120272, 7501058654793, 
+            8445292308465, 8445292308540, 7501058654212, 7506475130707, 7506475130134, 7501058642608, 7501058642592, 
+            7501058618597, 7506475128292, 7501059214590, 7506475118217, 7501059214385, 7501059229211, 7501059229228, 
+            7501059289239, 7501059239630, 7506475113168, 7506475111713, 7501058643902, 75000011, 7506475125673, 
+            7506475125680, 7506475117876, 7506475114172, 7506475113564, 7506475105606, 7501058610959, 7501058611857, 
+            7501058613554, 7506475102834, 7501073411173, 7506475123617, 7506475124874, 7501058628299, 7501058624666, 
+            7501059233980, 7501059289659, 7506475102148, 7613287207197, 7613287216458, 7613287218162, 8445290925299, 
+            7613037012637, 8585002432315, 88169052054, 7501001604318, 7501001604325, 7501058628664, 7501058628503, 
+            7501059240742, 7501001604103, 7506475120814, 7501001604110, 7501059297586, 7506475120821, 7506475118446, 
+            7501058650665, 7506475108935, 7506475127080, 7506475130325, 7506475130332, 7506475130318, 7506475114356, 
+            7506475102476, 7506475102421, 7506475102452, 7506475102490, 7506475102469, 7506475102520, 7506475102506, 
+            7506475102483, 7506475102537, 75004712, 75004705, 75004767, 75004729, 75004743, 7501000906246, 7501000906253, 
+            7501000906284, 7501000906680, 7501058651136, 7501058651129, 7506475114073, 7506475115438, 7506475119665, 
+            7506475119672, 7506475115421, 7506475122450, 7506475122436, 7506475122443, 7506475117081, 7506475122122, 
+            7506475122139, 7506475122115, 7501058637659, 7506475122092, 7506475121996, 7891000395745, 7501000909568, 
+            7501058626226, 7501058639493, 7506475103220, 7506475103213, 7501058616678, 7501058616715, 7501058614193, 
+            7501000909612, 7501059278721, 7501059278691, 7501058626530, 7613030884361, 7506475106917, 7501058625212, 
+            7501058623256, 7506475106924, 7501058625229, 7501058623249, 7501058625205, 7501058625236, 7506475127295, 
+            7501058623232, 7506475106801, 7506475106771, 7506475106153, 7506475106818, 7506475106788, 7506475106146, 
+            7506475103053, 7506475103275, 7501059275133, 7501059282117, 7501058615138, 7506475126090, 7501059234390, 
+            7506475112888, 7506475112956, 7506475112895, 7506475112963, 7501059225411, 7501059225350, 7506475122955, 
+            7506475103244, 7506475129664, 7506475118675, 7501059233072, 7501058617439, 7501058652683, 7501058651266, 
+            7501058651273, 7501058637727, 7501059243880, 7501059243873, 7501058637734, 7501059241060, 7501058637758, 
+            7501058637741, 7501058652652, 16000135437, 16000221284, 7501001625337, 7501058652690, 7506475111546, 
+            7501001625214, 7506475111812, 7506475115544, 7506475117197, 7506475126984, 7506475126977, 7506475126960, 
+            7506475125413, 7506475128117, 7506475128858, 7506475128285, 7501001604004, 7501059240216, 7501001604387, 
+            7501059239845, 7613034161086, 7506475131629, 7501059287938, 7501058615596, 7501058627292, 7501059219106, 
+            7501059242883, 7501059284623, 7501059284630, 7506475106078, 7501073419117, 7501001600198, 7501000912889, 
+            10722776200640, 7501059281165, 7501058618566, 7501058617736, 3800020423547, 7891000277119, 7501059288904, 
+            7501059223905, 28000170707, 7891000248362, 7501058623348, 7501058654861, 7501058656247, 7501058638090, 
+            7506475128384, 7506475126694, 7502252484285, 7502252482694, 7502252481796, 7502252480928, 7502252480676, 
+            7502252484247, 7502252482038, 7502252482045, 7502252480263, 7502252480287, 7502252483929, 7502252483936, 
+            7502252483943, 7502252484469, 7502252482236, 7502252482359, 7502252482250, 7502252487637, 7502252487675, 
+            7502252488184, 7502252488214, 7502252488887, 7502252488894, 7502252488900, 7502252480584, 7502252485077]
         CODIGOS_TABLA = [
-7506475104722, 7501058631961, 7506475112093, 7506475113861, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 7501059234321, 7501058611062, 7506475100250, 7501000913367, 7501058628831, 7501059240681, 7501058619228, 7501059235038, 7501058619211, 7501000913299, 7501058619235, 7501058655172, 7506475117364, 7501058654205, 7501058642127, 7501058642134, 7501058642141, 7501058642165, 7506475108829, 7506475112970, 7506475122764, 7506475101981, 7501058644824, 7501058644862, 7501000912803, 7501058620101, 7501058620095, 7501059224827, 7501058624635, 7506475110112, 7506475114998, 7501058620002, 7501058620019, 7501000912605, 7501058616548, 7501058628466, 7501058628473, 7501058616470, 7506475110105, 7501058646217, 7501058618924, 7501058618931, 7501058618917, 7506475103855, 7501058629135, 7501058629173, 7501058629159, 7501058624130, 7501058624147, 7501058642608, 7501058642592, 7501058618597, 7506475128292, 7501059214590, 7501059214385, 7501059229211, 7501059229228, 7501059239630, 7506475125673, 7506475125680, 7506475117876, 7506475114172, 7506475113564, 7506475105606, 7501058610959, 7501058611857, 7501058613554, 7506475102834, 7501073411173, 7501058624666, 7501059233980, 7501059289659, 7613287216458, 7613037012637, 8585002432315, 88169052054, 7501001604318, 7501001604325, 7501058628664, 7501058628503, 7501059240742, 7501001604103, 7501001604110, 7501059297586, 7506475130325, 7506475130332, 7506475130318, 7506475114356, 7506475102476, 7506475102421, 7506475102452, 7506475102490, 7506475102469, 7506475102520, 7506475102506, 7506475102483, 7506475102537, 75004712, 75004705, 75004767, 75004729, 7501000906246, 7501000906253, 7501000906284, 7501000906680, 7501058651136, 7501058651129, 7506475114073, 7506475115438, 7506475119665, 7506475119672, 7506475115421, 7506475122450, 7506475122436, 7506475122443, 7506475117081, 7506475122139, 7506475122115, 7501058637659, 7891000395745, 7501000909568, 7501058626226, 7501058639493, 7506475103220, 7506475103213, 7501059278691, 7613030884361, 7506475106917, 7501058625212, 7501058623256, 7506475106924, 7501058625229, 7501058623249, 7501058625205, 7501058625236, 7501058623232, 7506475106801, 7506475106771, 7506475106153, 7506475106818, 7506475106788, 7506475106146, 7506475103053, 7506475103275, 7501059275133, 7501059282117, 7501059234390, 7506475112888, 7506475112956, 7506475112895, 7506475112963, 7501059225411, 7501059225350, 7506475103244, 7501059233072, 7501058652683, 7501058651273, 7501058637727, 7501059243880, 7501059243873, 7501058637734, 7501059241060, 7501058637758, 7501058637741, 7501058652652, 16000135437, 16000221284, 7501001625337, 7501058652690, 7506475111546, 7501001625214, 7506475117197, 7506475128117, 7506475128285, 7501001604004, 7501059240216, 7501001604387, 7501059239845, 7613034161086, 7501058615596, 7501058627292, 7501059219106, 7501059242883, 7501059284623, 7501059284630, 7501073419117, 7501001600198, 7501000912889, 10722776200640, 7501059281165, 7501058618566, 7501058617736, 3800020423547, 7891000277119, 7501059288904, 7501059223905, 28000170707, 7891000248362, 7501058623348, 7501058656247, 7501058638090, 7502252484285, 7502252482694, 7502252481796, 7502252480928, 7502252480676, 7502252484247, 7502252482038, 7502252482045, 7502252483929, 7502252483936, 7502252483943, 7502252484469, 7502252482236, 7502252482359, 7502252482250, 7502252487637, 7502252487675, 7502252488184, 7502252488214, 7502252488887, 7502252488894, 7502252488900
-
-        ]
+           7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+            7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
+            7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
+            7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
+            7501059240681, 7501058619228, 7506475113915, 7501059235038, 7501058619211, 7501058632227, 7501000913299, 
+            7501058619235, 7501058645296, 7501058645302, 7501058655172, 7506475121156, 7506475117364, 7501058654205, 
+            7501058642127, 7501058642134, 7501058642141, 7501058642165, 7506475130295, 7501058642172, 7501058642158, 
+            7506475108829, 7506475112970, 7506475122764, 7506475101981, 7506475101264, 7506475120500, 7506475127158, 
+            7501058655219, 7501058644848, 7501058644824, 7501058644862, 7501000912803, 7501058620101, 7506475123051, 
+            7501058620095, 7501000912612, 7501059224827, 7506475131438, 7506475125253, 7506475113946, 7506475102353, 
+            7501058610942, 7501058624635, 7506475110112, 7506475114998, 7506475125543, 7506475113700, 7501059284111, 
+            7501058620002, 7501058620019, 7501000912605, 7506475123389, 7501058616548, 7506475128162, 7501058622099, 
+            7506475123792, 7501059231962, 7501059298941, 7501058628466, 7501058628473, 7501058616470, 7501058648020, 
+            7506475110105, 7506475115254, 7501058646217, 7501058618924, 7501058618931, 7501058618917, 7506475114936, 
+            7506475111119, 7506475103855, 7501058629135, 7501058629173, 7501058629159, 7506475126731, 7501058624130, 
+            7501058624147, 7501058624154, 7501058624161, 7506475120289, 7506475120265, 7506475120272, 7501058654793, 
+            8445292308465, 8445292308540, 7501058654212, 7506475130707, 7506475130134, 7501058642608, 7501058642592, 
+            7501058618597, 7506475128292, 7501059214590, 7506475118217, 7501059214385, 7501059229211, 7501059229228, 
+            7501059289239, 7501059239630, 7506475113168, 7506475111713, 7501058643902, 75000011, 7506475125673, 
+            7506475125680, 7506475117876, 7506475114172, 7506475113564, 7506475105606, 7501058610959, 7501058611857, 
+            7501058613554, 7506475102834, 7501073411173, 7506475123617, 7506475124874, 7501058628299, 7501058624666, 
+            7501059233980, 7501059289659, 7506475102148, 7613287207197, 7613287216458, 7613287218162, 8445290925299, 
+            7613037012637, 8585002432315, 88169052054, 7501001604318, 7501001604325, 7501058628664, 7501058628503, 
+            7501059240742, 7501001604103, 7506475120814, 7501001604110, 7501059297586, 7506475120821, 7506475118446, 
+            7501058650665, 7506475108935, 7506475127080, 7506475130325, 7506475130332, 7506475130318, 7506475114356, 
+            7506475102476, 7506475102421, 7506475102452, 7506475102490, 7506475102469, 7506475102520, 7506475102506, 
+            7506475102483, 7506475102537, 75004712, 75004705, 75004767, 75004729, 75004743, 7501000906246, 7501000906253, 
+            7501000906284, 7501000906680, 7501058651136, 7501058651129, 7506475114073, 7506475115438, 7506475119665, 
+            7506475119672, 7506475115421, 7506475122450, 7506475122436, 7506475122443, 7506475117081, 7506475122122, 
+            7506475122139, 7506475122115, 7501058637659, 7506475122092, 7506475121996, 7891000395745, 7501000909568, 
+            7501058626226, 7501058639493, 7506475103220, 7506475103213, 7501058616678, 7501058616715, 7501058614193, 
+            7501000909612, 7501059278721, 7501059278691, 7501058626530, 7613030884361, 7506475106917, 7501058625212, 
+            7501058623256, 7506475106924, 7501058625229, 7501058623249, 7501058625205, 7501058625236, 7506475127295, 
+            7501058623232, 7506475106801, 7506475106771, 7506475106153, 7506475106818, 7506475106788, 7506475106146, 
+            7506475103053, 7506475103275, 7501059275133, 7501059282117, 7501058615138, 7506475126090, 7501059234390, 
+            7506475112888, 7506475112956, 7506475112895, 7506475112963, 7501059225411, 7501059225350, 7506475122955, 
+            7506475103244, 7506475129664, 7506475118675, 7501059233072, 7501058617439, 7501058652683, 7501058651266, 
+            7501058651273, 7501058637727, 7501059243880, 7501059243873, 7501058637734, 7501059241060, 7501058637758, 
+            7501058637741, 7501058652652, 16000135437, 16000221284, 7501001625337, 7501058652690, 7506475111546, 
+            7501001625214, 7506475111812, 7506475115544, 7506475117197, 7506475126984, 7506475126977, 7506475126960, 
+            7506475125413, 7506475128117, 7506475128858, 7506475128285, 7501001604004, 7501059240216, 7501001604387, 
+            7501059239845, 7613034161086, 7506475131629, 7501059287938, 7501058615596, 7501058627292, 7501059219106, 
+            7501059242883, 7501059284623, 7501059284630, 7506475106078, 7501073419117, 7501001600198, 7501000912889, 
+            10722776200640, 7501059281165, 7501058618566, 7501058617736, 3800020423547, 7891000277119, 7501059288904, 
+            7501059223905, 28000170707, 7891000248362, 7501058623348, 7501058654861, 7501058656247, 7501058638090, 
+            7506475128384, 7506475126694, 7502252484285, 7502252482694, 7502252481796, 7502252480928, 7502252480676, 
+            7502252484247, 7502252482038, 7502252482045, 7502252480263, 7502252480287, 7502252483929, 7502252483936, 
+            7502252483943, 7502252484469, 7502252482236, 7502252482359, 7502252482250, 7502252487637, 7502252487675, 
+            7502252488184, 7502252488214, 7502252488887, 7502252488894, 7502252488900, 7502252480584, 7502252485077]
 
         # ========================================================
-        # 1.5. BACKTEST
+        # 1.5. BACKTEST CON SEGMENTACION
         # ========================================================
         st.subheader("1.5. Validación Histórica por Semana (Backtest)")
         st.markdown(
-            "Entrena modelos **excluyendo las últimas N semanas** de historia real, predice esas semanas "
-            "**sin realimentar** (prediccion directa multi-horizonte) y compara contra los valores reales."
+            "Entrena un modelo **excluyendo las últimas N semanas**, predice esas semanas y las compara "
+            "contra los valores reales. Cada producto se predice con el **método adecuado a su comportamiento**."
         )
 
         col_bt1, col_bt2 = st.columns(2)
@@ -311,27 +382,24 @@ if archivos_subidos:
             )
 
         try:
-            modelos_bt, df_held_bt, df_train_bt, filas_bt = entrenar_backtest(
+            modelo_bt, df_held_bt, df_train_bt = entrenar_backtest(
                 df_global, semanas_holdout, tuple(CODIGOS_PREDICCION)
             )
 
             if df_held_bt.empty:
                 st.warning("No hay suficientes semanas historicas por producto para hacer el backtest.")
-            elif not modelos_bt:
-                st.warning(
-                    "No hay datos suficientes para entrenar ningun modelo en el backtest. "
-                    "Prueba con menos semanas reservadas (ej. 2-3)."
-                )
             else:
                 resultados_bt = []
                 for codigo, group in df_held_bt.groupby('Codigo'):
                     group = group.sort_values('Semana').reset_index(drop=True)
                     train_group = df_train_bt[df_train_bt['Codigo'] == codigo]
-                    if train_group.empty or len(train_group) < 4:
+                    if train_group.empty or len(train_group) < 3:
                         continue
 
                     n_semanas = len(group)
-                    preds = predecir_directo(modelos_bt, df_train_bt, codigo, n_semanas)
+                    preds, segmento = predecir_por_segmento(
+                        modelo_bt, df_train_bt, codigo, n_semanas
+                    )
 
                     for i, (pred, actual) in enumerate(zip(preds, group['Monto de ventas'].tolist()), start=1):
                         if pd.isna(actual):
@@ -339,6 +407,7 @@ if archivos_subidos:
                         resultados_bt.append({
                             'Codigo': codigo,
                             'Descripcion': group.iloc[i-1].get('Descripcion', 'Desconocido'),
+                            'Segmento': segmento,
                             'Semana_Real': int(group.iloc[i-1]['Semana']),
                             'Semana_Predecida': i,
                             'Prediccion': float(pred),
@@ -379,16 +448,24 @@ if archivos_subidos:
                             f"({df_bt_filt['Codigo'].nunique()} productos × semanas seleccionadas)"
                         )
 
-                        # Diagnostico backtest: que horizontes se pudieron entrenar
-                        with st.expander("🔧 Diagnostico del backtest (horizontes entrenados)"):
-                            st.write(f"**Horizontes entrenados en backtest**: {sorted(modelos_bt.keys())}")
-                            df_filas_bt = pd.DataFrame({
-                                'Horizonte': list(filas_bt.keys()),
-                                'Filas utiles': list(filas_bt.values()),
-                                'Entrenado': [h in modelos_bt for h in filas_bt.keys()],
+                        # Desglose por segmento
+                        st.markdown("##### 🧭 Desglose de metricas por segmento")
+                        seg_metrics = []
+                        for seg, grp in df_bt_filt.groupby('Segmento'):
+                            yt = grp['Actual'].values
+                            yp = grp['Prediccion'].values
+                            s_abs = np.sum(np.abs(yt - yp))
+                            s_real = np.sum(np.abs(yt))
+                            seg_metrics.append({
+                                'Segmento': seg,
+                                'N productos': grp['Codigo'].nunique(),
+                                'WAPE': f"{(s_abs / s_real * 100) if s_real > 0 else 0:.2f}%",
+                                'MAE': f"${mean_absolute_error(yt, yp):,.2f}",
+                                'RMSE': f"${np.sqrt(mean_squared_error(yt, yp)):,.2f}",
                             })
-                            st.dataframe(df_filas_bt, use_container_width=True, hide_index=True)
+                        st.dataframe(pd.DataFrame(seg_metrics), use_container_width=True, hide_index=True)
 
+                        # Grafica comparativa
                         st.markdown("##### 🔍 Comparativa Real vs Predicho (suma agregada por semana)")
                         df_chart = df_bt_filt.groupby('Semana_Predecida').agg({
                             'Prediccion': 'sum', 'Actual': 'sum'
@@ -399,7 +476,6 @@ if archivos_subidos:
                             value_vars=['Prediccion', 'Actual'],
                             var_name='Tipo', value_name='Monto'
                         )
-
                         chart_bt = alt.Chart(df_chart_melt).mark_bar().encode(
                             x=alt.X('Semana_Etiqueta:O', title='Semana Predecida'),
                             y=alt.Y('Monto:Q', title='Monto Total ($)', axis=alt.Axis(format='$,.2f')),
@@ -413,26 +489,10 @@ if archivos_subidos:
                         st.altair_chart(chart_bt, use_container_width=True)
 
                         with st.expander("🔎 Ver detalle por producto (prediccion vs real)"):
-                            df_diag = df_bt_filt.copy()
-                            df_diag['Error_Abs'] = (df_diag['Prediccion'] - df_diag['Actual']).abs()
                             st.dataframe(
-                                df_diag.sort_values(['Codigo', 'Semana_Predecida']).style.format({
+                                df_bt_filt.sort_values(['Segmento', 'Codigo', 'Semana_Predecida']).style.format({
                                     'Prediccion': '${:,.2f}',
                                     'Actual': '${:,.2f}',
-                                    'Error_Abs': '${:,.2f}',
-                                }),
-                                use_container_width=True
-                            )
-
-                            st.markdown("##### 🚨 Top 10 peores predicciones (por error absoluto)")
-                            st.dataframe(
-                                df_diag.nlargest(10, 'Error_Abs')[
-                                    ['Codigo', 'Descripcion', 'Semana_Real', 'Semana_Predecida',
-                                     'Prediccion', 'Actual', 'Error_Abs']
-                                ].style.format({
-                                    'Prediccion': '${:,.2f}',
-                                    'Actual': '${:,.2f}',
-                                    'Error_Abs': '${:,.2f}',
                                 }),
                                 use_container_width=True
                             )
@@ -443,7 +503,7 @@ if archivos_subidos:
         st.markdown("---")
 
         # ========================================================
-        # 2. PREDICCION Y GRAFICA
+        # 2. PREDICCION Y GRAFICA (CON SEGMENTACION)
         # ========================================================
         st.subheader("2. Simulacion y Tendencia de Producto")
 
@@ -483,9 +543,12 @@ if archivos_subidos:
                 semana_max = df_hist_prod['Semana'].max()
                 df_ultimo_registro = df_hist_prod[df_hist_prod['Semana'] == semana_max].iloc[0]
 
-                preds_futuras = predecir_directo(
-                    modelos_directos, df_global, codigo_seleccionado, semanas_proyectar
+                preds_futuras, segmento_prod = predecir_por_segmento(
+                    modelo_rf, df_global, codigo_seleccionado, semanas_proyectar
                 )
+
+                st.caption(f"Segmento detectado para este producto: **{segmento_prod}** "
+                           f"({'RandomForest' if segmento_prod=='estable' else 'media móvil' if segmento_prod=='volatil' else 'Croston simplificado'})")
 
                 df_real = df_hist_prod[['Semana', 'Monto de ventas']].copy()
                 df_real['Tipo'] = 'Historico Real'
@@ -505,7 +568,7 @@ if archivos_subidos:
 
                 df_grafica_comb = pd.concat([df_real, df_futuro], ignore_index=True)
 
-                st.markdown(f"#### 📈 Tendencia Historica y Proyeccion Directa ({semanas_proyectar} Semanas)")
+                st.markdown(f"#### 📈 Tendencia Historica y Proyeccion ({semanas_proyectar} Semanas)")
 
                 grafica = alt.Chart(df_grafica_comb).mark_line(point=True).encode(
                     x=alt.X('Semana:O', title='Semana', axis=alt.Axis(labelAngle=0)),
@@ -544,7 +607,7 @@ if archivos_subidos:
         st.markdown("---")
 
         # ========================================================
-        # 3. REPORTE SEMANAL
+        # 3. REPORTE SEMANAL DE DIAS DE INVENTARIO
         # ========================================================
         st.subheader("3. Reporte Semanal (Dias de Inventario)")
 
@@ -581,7 +644,7 @@ if archivos_subidos:
         st.markdown("---")
 
         # ========================================================
-        # 4. TABLA MASIVA EDITABLE
+        # 4. TABLA MASIVA EDITABLE (CON SEGMENTACION)
         # ========================================================
         st.subheader("4. Proyeccion Masiva de Inventario (Codigos Seleccionados)")
         st.markdown(
@@ -631,13 +694,14 @@ if archivos_subidos:
                     codigo = int(row['Codigo'])
                     inv_actual = row['Inventario'] if pd.notna(row['Inventario']) else 0.0
 
-                    preds = predecir_directo(
-                        modelos_directos, df_global, codigo, semanas_proyectar_masivo
+                    preds, segmento = predecir_por_segmento(
+                        modelo_rf, df_global, codigo, semanas_proyectar_masivo
                     )
                     predicciones_por_codigo[codigo] = preds
                     base_por_codigo[codigo] = {
                         'Descripcion': row.get('Descripcion', 'Desconocido'),
                         'Inv_Actual': inv_actual,
+                        'Segmento': segmento,
                     }
 
                 editor_rows = []
@@ -646,6 +710,7 @@ if archivos_subidos:
                     row_data = {
                         'Codigo': codigo,
                         'Descripcion': info['Descripcion'],
+                        'Segmento': info['Segmento'],
                         'Inv. Actual (Inicial)': float(info['Inv_Actual']),
                     }
                     inv_sugerido = float(info['Inv_Actual'])
@@ -659,6 +724,7 @@ if archivos_subidos:
                 column_config = {
                     'Codigo': st.column_config.NumberColumn('Codigo', disabled=True, format='%d'),
                     'Descripcion': st.column_config.TextColumn('Descripcion', disabled=True),
+                    'Segmento': st.column_config.TextColumn('Segmento', disabled=True),
                     'Inv. Actual (Inicial)': st.column_config.NumberColumn(
                         'Inv. Actual (Inicial)', disabled=True, format='$%.2f'
                     ),
@@ -687,6 +753,7 @@ if archivos_subidos:
                     res_dict = {
                         'Codigo': codigo,
                         'Descripcion': row['Descripcion'],
+                        'Segmento': row['Segmento'],
                         'Inv. Actual (Inicial)': float(row['Inv. Actual (Inicial)']) if pd.notna(row['Inv. Actual (Inicial)']) else 0.0,
                     }
                     for sem_idx, p_val in enumerate(preds, start=1):
