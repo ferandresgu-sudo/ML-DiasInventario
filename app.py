@@ -20,9 +20,6 @@ st.title("📦 Simulador Predictivo de Dias de Inventario")
 if not LGB_AVAILABLE:
     st.warning("⚠️ LightGBM no esta instalado. Usando RandomForest como fallback.")
 
-# ========================================================
-# MODELO L1 PURO (El que te dio 16.57%)
-# ========================================================
 def construir_modelo_principal():
     if LGB_AVAILABLE:
         return lgb.LGBMRegressor(
@@ -35,7 +32,7 @@ def construir_modelo_principal():
             subsample_freq=1,
             reg_alpha=0.1,
             reg_lambda=0.5,
-            objective='regression_l1',   # Volvemos a L1 puro
+            objective='regression_l1',
             random_state=42,
             n_jobs=-1,
             verbose=-1,
@@ -67,28 +64,42 @@ def clasificar_producto(df_prod):
     return 'estable' if cv < 0.4 else 'volatil'
 
 # ========================================================
-# PREDICCIÓN CON CLIPPING DINÁMICO (ANTI-EXPLOSIÓN)
+# PREDICCIÓN CON CLIPPING + INYECCIÓN DE TENDENCIA
 # ========================================================
-def predecir_futuro_recursivo(modelo, venta_actual, venta_1_atras, n_semanas, hist_stats):
+def predecir_futuro_recursivo(modelo, venta_actual, venta_1_atras, n_semanas, hist_stats, historial_reciente):
     predicciones = []
     v_prev1 = venta_actual
     v_prev2 = venta_1_atras
     
-    for _ in range(n_semanas):
+    # Calcular tendencia de las últimas 4 semanas (pendiente)
+    if len(historial_reciente) >= 2:
+        x_trend = np.arange(len(historial_reciente))
+        # polyfit devuelve [pendiente, intercepto]
+        pendiente = np.polyfit(x_trend, historial_reciente, 1)[0]
+        # Limitamos la tendencia semanal para que no sea una explosión
+        pendiente = np.clip(pendiente, -venta_actual*0.1, venta_actual*0.1)
+    else:
+        pendiente = 0.0
+    
+    for i in range(n_semanas):
         X_input = pd.DataFrame({
             'Venta_1_Semana_Atras': [v_prev1],
             'Venta_2_Semanas_Atras': [v_prev2],
         })
         try:
-            pred = modelo.predict(X_input)[0]
+            pred_base = modelo.predict(X_input)[0]
         except Exception:
-            pred = 0.01
+            pred_base = 0.01
+        
+        # --- INYECCIÓN DE TENDENCIA ---
+        # Si el producto venía subiendo/bajando, aplicamos un pequeño % de esa tendencia
+        # Multiplicamos por (i+1) para que el efecto crezca a futuro
+        ajuste_tendencia = pendiente * (i + 1) * 0.5 
+        pred = float(pred_base) + ajuste_tendencia
         
         pred = 0.01 if pd.isna(pred) or pred <= 0 else float(pred)
         
         # --- CLIPPING DINÁMICO ---
-        # No permitimos que la predicción supere el 130% del máximo histórico reciente
-        # Ni que caiga por debajo del 50% de la mediana histórica
         if hist_stats['max'] > 0:
             pred = min(pred, hist_stats['max'] * 1.3)
         if hist_stats['median'] > 0:
@@ -116,27 +127,22 @@ def predecir_por_segmento(modelo, df_historial, codigo, n_semanas):
         return [max(0.01, base)] * n_semanas, segmento
 
     if segmento == 'volatil':
-        base = float(hist.tail(4).mean()) if len(hist) > 0 else 0.01
+        base = float(hist.tail(3).mean()) if len(hist) > 0 else 0.01
         return [max(0.01, base)] * n_semanas, segmento
 
-    # Estable: modelo recursivo con limitadores
+    # Estable
     ultimo = df_prod.iloc[-1]
     venta_actual = ultimo['Monto de ventas'] if pd.notna(ultimo['Monto de ventas']) else 0.0
     venta_1_atras = ultimo['Venta_1_Semana_Atras'] if pd.notna(ultimo['Venta_1_Semana_Atras']) else 0.0
     
-    # Estadísticas para el clipping
-    hist_stats = {
-        'max': float(hist.max()),
-        'median': float(hist.median())
-    }
+    hist_stats = {'max': float(hist.max()), 'median': float(hist.median())}
+    # Pasamos las últimas 4 semanas para calcular la tendencia
+    historial_reciente = hist.tail(4).values 
     
-    preds = predecir_futuro_recursivo(modelo, venta_actual, venta_1_atras, n_semanas, hist_stats)
+    preds = predecir_futuro_recursivo(modelo, venta_actual, venta_1_atras, n_semanas, hist_stats, historial_reciente)
     return preds, segmento
 
-# ========================================================
-# CARGA Y ENTRENAMIENTO (SIN BIAS FACTOR)
-# ========================================================
-@st.cache_resource(show_spinner="Entrenando LightGBM...")
+@st.cache_resource(show_spinner="Entrenando LightGBM con tendencia...")
 def cargar_y_entrenar(archivos_subidos):
     lista_dfs = []
     for archivo in archivos_subidos:
@@ -229,7 +235,7 @@ archivos_subidos = st.file_uploader("Sube tus archivos Excel:", type=["xlsx", "x
 if archivos_subidos:
     try:
         df_global, modelo_rf, wape_val, mae_val, rmse_val, r2_val = cargar_y_entrenar(archivos_subidos)
-        etiqueta = "LightGBM (L1) + Clipping Dinámico" if LGB_AVAILABLE else "RandomForest + Clipping"
+        etiqueta = "LightGBM (L1) + Clipping + Tendencia" if LGB_AVAILABLE else "RandomForest + Clipping + Tendencia"
         
         st.success(f"Modelo entrenado: **{etiqueta}**")
         
@@ -292,7 +298,7 @@ if archivos_subidos:
             7502252483943, 7502252484469, 7502252482236, 7502252482359, 7502252482250, 7502252487637, 7502252487675, 
             7502252488184, 7502252488214, 7502252488887, 7502252488894, 7502252488900, 7502252480584, 7502252485077]
         CODIGOS_TABLA = [
-           7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+        7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -346,7 +352,7 @@ if archivos_subidos:
         
         col_bt1, col_bt2 = st.columns(2)
         with col_bt1:
-            semanas_holdout = st.slider("Semanas a reservar:", 1, 12, 4, key="slider_holdout")
+            semanas_holdout = st.slider("Semanas a reservar:", 1, 12, 8, key="slider_holdout")
         with col_bt2:
             semana_inicio = st.slider("Calcular a partir de semana #:", 1, semanas_holdout, 1, key="slider_inicio")
 
@@ -399,7 +405,7 @@ if archivos_subidos:
 
         st.markdown("---")
 
-        st.subheader("4. Proyeccion Masiva (Con Clipping Dinámico)")
+        st.subheader("4. Proyeccion Masiva (Con Dinamismo de Tendencia)")
         
         CODIGOS_PERMITIDOS = list(set(CODIGOS_PREDICCION + CODIGOS_TABLA))
         df_todos = df_global.dropna(subset=['Codigo']).copy()
