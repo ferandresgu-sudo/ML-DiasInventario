@@ -452,7 +452,6 @@ if archivos_subidos:
                                     'Error_Abs': '${:,.2f}',
                                     'Variacion_%': '{:+.1f}%'
                                 }),
-                                use_container_width=True
                                 use_container_width=True,
                                 hide_index=True
                             )
