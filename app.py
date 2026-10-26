@@ -86,7 +86,7 @@ def predecir_recursivo_seguro(modelo, hist_ventas, n_semanas):
     return predicciones
 
 # ========================================================
-# ENTRENAMIENTO
+# ENTRENAMIENTO (Retorna un Diccionario para evitar errores)
 # ========================================================
 @st.cache_resource(show_spinner="Entrenando modelo con regresión cuantílica y pesos...")
 def cargar_y_entrenar(archivos_subidos):
@@ -123,8 +123,7 @@ def cargar_y_entrenar(archivos_subidos):
     X = df_modelo[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']]
     y = df_modelo['Monto de ventas']
     
-    # --- PONDERACION DE MUESTRAS (Dar mas peso a ventas altas) ---
-    # Las ventas superiores al promedio pesaran hasta 3.5 veces mas
+    # PONDERACION DE MUESTRAS (Dar mas peso a ventas altas)
     pesos = 1.0 + (y / y.mean()).clip(0, 3.5)
     
     X_train, X_test, y_train, y_test, w_train = train_test_split(X, y, pesos, test_size=0.2, random_state=42)
@@ -140,9 +139,17 @@ def cargar_y_entrenar(archivos_subidos):
     wape = (np.sum(np.abs(y_test - preds_test)) / y_test.sum()) * 100 if y_test.sum() > 0 else 0.0
     
     modelo_final = construir_modelo()
-    modelo_final.fit(X, y, sample_weight=pesos) # Entrenamiento final con todos los pesos
+    modelo_final.fit(X, y, sample_weight=pesos)
     
-    return df, modelo_final, wape, mean_absolute_error(y_test, preds_test), np.sqrt(mean_squared_error(y_test, preds_test)), r2_score(y_test, preds_test)
+    # RETORNO COMO DICCIONARIO (Evita el error "too many values to unpack")
+    return {
+        'df': df,
+        'modelo': modelo_final,
+        'wape': wape,
+        'mae': mean_absolute_error(y_test, preds_test),
+        'rmse': np.sqrt(mean_squared_error(y_test, preds_test)),
+        'r2': r2_score(y_test, preds_test)
+    }
 
 @st.cache_resource(show_spinner=False)
 def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
@@ -177,14 +184,21 @@ def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
     return modelo, df_held, df_train
 
 # ========================================================
-# INTERFAZ (Misma estructura visual)
+# INTERFAZ
 # ========================================================
 st.subheader("1. Origen de los Datos")
 archivos_subidos = st.file_uploader("Selecciona archivos Excel:", type=["xlsx", "xls", "xlsm"], accept_multiple_files=True)
 
 if archivos_subidos:
     try:
-        df_global, modelo_rf, wape_val, mae_val, rmse_val, r2_val = cargar_y_entrenar(archivos_subidos)
+        # Extraemos los valores del diccionario de forma segura
+        resultado = cargar_y_entrenar(archivos_subidos)
+        df_global = resultado['df']
+        modelo_rf = resultado['modelo']
+        wape_val = resultado['wape']
+        mae_val = resultado['mae']
+        rmse_val = resultado['rmse']
+        r2_val = resultado['r2']
         
         st.success("Modelo Cuantílico entrenado con exito.")
         
@@ -483,4 +497,4 @@ if archivos_subidos:
                 st.dataframe(df_final.style.format(fmt), use_container_width=True)
 
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Error crítico en la app: {e}")
