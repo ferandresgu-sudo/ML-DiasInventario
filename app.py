@@ -427,8 +427,6 @@ if archivos_subidos:
                         st.altair_chart(chart_bt, use_container_width=True)
 
                         with st.expander("🔎 Ver detalle por producto (prediccion vs real)"):
-                        # EXPANDER CON TOP 10 Y VARIACION
-                        with st.expander("🔎 Ver detalle y Top 10 Peores Predicciones"):
                             
                             # 1. Top 10 Peores
                             st.markdown("##### 🚨 Top 10 Peores Predicciones (Mayor Error Absoluto)")
