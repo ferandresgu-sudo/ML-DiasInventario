@@ -41,39 +41,58 @@ def obtener_rango_fechas(semana_num):
     return f"{start.day:02d} {meses[start.month]} - {end.day:02d} {meses[end.month]}"
 
 def es_producto_muerto(df_prod, ventana_semanas=3):
-    """Filtro mas conservador: si no vendio en las ultimas 3 semanas, es muerto."""
     if df_prod.empty: return True
     ultimas = df_prod.sort_values('Semana').tail(ventana_semanas)['Monto de ventas']
     return bool(ultimas.fillna(0).sum() <= 0.01)
 
-def predecir_recursivo_seguro(modelo, venta_actual, venta_1_atras, n_semanas, hist_max):
-    """Prediccion recursiva con Clipping estatico (sin logaritmos)."""
+def predecir_recursivo_seguro(modelo, hist_ventas, n_semanas, hist_max):
+    """
+    NUEVO: Prediccion con Deriva Amortiguada (Damped Drift).
+    Calcula la pendiente de las ultimas semanas y la aplica con un freno.
+    """
     predicciones = []
-    v_prev1 = venta_actual
-    v_prev2 = venta_1_atras
     
-    for _ in range(n_semanas):
+    # 1. Extraer ultimos valores reales
+    v_prev1 = float(hist_ventas[-1]) if len(hist_ventas) >= 1 else 0.0
+    v_prev2 = float(hist_ventas[-2]) if len(hist_ventas) >= 2 else v_prev1
+    v_prev3 = float(hist_ventas[-3]) if len(hist_ventas) >= 3 else v_prev2
+    
+    # 2. Calcular la pendiente (tendencia de las ultimas semanas)
+    pendiente = (v_prev1 - v_prev3) / 2.0
+    
+    # Limitar la pendiente para evitar extremos (max 20% del valor actual)
+    max_delta = v_prev1 * 0.2
+    pendiente = max(-max_delta, min(pendiente, max_delta))
+    
+    for i in range(n_semanas):
         X_input = pd.DataFrame({'Venta_1_Semana_Atras': [v_prev1], 'Venta_2_Semanas_Atras': [v_prev2]})
         try:
-            pred = float(modelo.predict(X_input)[0])
+            pred_modelo = float(modelo.predict(X_input)[0])
         except:
-            pred = 0.01
+            pred_modelo = 0.01
             
-        pred = max(0.01, pred) # Evitar negativos o ceros absolutos
-        # CLIPPING: El modelo no puede predecir mas del 150% del maximo historico
+        # 3. Aplicar la tendencia con freno (factor 0.7 en cada paso)
+        # Si la pendiente es negativa, la prediccion caera suavemente.
+        ajuste_tendencia = pendiente * (i + 1) * 0.7
+        pred_final = pred_modelo + ajuste_tendencia
+        
+        # 4. Clipping estatico
+        pred_final = max(0.01, pred_final)
         if hist_max > 0:
-            pred = min(pred, hist_max * 1.5)
+            pred_final = min(pred_final, hist_max * 1.5)
             
-        predicciones.append(pred)
+        predicciones.append(pred_final)
+        
+        # Actualizar ventanas para la siguiente semana
         v_prev2 = v_prev1
-        v_prev1 = pred
+        v_prev1 = pred_final
         
     return predicciones
 
 # ========================================================
 # ENTRENAMIENTO
 # ========================================================
-@st.cache_resource(show_spinner="Entrenando modelo estable...")
+@st.cache_resource(show_spinner="Entrenando modelo estable con Deriva...")
 def cargar_y_entrenar(archivos_subidos):
     lista_dfs = []
     for archivo in archivos_subidos:
@@ -99,7 +118,6 @@ def cargar_y_entrenar(archivos_subidos):
     if 'Dias Inv' not in df.columns: df['Dias Inv'] = 0.0
     
     df = df.sort_values(['Codigo', 'Semana'])
-    # VOLVEMOS A LOS 2 LAGS ORIGINALES
     df['Venta_1_Semana_Atras'] = df.groupby('Codigo')['Monto de ventas'].shift(1)
     df['Venta_2_Semanas_Atras'] = df.groupby('Codigo')['Monto de ventas'].shift(2)
     
@@ -107,7 +125,7 @@ def cargar_y_entrenar(archivos_subidos):
     if df_modelo.empty: raise ValueError("No hay historial suficiente.")
     
     X = df_modelo[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']]
-    y = df_modelo['Monto de ventas'] # SIN LOGARITMO
+    y = df_modelo['Monto de ventas']
     
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
@@ -160,7 +178,7 @@ if archivos_subidos:
     try:
         df_global, modelo_rf, wape_val, mae_val, rmse_val, r2_val = cargar_y_entrenar(archivos_subidos)
         
-        st.success("Modelo base entrenado con exito.")
+        st.success("Modelo base entrenado con exito (con ajuste de tendencia).")
         
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         col_m1.metric("WAPE Base", f"{wape_val:.2f}%")
@@ -291,16 +309,13 @@ if archivos_subidos:
 
                     if train_group.empty or len(train_group) < 3: continue
 
-                    last = train_group.iloc[-1]
-                    v_act = last['Monto de ventas'] if pd.notna(last['Monto de ventas']) else 0.0
-                    v_lag = last['Venta_1_Semana_Atras'] if pd.notna(last['Venta_1_Semana_Atras']) else 0.0
-                    h_max = train_group['Monto de ventas'].max() if not train_group['Monto de ventas'].isna().all() else 0
+                    hist_real = train_group['Monto de ventas'].dropna().values
+                    h_max = hist_real.max() if len(hist_real) > 0 else 0
                     
-                    # FILTRO DE MUERTOS
                     if es_producto_muerto(train_group):
                         preds = [0.0] * len(group)
                     else:
-                        preds = predecir_recursivo_seguro(modelo_bt, v_act, v_lag, len(group), h_max)
+                        preds = predecir_recursivo_seguro(modelo_bt, hist_real, len(group), h_max)
 
                     for i, (pred, actual) in enumerate(zip(preds, group['Monto de ventas'].tolist()), start=1):
                         if pd.isna(actual): continue
@@ -338,7 +353,7 @@ if archivos_subidos:
         st.markdown("---")
 
         # ========================================================
-        # 2. PREDICCIÓN
+        # 2. PREDICCIÓN Y GRÁFICA
         # ========================================================
         st.subheader("2. Simulacion y Tendencia de Producto")
         df_pred = df_global.dropna(subset=['Codigo']).copy()
@@ -361,16 +376,14 @@ if archivos_subidos:
                 semana_max = df_hist_prod['Semana'].max()
                 df_ult = df_hist_prod[df_hist_prod['Semana'] == semana_max].iloc[0]
                 
-                hist_ventas = df_hist_prod['Monto de ventas'].dropna()
-                h_max = hist_ventas.max() if not hist_ventas.empty else 0
+                hist_ventas = df_hist_prod['Monto de ventas'].dropna().values
+                h_max = hist_ventas.max() if len(hist_ventas) > 0 else 0
                 
                 if es_producto_muerto(df_hist_prod):
                     preds_futuras = [0.0] * sem_proy
                     st.warning("⚠️ Producto sin ventas recientes. Proyeccion en $0.")
                 else:
-                    v1 = df_ult['Monto de ventas'] if pd.notna(df_ult['Monto de ventas']) else 0.0
-                    v2 = df_ult['Venta_1_Semana_Atras'] if pd.notna(df_ult['Venta_1_Semana_Atras']) else 0.0
-                    preds_futuras = predecir_recursivo_seguro(modelo_rf, v1, v2, sem_proy, h_max)
+                    preds_futuras = predecir_recursivo_seguro(modelo_rf, hist_ventas, sem_proy, h_max)
                 
                 df_real = df_hist_prod[['Semana', 'Monto de ventas']].copy()
                 df_real['Tipo'] = 'Historico Real'
@@ -446,15 +459,13 @@ if archivos_subidos:
                 for _, row in df_proc.iterrows():
                     cod = int(row['Codigo'])
                     df_hist = df_global[df_global['Codigo'] == cod]
-                    hist = df_hist['Monto de ventas'].dropna()
-                    h_max = hist.max() if not hist.empty else 0
+                    hist = df_hist['Monto de ventas'].dropna().values
+                    h_max = hist.max() if len(hist) > 0 else 0
                     
                     if es_producto_muerto(df_hist):
                         preds = [0.0] * sem_proy_mas
                     else:
-                        v1 = row['Monto de ventas'] if pd.notna(row['Monto de ventas']) else 0.0
-                        v2 = row['Venta_1_Semana_Atras'] if pd.notna(row['Venta_1_Semana_Atras']) else 0.0
-                        preds = predecir_recursivo_seguro(modelo_rf, v1, v2, sem_proy_mas, h_max)
+                        preds = predecir_recursivo_seguro(modelo_rf, hist, sem_proy_mas, h_max)
                         
                     preds_dict[cod] = preds
                     base_dict[cod] = {'Desc': row.get('Descripcion', 'Desc.'), 'Inv': row['Inventario'] if pd.notna(row['Inventario']) else 0.0}
