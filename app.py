@@ -7,71 +7,73 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 import altair as alt
 
+try:
+    import lightgbm as lgb
+    LGB_AVAILABLE = True
+except ImportError:
+    LGB_AVAILABLE = False
+    lgb = None
+
 # ========================================================
-# CONFIGURACION DE LA PAGINA
+# CONFIGURACION
 # ========================================================
 st.set_page_config(page_title="Prediccion de Inventario", page_icon="📦", layout="wide")
 st.title("📦 Simulador Predictivo de Dias de Inventario")
-st.markdown("Sube todos los archivos de tu carpeta historica para entrenar el modelo y analizar el desempeño por producto.")
 
-# ========================================================
-# FUNCIONES AUXILIARES
-# ========================================================
+if not LGB_AVAILABLE:
+    st.info("💡 Instala LightGBM (`pip install lightgbm`) para obtener la maxima precision. Usando RandomForest por ahora.")
+
+def construir_modelo():
+    if LGB_AVAILABLE:
+        return lgb.LGBMRegressor(
+            n_estimators=150, max_depth=3, num_leaves=6, learning_rate=0.05,
+            min_child_samples=6, subsample=0.8, subsample_freq=1,
+            reg_alpha=0.1, reg_lambda=0.5, objective='regression_l1',
+            random_state=42, n_jobs=-1, verbose=-1
+        )
+    return RandomForestRegressor(n_estimators=200, max_depth=12, min_samples_leaf=4, random_state=42, n_jobs=-1)
+
 def obtener_rango_fechas(semana_num):
     base_date = datetime.date(2026, 6, 15)
-    start_date = base_date + datetime.timedelta(weeks=int(semana_num) - 25)
-    end_date = start_date + datetime.timedelta(days=6)
-    meses = {1: 'ene', 2: 'feb', 3: 'mar', 4: 'abr', 5: 'may', 6: 'jun',
-             7: 'jul', 8: 'ago', 9: 'sep', 10: 'oct', 11: 'nov', 12: 'dic'}
-    return f"{start_date.day:02d} {meses[start_date.month]} - {end_date.day:02d} {meses[end_date.month]}"
+    start = base_date + datetime.timedelta(weeks=int(semana_num) - 25)
+    end = start + datetime.timedelta(days=6)
+    meses = {1:'ene',2:'feb',3:'mar',4:'abr',5:'may',6:'jun',7:'jul',8:'ago',9:'sep',10:'oct',11:'nov',12:'dic'}
+    return f"{start.day:02d} {meses[start.month]} - {end.day:02d} {meses[end.month]}"
 
-def es_producto_muerto(df_prod, ventana_semanas=4):
-    """NUEVO: Detecta si el producto no ha vendido en las ultimas semanas."""
+def es_producto_muerto(df_prod, ventana_semanas=3):
+    """Filtro mas conservador: si no vendio en las ultimas 3 semanas, es muerto."""
     if df_prod.empty: return True
     ultimas = df_prod.sort_values('Semana').tail(ventana_semanas)['Monto de ventas']
     return bool(ultimas.fillna(0).sum() <= 0.01)
 
-def predecir_futuro_recursivo(modelo, hist_ventas, n_semanas, hist_max, hist_median):
-    """
-    NUEVO: Prediccion Logaritmica + Clipping + Calculo dinamico de features.
-    Recibe el historial completo de ventas del producto.
-    """
+def predecir_recursivo_seguro(modelo, venta_actual, venta_1_atras, n_semanas, hist_max):
+    """Prediccion recursiva con Clipping estatico (sin logaritmos)."""
     predicciones = []
-    historial = list(hist_ventas) # Lista viva para actualizar los lags
-
+    v_prev1 = venta_actual
+    v_prev2 = venta_1_atras
+    
     for _ in range(n_semanas):
-        # Extraer lags del historial (protegido contra indices fuera de rango)
-        v1 = historial[-1] if len(historial) >= 1 else 0
-        v2 = historial[-2] if len(historial) >= 2 else v1
-        v3 = historial[-3] if len(historial) >= 3 else v2
-        med4 = np.median(historial[-4:]) if len(historial) >= 4 else np.median(historial)
-        
-        # Transformacion Logaritmica
-        X_input = pd.DataFrame({
-            'Venta_1_Semana_Atras': [np.log1p(v1)], 
-            'Venta_2_Semanas_Atras': [np.log1p(v2)],
-            'Venta_3_Semana_Atras': [np.log1p(v3)],
-            'Venta_Mediana_4': [np.log1p(med4)]
-        })
-        
-        # Prediccion y Destransformacion
-        pred_log = modelo.predict(X_input)[0]
-        pred = np.expm1(pred_log)
-        pred = 0.01 if pd.isna(pred) or pred <= 0 else float(pred)
-        
-        # CLIPPING DINAMICO
-        if hist_max > 0: pred = min(pred, hist_max * 1.3)
-        if hist_median > 0: pred = max(pred, hist_median * 0.5)
-        
+        X_input = pd.DataFrame({'Venta_1_Semana_Atras': [v_prev1], 'Venta_2_Semanas_Atras': [v_prev2]})
+        try:
+            pred = float(modelo.predict(X_input)[0])
+        except:
+            pred = 0.01
+            
+        pred = max(0.01, pred) # Evitar negativos o ceros absolutos
+        # CLIPPING: El modelo no puede predecir mas del 150% del maximo historico
+        if hist_max > 0:
+            pred = min(pred, hist_max * 1.5)
+            
         predicciones.append(pred)
-        historial.append(pred)
+        v_prev2 = v_prev1
+        v_prev1 = pred
         
     return predicciones
 
 # ========================================================
-# CARGA Y ENTRENAMIENTO GLOBAL
+# ENTRENAMIENTO
 # ========================================================
-@st.cache_resource(show_spinner="Entrenando modelo con Logaritmo y nuevas features...")
+@st.cache_resource(show_spinner="Entrenando modelo estable...")
 def cargar_y_entrenar(archivos_subidos):
     lista_dfs = []
     for archivo in archivos_subidos:
@@ -92,52 +94,33 @@ def cargar_y_entrenar(archivos_subidos):
         elif 'dias' in cl and 'inv' in cl: df.rename(columns={col: 'Dias Inv'}, inplace=True)
         
     df = df.loc[:, ~df.columns.duplicated()]
-    df['Codigo'] = pd.to_numeric(df['Codigo'], errors='coerce')
-    df['Semana'] = pd.to_numeric(df['Semana'], errors='coerce')
-    df['Monto de ventas'] = pd.to_numeric(df['Monto de ventas'], errors='coerce')
-    df['Inventario'] = pd.to_numeric(df['Inventario'], errors='coerce')
-    df['Dias Inv'] = pd.to_numeric(df['Dias Inv'], errors='coerce') if 'Dias Inv' in df.columns else 0.0
+    for c in ['Codigo', 'Semana', 'Monto de ventas', 'Inventario', 'Dias Inv']:
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce')
+    if 'Dias Inv' not in df.columns: df['Dias Inv'] = 0.0
     
-    df = df.sort_values(by=['Codigo', 'Semana'])
-    
-    # NUEVAS FEATURES
+    df = df.sort_values(['Codigo', 'Semana'])
+    # VOLVEMOS A LOS 2 LAGS ORIGINALES
     df['Venta_1_Semana_Atras'] = df.groupby('Codigo')['Monto de ventas'].shift(1)
     df['Venta_2_Semanas_Atras'] = df.groupby('Codigo')['Monto de ventas'].shift(2)
-    df['Venta_3_Semana_Atras'] = df.groupby('Codigo')['Monto de ventas'].shift(3)
-    df['Venta_Mediana_4'] = df.groupby('Codigo')['Monto de ventas'].transform(lambda s: s.shift(1).rolling(4, min_periods=1).median())
     
-    df_modelo = df.dropna(subset=['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras', 'Venta_3_Semana_Atras', 'Venta_Mediana_4', 'Monto de ventas']).copy()
+    df_modelo = df.dropna(subset=['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras', 'Monto de ventas']).copy()
+    if df_modelo.empty: raise ValueError("No hay historial suficiente.")
     
-    if df_modelo.empty:
-        raise ValueError("No hay historial suficiente (se requieren al menos 4 semanas).")
-        
-    features = ['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras', 'Venta_3_Semana_Atras', 'Venta_Mediana_4']
-    
-    # APLICAMOS LOGARITMO A LA VARIABLE OBJETIVO (Y)
-    X = df_modelo[features]
-    y = np.log1p(df_modelo['Monto de ventas'])
+    X = df_modelo[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']]
+    y = df_modelo['Monto de ventas'] # SIN LOGARITMO
     
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    modelo_eval = RandomForestRegressor(n_estimators=200, max_depth=12, min_samples_leaf=3, random_state=42)
+    modelo_eval = construir_modelo()
     modelo_eval.fit(X_train, y_train)
+    preds_test = modelo_eval.predict(X_test)
     
-    # Destransformamos las predicciones del test para calcular metricas reales
-    preds_test_real = np.expm1(modelo_eval.predict(X_test))
-    y_test_real = np.expm1(y_test)
+    wape = (np.sum(np.abs(y_test - preds_test)) / y_test.sum()) * 100 if y_test.sum() > 0 else 0.0
     
-    suma_errores = np.sum(np.abs(y_test_real - preds_test_real))
-    suma_ventas = np.sum(y_test_real)
-    
-    wape = (suma_errores / suma_ventas) * 100 if suma_ventas > 0 else 0.0
-    mae = mean_absolute_error(y_test_real, preds_test_real)
-    rmse = np.sqrt(mean_squared_error(y_test_real, preds_test_real))
-    r2 = r2_score(y_test_real, preds_test_real)
-
-    modelo_final = RandomForestRegressor(n_estimators=200, max_depth=12, min_samples_leaf=3, random_state=42)
+    modelo_final = construir_modelo()
     modelo_final.fit(X, y)
     
-    return df, modelo_final, wape, mae, rmse, r2
+    return df, modelo_final, wape, mean_absolute_error(y_test, preds_test), np.sqrt(mean_squared_error(y_test, preds_test)), r2_score(y_test, preds_test)
 
 @st.cache_resource(show_spinner=False)
 def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
@@ -145,18 +128,13 @@ def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
     df_work = df.dropna(subset=['Codigo', 'Semana', 'Monto de ventas']).copy()
     df_work = df_work[df_work['Codigo'].isin(codigos)].sort_values(['Codigo', 'Semana']).reset_index(drop=True)
 
-    train_rows = []
-    held_rows = []
-
+    train_rows, held_rows = [], []
     for codigo, group in df_work.groupby('Codigo'):
-        group = group.sort_values('Semana').reset_index(drop=True)
-        if len(group) <= n_semanas_holdout + 3:
+        if len(group) <= n_semanas_holdout + 2:
             train_rows.append(group)
             continue
         train_rows.append(group.iloc[:-n_semanas_holdout])
         held_rows.append(group.iloc[-n_semanas_holdout:])
-
-    if not train_rows: raise ValueError("No hay datos de entrenamiento suficientes.")
 
     df_train = pd.concat(train_rows, ignore_index=True)
     df_held = pd.concat(held_rows, ignore_index=True) if held_rows else pd.DataFrame()
@@ -164,20 +142,12 @@ def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
     df_train = df_train.sort_values(['Codigo', 'Semana'])
     df_train['Venta_1_Semana_Atras'] = df_train.groupby('Codigo')['Monto de ventas'].shift(1)
     df_train['Venta_2_Semanas_Atras'] = df_train.groupby('Codigo')['Monto de ventas'].shift(2)
-    df_train['Venta_3_Semana_Atras'] = df_train.groupby('Codigo')['Monto de ventas'].shift(3)
-    df_train['Venta_Mediana_4'] = df_train.groupby('Codigo')['Monto de ventas'].transform(lambda s: s.shift(1).rolling(4, min_periods=1).median())
 
-    features = ['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras', 'Venta_3_Semana_Atras', 'Venta_Mediana_4']
-    df_tr_model = df_train.dropna(subset=features + ['Monto de ventas'])
-
-    if df_tr_model.empty: raise ValueError("Sin datos suficientes para entrenar el backtest.")
-
-    X = df_tr_model[features]
-    y = np.log1p(df_tr_model['Monto de ventas']) # Log transform en Backtest
-
-    modelo = RandomForestRegressor(n_estimators=200, max_depth=12, min_samples_leaf=3, random_state=42)
-    modelo.fit(X, y)
-
+    df_tr_model = df_train.dropna(subset=['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras', 'Monto de ventas'])
+    
+    modelo = construir_modelo()
+    modelo.fit(df_tr_model[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']], df_tr_model['Monto de ventas'])
+    
     return modelo, df_held, df_train
 
 # ========================================================
@@ -190,14 +160,13 @@ if archivos_subidos:
     try:
         df_global, modelo_rf, wape_val, mae_val, rmse_val, r2_val = cargar_y_entrenar(archivos_subidos)
         
-        st.success("Archivos cargados y modelo optimizado entrenado con exito!")
+        st.success("Modelo base entrenado con exito.")
         
-        st.markdown("##### Metricas de Ajuste (Split Aleatorio con correccion Logaritmica)")
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-        col_m1.metric("Error WAPE", f"{wape_val:.2f}%")
-        col_m2.metric("Error Promedio (MAE)", f"${mae_val:,.2f}")
-        col_m3.metric("Penalización (RMSE)", f"${rmse_val:,.2f}")
-        col_m4.metric("Explicabilidad (R²)", f"{max(0, r2_val):.2f}")
+        col_m1.metric("WAPE Base", f"{wape_val:.2f}%")
+        col_m2.metric("MAE Base", f"${mae_val:,.2f}")
+        col_m3.metric("RMSE Base", f"${rmse_val:,.2f}")
+        col_m4.metric("R² Base", f"{max(0, r2_val):.2f}")
 
         st.markdown("---")
 
@@ -303,37 +272,35 @@ if archivos_subidos:
         # ========================================================
         # 1.5. BACKTEST
         # ========================================================
-        st.subheader("1.5. Validación Histórica por Semana (Backtest)")
+        st.subheader("1.5. Validación Histórica (Backtest)")
         
         col_bt1, col_bt2 = st.columns(2)
         with col_bt1:
-            semanas_holdout = st.slider("Semanas historicas a reservar:", 1, 12, 4, key="slider_holdout")
+            semanas_holdout = st.slider("Semanas a reservar:", 1, 12, 4, key="slider_holdout")
         with col_bt2:
             semana_inicio_metrica = st.slider("Calcular a partir de semana #:", 1, semanas_holdout, 1, key="slider_semana_inicio")
 
         try:
             modelo_bt, df_held_bt, df_train_bt = entrenar_backtest(df_global, semanas_holdout, tuple(CODIGOS_PREDICCION))
 
-            if df_held_bt.empty:
-                st.warning("No hay suficientes semanas para hacer el backtest.")
-            else:
+            if not df_held_bt.empty:
                 resultados_bt = []
                 for codigo, group in df_held_bt.groupby('Codigo'):
                     group = group.sort_values('Semana').reset_index(drop=True)
                     train_group = df_train_bt[df_train_bt['Codigo'] == codigo].sort_values('Semana')
 
-                    if train_group.empty or len(train_group) < 4: continue
+                    if train_group.empty or len(train_group) < 3: continue
 
-                    n_semanas = len(group)
-                    hist_real = train_group['Monto de ventas'].dropna().values
+                    last = train_group.iloc[-1]
+                    v_act = last['Monto de ventas'] if pd.notna(last['Monto de ventas']) else 0.0
+                    v_lag = last['Venta_1_Semana_Atras'] if pd.notna(last['Venta_1_Semana_Atras']) else 0.0
+                    h_max = train_group['Monto de ventas'].max() if not train_group['Monto de ventas'].isna().all() else 0
                     
-                    # FILTRO DE PRODUCTO MUERTO
+                    # FILTRO DE MUERTOS
                     if es_producto_muerto(train_group):
-                        preds = [0.0] * n_semanas
+                        preds = [0.0] * len(group)
                     else:
-                        h_max = hist_real.max() if len(hist_real) > 0 else 0
-                        h_med = np.median(hist_real) if len(hist_real) > 0 else 0
-                        preds = predecir_futuro_recursivo(modelo_bt, hist_real, n_semanas, h_max, h_med)
+                        preds = predecir_recursivo_seguro(modelo_bt, v_act, v_lag, len(group), h_max)
 
                     for i, (pred, actual) in enumerate(zip(preds, group['Monto de ventas'].tolist()), start=1):
                         if pd.isna(actual): continue
@@ -342,31 +309,26 @@ if archivos_subidos:
                             'Semana_Predecida': i, 'Prediccion': float(pred), 'Actual': float(actual)
                         })
 
-                if not resultados_bt:
-                    st.warning("No se pudieron generar predicciones de backtest.")
-                else:
+                if resultados_bt:
                     df_bt = pd.DataFrame(resultados_bt)
                     df_bt['Error_Abs'] = (df_bt['Prediccion'] - df_bt['Actual']).abs()
                     df_bt['Variacion_%'] = np.where(df_bt['Actual'] > 0, ((df_bt['Prediccion'] - df_bt['Actual']) / df_bt['Actual']) * 100, 0.0)
                     df_bt_filt = df_bt[df_bt['Semana_Predecida'] >= semana_inicio_metrica].copy()
 
                     if not df_bt_filt.empty:
-                        y_true = df_bt_filt['Actual'].values
-                        y_pred = df_bt_filt['Prediccion'].values
-
-                        wape_bt = (np.sum(np.abs(y_true - y_pred)) / np.sum(np.abs(y_true))) * 100 if np.sum(y_true) > 0 else 0.0
-                        st.markdown(f"#### 📊 Metricas de Backtest — Semanas +{semana_inicio_metrica} a +{semanas_holdout}")
+                        y_t, y_p = df_bt_filt['Actual'].values, df_bt_filt['Prediccion'].values
+                        wape_bt = (np.sum(np.abs(y_t - y_p)) / np.sum(np.abs(y_t))) * 100 if np.sum(y_t) > 0 else 0.0
+                        
+                        st.markdown(f"#### 📊 Métricas Backtest — Semanas +{semana_inicio_metrica} a +{semanas_holdout}")
                         c1, c2, c3, c4 = st.columns(4)
                         c1.metric("WAPE", f"{wape_bt:.2f}%")
-                        c2.metric("MAE", f"${mean_absolute_error(y_true, y_pred):,.2f}")
-                        c3.metric("RMSE", f"${np.sqrt(mean_squared_error(y_true, y_pred)):,.2f}")
-                        c4.metric("R²", f"{max(0, r2_score(y_true, y_pred)):.2f}")
+                        c2.metric("MAE", f"${mean_absolute_error(y_t, y_p):,.2f}")
+                        c3.metric("RMSE", f"${np.sqrt(mean_squared_error(y_t, y_p)):,.2f}")
+                        c4.metric("R²", f"{max(0, r2_score(y_t, y_p)):.2f}")
 
                         with st.expander("🔎 Ver detalle y Top 10 Peores Predicciones"):
-                            st.markdown("##### 🚨 Top 10 Peores Predicciones")
-                            top_10 = df_bt_filt.nlargest(10, 'Error_Abs')
-                            st.dataframe(top_10.style.format({'Prediccion': '${:,.2f}', 'Actual': '${:,.2f}', 'Error_Abs': '${:,.2f}', 'Variacion_%': '{:+.1f}%'}), use_container_width=True, hide_index=True)
-                            
+                            st.markdown("##### 🚨 Top 10 Peores")
+                            st.dataframe(df_bt_filt.nlargest(10, 'Error_Abs').style.format({'Prediccion': '${:,.2f}', 'Actual': '${:,.2f}', 'Error_Abs': '${:,.2f}', 'Variacion_%': '{:+.1f}%'}), use_container_width=True, hide_index=True)
                             st.markdown("##### 📋 Detalle Completo")
                             st.dataframe(df_bt_filt.sort_values(['Codigo', 'Semana_Predecida']).style.format({'Prediccion': '${:,.2f}', 'Actual': '${:,.2f}', 'Error_Abs': '${:,.2f}', 'Variacion_%': '{:+.1f}%'}), use_container_width=True, hide_index=True)
 
@@ -376,7 +338,7 @@ if archivos_subidos:
         st.markdown("---")
 
         # ========================================================
-        # 2. PREDICCIÓN Y GRÁFICA
+        # 2. PREDICCIÓN
         # ========================================================
         st.subheader("2. Simulacion y Tendencia de Producto")
         df_pred = df_global.dropna(subset=['Codigo']).copy()
@@ -388,59 +350,56 @@ if archivos_subidos:
                 
             col_sim1, col_sim2, col_sim3 = st.columns(3)
             with col_sim1:
-                codigo_seleccionado = st.selectbox("Selecciona el Producto:", options=list(opciones_productos.keys()), format_func=lambda x: opciones_productos[x])
+                codigo_sel = st.selectbox("Selecciona el Producto:", options=list(opciones_productos.keys()), format_func=lambda x: opciones_productos[x])
             with col_sim2:
-                monto_enviar = st.number_input("Monto de mercancia a enviar ($):", min_value=0.0, value=0.0, step=1000.0)
+                monto_enviar = st.number_input("Monto de mercancia ($):", min_value=0.0, value=0.0, step=1000.0)
             with col_sim3:
-                semanas_proyectar = st.slider("Semanas a proyectar (Gráfica):", 1, 8, 4, key="slider_grafica")
+                sem_proy = st.slider("Semanas a proyectar:", 1, 8, 4, key="s_graf")
 
-            df_hist_prod = df_pred[df_pred['Codigo'] == codigo_seleccionado].sort_values('Semana')
-            
+            df_hist_prod = df_pred[df_pred['Codigo'] == codigo_sel].sort_values('Semana')
             if not df_hist_prod.empty:
                 semana_max = df_hist_prod['Semana'].max()
-                df_ultimo_registro = df_hist_prod[df_hist_prod['Semana'] == semana_max].iloc[0]
+                df_ult = df_hist_prod[df_hist_prod['Semana'] == semana_max].iloc[0]
                 
-                hist_ventas = df_hist_prod['Monto de ventas'].dropna().values
+                hist_ventas = df_hist_prod['Monto de ventas'].dropna()
+                h_max = hist_ventas.max() if not hist_ventas.empty else 0
                 
                 if es_producto_muerto(df_hist_prod):
-                    preds_futuras = [0.0] * semanas_proyectar
-                    st.warning("⚠️ Este producto no ha registrado ventas recientes. Se proyecta en $0.")
+                    preds_futuras = [0.0] * sem_proy
+                    st.warning("⚠️ Producto sin ventas recientes. Proyeccion en $0.")
                 else:
-                    h_max = hist_ventas.max() if len(hist_ventas) > 0 else 0
-                    h_med = np.median(hist_ventas) if len(hist_ventas) > 0 else 0
-                    preds_futuras = predecir_futuro_recursivo(modelo_rf, hist_ventas, semanas_proyectar, h_max, h_med)
+                    v1 = df_ult['Monto de ventas'] if pd.notna(df_ult['Monto de ventas']) else 0.0
+                    v2 = df_ult['Venta_1_Semana_Atras'] if pd.notna(df_ult['Venta_1_Semana_Atras']) else 0.0
+                    preds_futuras = predecir_recursivo_seguro(modelo_rf, v1, v2, sem_proy, h_max)
                 
                 df_real = df_hist_prod[['Semana', 'Monto de ventas']].copy()
                 df_real['Tipo'] = 'Historico Real'
                 
-                filas_futuras = [{'Semana': semana_max, 'Monto de ventas': df_ultimo_registro['Monto de ventas'], 'Tipo': 'Proyectado'}]
-                for idx, pred_val in enumerate(preds_futuras, start=1):
-                    filas_futuras.append({'Semana': semana_max + idx, 'Monto de ventas': pred_val, 'Tipo': 'Proyectado'})
+                filas_futuras = [{'Semana': semana_max, 'Monto de ventas': df_ult['Monto de ventas'], 'Tipo': 'Proyectado'}]
+                for idx, p_val in enumerate(preds_futuras, start=1):
+                    filas_futuras.append({'Semana': semana_max + idx, 'Monto de ventas': p_val, 'Tipo': 'Proyectado'})
                 
-                df_grafica_comb = pd.concat([df_real, pd.DataFrame(filas_futuras)], ignore_index=True)
+                df_graf = pd.concat([df_real, pd.DataFrame(filas_futuras)], ignore_index=True)
 
-                st.markdown(f"#### 📈 Tendencia Historica y Proyeccion ({semanas_proyectar} Semanas)")
-                grafica = alt.Chart(df_grafica_comb).mark_line(point=True).encode(
+                grafica = alt.Chart(df_graf).mark_line(point=True).encode(
                     x=alt.X('Semana:O', title='Semana', axis=alt.Axis(labelAngle=0)),
-                    y=alt.Y('Monto de ventas:Q', title='Monto de Ventas ($)', axis=alt.Axis(format='$,.2f')),
-                    color=alt.Color('Tipo:N', title='Origen', scale=alt.Scale(domain=['Historico Real', 'Proyectado'], range=['#1f77b4', '#ff7f0e'])),
+                    y=alt.Y('Monto de ventas:Q', title='Ventas ($)', axis=alt.Axis(format='$,.2f')),
+                    color=alt.Color('Tipo:N', scale=alt.Scale(domain=['Historico Real', 'Proyectado'], range=['#1f77b4', '#ff7f0e'])),
                     strokeDash=alt.condition(alt.datum.Tipo == 'Proyectado', alt.value([4, 4]), alt.value([0])),
                     tooltip=['Semana:O', alt.Tooltip('Monto de ventas:Q', format='$,.2f'), 'Tipo:N']
                 ).properties(height=350).interactive()
-                
                 st.altair_chart(grafica, use_container_width=True)
 
-                inv_actual = df_ultimo_registro['Inventario'] if pd.notna(df_ultimo_registro['Inventario']) else 0
-                inv_futuro = inv_actual + monto_enviar
-                venta_prom_est = np.mean(preds_futuras) if len(preds_futuras) > 0 else 0
-                dias_inv = (inv_futuro / venta_prom_est) * 30 if venta_prom_est > 0 else 0
+                inv_act = df_ult['Inventario'] if pd.notna(df_ult['Inventario']) else 0
+                inv_fut = inv_act + monto_enviar
+                venta_prom = np.mean(preds_futuras) if len(preds_futuras) > 0 else 0
+                dias_inv = (inv_fut / venta_prom) * 30 if venta_prom > 0 else 0
                 
-                st.markdown("### 📊 Resultados de la Proyeccion")
                 r1, r2, r3, r4 = st.columns(4)
-                r1.info(f"Inv. en Sistema:\n\n${inv_actual:,.2f}")
-                r2.warning(f"Inv. Total (Simulado):\n\n${inv_futuro:,.2f}")
-                r3.info(f"Venta Est. Prom.:\n\n${venta_prom_est:,.2f}")
-                r4.success(f"Dias Cobertura Prom.:\n\n{dias_inv:.1f} dias")
+                r1.info(f"Inv. en Sistema:\n\n${inv_act:,.2f}")
+                r2.warning(f"Inv. Total:\n\n${inv_fut:,.2f}")
+                r3.info(f"Venta Est. Prom.:\n\n${venta_prom:,.2f}")
+                r4.success(f"Dias Cobertura:\n\n{dias_inv:.1f} dias")
 
         st.markdown("---")
 
@@ -471,85 +430,72 @@ if archivos_subidos:
         # ========================================================
         st.subheader("4. Proyeccion Masiva de Inventario")
         CODIGOS_PERMITIDOS = list(set(CODIGOS_PREDICCION + CODIGOS_TABLA))
-        df_todos = df_global.dropna(subset=['Codigo']).copy()
-        df_ultimos_masivo = df_todos[df_todos['Codigo'].isin(CODIGOS_PERMITIDOS)].sort_values('Semana').groupby('Codigo').tail(1)
+        df_ultimos_masivo = df_global[df_global['Codigo'].isin(CODIGOS_PERMITIDOS)].sort_values('Semana').groupby('Codigo').tail(1)
         
         opciones_todos = {int(row['Codigo']): f"{int(row['Codigo'])} - {row.get('Descripcion', 'Desconocido')}" for _, row in df_ultimos_masivo.iterrows()}
         
-        col_masiva1, col_masiva2 = st.columns(2)
-        with col_masiva1:
-            semanas_proyectar_masivo = st.slider("Semanas a predecir:", 1, 12, 4, key="slider_masiva")
-        with col_masiva2:
-            filtro_seleccionado = st.selectbox("Filtra por producto:", ["Todos"] + list(opciones_todos.keys()), format_func=lambda x: "Todos" if x == "Todos" else opciones_todos[x])
+        col_m1, col_m2 = st.columns(2)
+        with col_m1: sem_proy_mas = st.slider("Semanas a predecir:", 1, 12, 4, key="slider_mas")
+        with col_m2: filtro = st.selectbox("Filtrar producto:", ["Todos"] + list(opciones_todos.keys()), format_func=lambda x: "Todos" if x == "Todos" else opciones_todos[x])
         
-        with st.spinner("Calculando predicciones con Log y Clipping..."):
-            df_a_procesar = df_ultimos_masivo if filtro_seleccionado == "Todos" else df_ultimos_masivo[df_ultimos_masivo['Codigo'] == filtro_seleccionado]
+        with st.spinner("Calculando..."):
+            df_proc = df_ultimos_masivo if filtro == "Todos" else df_ultimos_masivo[df_ultimos_masivo['Codigo'] == filtro]
             
-            if not df_a_procesar.empty:
-                predicciones_por_codigo = {}
-                base_por_codigo = {}
-                
-                for _, row in df_a_procesar.iterrows():
-                    codigo = int(row['Codigo'])
-                    df_prod_hist = df_global[df_global['Codigo'] == codigo]
-                    hist_ventas = df_prod_hist['Monto de ventas'].dropna().values
+            if not df_proc.empty:
+                preds_dict, base_dict = {}, {}
+                for _, row in df_proc.iterrows():
+                    cod = int(row['Codigo'])
+                    df_hist = df_global[df_global['Codigo'] == cod]
+                    hist = df_hist['Monto de ventas'].dropna()
+                    h_max = hist.max() if not hist.empty else 0
                     
-                    if es_producto_muerto(df_prod_hist):
-                        preds = [0.0] * semanas_proyectar_masivo
+                    if es_producto_muerto(df_hist):
+                        preds = [0.0] * sem_proy_mas
                     else:
-                        h_max = hist_ventas.max() if len(hist_ventas) > 0 else 0
-                        h_med = np.median(hist_ventas) if len(hist_ventas) > 0 else 0
-                        preds = predecir_futuro_recursivo(modelo_rf, hist_ventas, semanas_proyectar_masivo, h_max, h_med)
+                        v1 = row['Monto de ventas'] if pd.notna(row['Monto de ventas']) else 0.0
+                        v2 = row['Venta_1_Semana_Atras'] if pd.notna(row['Venta_1_Semana_Atras']) else 0.0
+                        preds = predecir_recursivo_seguro(modelo_rf, v1, v2, sem_proy_mas, h_max)
                         
-                    predicciones_por_codigo[codigo] = preds
-                    base_por_codigo[codigo] = {'Descripcion': row.get('Descripcion', 'Desc.'), 'Inv_Actual': row['Inventario'] if pd.notna(row['Inventario']) else 0.0}
+                    preds_dict[cod] = preds
+                    base_dict[cod] = {'Desc': row.get('Descripcion', 'Desc.'), 'Inv': row['Inventario'] if pd.notna(row['Inventario']) else 0.0}
                 
                 editor_rows = []
-                for codigo, preds in predicciones_por_codigo.items():
-                    info = base_por_codigo[codigo]
-                    row_data = {'Codigo': codigo, 'Descripcion': info['Descripcion'], 'Inv. Actual (Inicial)': float(info['Inv_Actual'])}
-                    inv_sugerido = float(info['Inv_Actual'])
-                    for sem_idx, p_val in enumerate(preds, start=1):
-                        row_data[f'Inv. Sem +{sem_idx} ($)'] = inv_sugerido
-                        inv_sugerido = max(0.0, inv_sugerido - float(p_val))
-                    editor_rows.append(row_data)
+                for cod, preds in preds_dict.items():
+                    info = base_dict[cod]
+                    r_data = {'Codigo': cod, 'Descripcion': info['Desc'], 'Inv. Actual': float(info['Inv'])}
+                    inv_sug = float(info['Inv'])
+                    for i, p in enumerate(preds, start=1):
+                        r_data[f'Inv. Sem +{i}'] = inv_sug
+                        inv_sug = max(0.0, inv_sug - p)
+                    editor_rows.append(r_data)
                 
                 editor_df = pd.DataFrame(editor_rows)
-                column_config = {
-                    'Codigo': st.column_config.NumberColumn('Codigo', disabled=True, format='%d'),
-                    'Descripcion': st.column_config.TextColumn('Descripcion', disabled=True),
-                    'Inv. Actual (Inicial)': st.column_config.NumberColumn('Inv. Actual (Inicial)', disabled=True, format='$%.2f'),
-                }
-                for sem_idx in range(1, semanas_proyectar_masivo + 1):
-                    column_config[f'Inv. Sem +{sem_idx} ($)'] = st.column_config.NumberColumn(f'Inv. Sem +{sem_idx} ($)', min_value=0.0, step=100.0, format='$%.2f')
+                cfg = {'Codigo': st.column_config.NumberColumn(disabled=True), 'Descripcion': st.column_config.TextColumn(disabled=True), 'Inv. Actual': st.column_config.NumberColumn('Inv. Actual', disabled=True, format='$%.2f')}
+                for i in range(1, sem_proy_mas + 1):
+                    cfg[f'Inv. Sem +{i}'] = st.column_config.NumberColumn(f'Inv. Sem +{i}', min_value=0.0, step=100.0, format='$%.2f')
                 
-                st.markdown("##### ✏️ Tabla editable — ajusta los montos de inventario:")
-                edited_df = st.data_editor(editor_df, column_config=column_config, use_container_width=True, hide_index=True, num_rows="fixed", key=f"editor_inv_{semanas_proyectar_masivo}")
+                edited = st.data_editor(editor_df, column_config=cfg, use_container_width=True, hide_index=True, key=f"ed_{sem_proy_mas}")
                 
-                resultados_finales = []
-                for _, row in edited_df.iterrows():
-                    codigo = int(row['Codigo'])
-                    preds = predicciones_por_codigo[codigo]
-                    res_dict = {'Codigo': codigo, 'Descripcion': row['Descripcion'], 'Inv. Actual (Inicial)': float(row['Inv. Actual (Inicial)']) if pd.notna(row['Inv. Actual (Inicial)']) else 0.0}
-                    
-                    for sem_idx, p_val in enumerate(preds, start=1):
-                        col_name = f'Inv. Sem +{sem_idx} ($)'
-                        inv_editado = float(row[col_name]) if pd.notna(row[col_name]) else 0.0
-                        dias_inv = (inv_editado / p_val) * 30 if p_val > 0 else 0.0
-                        res_dict[col_name] = inv_editado
-                        res_dict[f'Pred. Sem +{sem_idx} ($)'] = float(p_val)
-                        res_dict[f'Dias Inv Sem +{sem_idx}'] = dias_inv
-                    resultados_finales.append(res_dict)
+                res = []
+                for _, row in edited.iterrows():
+                    cod = int(row['Codigo'])
+                    r_dict = {'Codigo': cod, 'Descripcion': row['Descripcion'], 'Inv. Actual': float(row['Inv. Actual'])}
+                    for i, p in enumerate(preds_dict[cod], start=1):
+                        col = f'Inv. Sem +{i}'
+                        inv_ed = float(row[col]) if pd.notna(row[col]) else 0.0
+                        r_dict[col] = inv_ed
+                        r_dict[f'Pred. Sem +{i}'] = p
+                        r_dict[f'Dias Inv +{i}'] = (inv_ed / p) * 30 if p > 0 else 0.0
+                    res.append(r_dict)
                 
-                df_resultados = pd.DataFrame(resultados_finales)
-                format_dict = {'Inv. Actual (Inicial)': '${:,.2f}'}
-                for sem_idx in range(1, semanas_proyectar_masivo + 1):
-                    format_dict[f'Inv. Sem +{sem_idx} ($)'] = '${:,.2f}'
-                    format_dict[f'Pred. Sem +{sem_idx} ($)'] = '${:,.2f}'
-                    format_dict[f'Dias Inv Sem +{sem_idx}'] = '{:.1f}'
+                df_final = pd.DataFrame(res)
+                fmt = {'Inv. Actual': '${:,.2f}'}
+                for i in range(1, sem_proy_mas + 1):
+                    fmt[f'Inv. Sem +{i}'] = '${:,.2f}'
+                    fmt[f'Pred. Sem +{i}'] = '${:,.2f}'
+                    fmt[f'Dias Inv +{i}'] = '{:.1f}'
                 
-                st.markdown("##### 📊 Resultado final — Dias de inventario recalculados:")
-                st.dataframe(df_resultados.style.format(format_dict), use_container_width=True)
+                st.dataframe(df_final.style.format(fmt), use_container_width=True)
 
     except Exception as e:
-        st.error(f"Error al procesar: {e}")
+        st.error(f"Error: {e}")
