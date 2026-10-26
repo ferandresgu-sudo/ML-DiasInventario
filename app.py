@@ -21,17 +21,15 @@ st.set_page_config(page_title="Prediccion de Inventario", page_icon="📦", layo
 st.title("📦 Simulador Predictivo de Dias de Inventario (Optimizado para Picos)")
 
 # ========================================================
-# MODELO CUANTÍLICO (El secreto para los picos altos)
+# MODELO CUANTÍLICO
 # ========================================================
 def construir_modelo():
-    # Usamos alpha=0.8 (Percentil 80) para forzar al modelo a mirar los picos altos
     if LGB_AVAILABLE:
         return lgb.LGBMRegressor(
             objective='quantile', alpha=0.8, 
             n_estimators=200, max_depth=4, num_leaves=8, learning_rate=0.05,
             min_child_samples=4, subsample=0.9, random_state=42, n_jobs=-1, verbose=-1
         )
-    # Fallback si no hay LightGBM
     return GradientBoostingRegressor(
         loss='quantile', alpha=0.8,
         n_estimators=200, max_depth=4, learning_rate=0.05, random_state=42
@@ -50,18 +48,11 @@ def es_producto_muerto(df_prod, ventana_semanas=3):
     return bool(ultimas.fillna(0).sum() <= 0.01)
 
 def predecir_recursivo_seguro(modelo, hist_ventas, n_semanas):
-    """
-    Prediccion recursiva con Tendencia Multiplicativa.
-    Evita las lineas planas y respeta la escala real sin limites artificiales (Clipping).
-    """
     predicciones = []
-    
     v_prev1 = float(hist_ventas[-1]) if len(hist_ventas) >= 1 else 0.0
     v_prev2 = float(hist_ventas[-2]) if len(hist_ventas) >= 2 else v_prev1
     
-    # Calcular factor de tendencia (Multiplicativo)
     tendencia = (v_prev1 / v_prev2) if v_prev2 > 0 else 1.0
-    # Limitar la tendencia para que no explote (entre 0.8 y 1.25)
     tendencia = np.clip(tendencia, 0.8, 1.25)
     
     for i in range(n_semanas):
@@ -71,7 +62,6 @@ def predecir_recursivo_seguro(modelo, hist_ventas, n_semanas):
         except:
             pred_modelo = v_prev1
             
-        # Aplicar la tendencia suavemente a partir de la semana 2
         if i > 0:
             pred_final = pred_modelo * (tendencia ** i)
         else:
@@ -86,9 +76,9 @@ def predecir_recursivo_seguro(modelo, hist_ventas, n_semanas):
     return predicciones
 
 # ========================================================
-# ENTRENAMIENTO (Retorna un Diccionario para evitar errores)
+# ENTRENAMIENTO (Retorna 6 valores separados)
 # ========================================================
-@st.cache_resource(show_spinner="Entrenando modelo con regresión cuantílica y pesos...")
+@st.cache_resource(show_spinner="Entrenando modelo optimizado...")
 def cargar_y_entrenar(archivos_subidos):
     lista_dfs = []
     for archivo in archivos_subidos:
@@ -123,33 +113,23 @@ def cargar_y_entrenar(archivos_subidos):
     X = df_modelo[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']]
     y = df_modelo['Monto de ventas']
     
-    # PONDERACION DE MUESTRAS (Dar mas peso a ventas altas)
     pesos = 1.0 + (y / y.mean()).clip(0, 3.5)
-    
     X_train, X_test, y_train, y_test, w_train = train_test_split(X, y, pesos, test_size=0.2, random_state=42)
     
     modelo_eval = construir_modelo()
-    if LGB_AVAILABLE:
-        modelo_eval.fit(X_train, y_train, sample_weight=w_train)
-    else:
-        modelo_eval.fit(X_train, y_train, sample_weight=w_train)
-        
+    modelo_eval.fit(X_train, y_train, sample_weight=w_train)
     preds_test = modelo_eval.predict(X_test)
     
     wape = (np.sum(np.abs(y_test - preds_test)) / y_test.sum()) * 100 if y_test.sum() > 0 else 0.0
+    mae = mean_absolute_error(y_test, preds_test)
+    rmse = np.sqrt(mean_squared_error(y_test, preds_test))
+    r2 = r2_score(y_test, preds_test)
     
     modelo_final = construir_modelo()
     modelo_final.fit(X, y, sample_weight=pesos)
     
-    # RETORNO COMO DICCIONARIO (Evita el error "too many values to unpack")
-    return {
-        'df': df,
-        'modelo': modelo_final,
-        'wape': wape,
-        'mae': mean_absolute_error(y_test, preds_test),
-        'rmse': np.sqrt(mean_squared_error(y_test, preds_test)),
-        'r2': r2_score(y_test, preds_test)
-    }
+    # RETORNAMOS 6 VALORES EXACTOS
+    return df, modelo_final, wape, mae, rmse, r2
 
 @st.cache_resource(show_spinner=False)
 def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
@@ -191,16 +171,10 @@ archivos_subidos = st.file_uploader("Selecciona archivos Excel:", type=["xlsx", 
 
 if archivos_subidos:
     try:
-        # Extraemos los valores del diccionario de forma segura
-        resultado = cargar_y_entrenar(archivos_subidos)
-        df_global = resultado['df']
-        modelo_rf = resultado['modelo']
-        wape_val = resultado['wape']
-        mae_val = resultado['mae']
-        rmse_val = resultado['rmse']
-        r2_val = resultado['r2']
+        # AQUI ESTA LA CORRECCION DEL ERROR (6 variables)
+        df_global, modelo_rf, wape_val, mae_val, rmse_val, r2_val = cargar_y_entrenar(archivos_subidos)
         
-        st.success("Modelo Cuantílico entrenado con exito.")
+        st.success("Modelo entrenado con exito.")
         
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         col_m1.metric("WAPE Base", f"{wape_val:.2f}%")
