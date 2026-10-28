@@ -17,7 +17,7 @@ st.title("📦 Simulador Predictivo de Dias de Inventario")
 st.markdown("Sube todos los archivos de tu carpeta historica para entrenar el modelo y analizar el desempeño por producto.")
 
 # ========================================================
-# FUNCION PARA CONVERTIR NUMERO DE SEMANA A RANGO DE FECHAS
+# FUNCIONES AUXILIARES
 # ========================================================
 def obtener_rango_fechas(semana_num):
     base_date = datetime.date(2026, 6, 15)
@@ -29,9 +29,6 @@ def obtener_rango_fechas(semana_num):
              7: 'jul', 8: 'ago', 9: 'sep', 10: 'oct', 11: 'nov', 12: 'dic'}
     return f"{start_date.day:02d} {meses[start_date.month]} - {end_date.day:02d} {meses[end_date.month]}"
 
-# ========================================================
-# FUNCION PARA PREDICCION RECURSIVA MULTI-SEMANA
-# ========================================================
 def predecir_futuro_recursivo(modelo, venta_actual, venta_1_atras, n_semanas):
     predicciones = []
     v_prev1 = venta_actual
@@ -48,10 +45,7 @@ def predecir_futuro_recursivo(modelo, venta_actual, venta_1_atras, n_semanas):
         v_prev1 = pred
     return predicciones
 
-# ========================================================
-# FUNCION CACHEADA PARA PROCESAMIENTO Y ENTRENAMIENTO
-# ========================================================
-@st.cache_resource(show_spinner="Procesando archivos y entrenando modelo, esto puede tomar unos segundos.")
+@st.cache_resource(show_spinner="Procesando archivos y entrenando modelo...")
 def cargar_y_entrenar(archivos_subidos):
     lista_dfs = []
     for archivo in archivos_subidos:
@@ -78,15 +72,9 @@ def cargar_y_entrenar(archivos_subidos):
         elif 'dias' in col_lower and 'inv' in col_lower: df.rename(columns={col: 'Dias Inv'}, inplace=True)
         
     df = df.loc[:, ~df.columns.duplicated()]
-    df['Codigo'] = pd.to_numeric(df['Codigo'], errors='coerce')
-    df['Semana'] = pd.to_numeric(df['Semana'], errors='coerce')
-    df['Monto de ventas'] = pd.to_numeric(df['Monto de ventas'], errors='coerce')
-    df['Inventario'] = pd.to_numeric(df['Inventario'], errors='coerce')
-    
-    if 'Dias Inv' in df.columns:
-        df['Dias Inv'] = pd.to_numeric(df['Dias Inv'], errors='coerce')
-    else:
-        df['Dias Inv'] = 0.0
+    for c in ['Codigo', 'Semana', 'Monto de ventas', 'Inventario', 'Dias Inv']:
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce')
+    if 'Dias Inv' not in df.columns: df['Dias Inv'] = 0.0
         
     df = df.sort_values(by=['Codigo', 'Semana'])
     df['Venta_1_Semana_Atras'] = df.groupby('Codigo')['Monto de ventas'].shift(1)
@@ -105,9 +93,6 @@ def cargar_y_entrenar(archivos_subidos):
     
     return df, modelo_final
 
-# ========================================================
-# FUNCION: ENTRENAR MODELO CON HOLDOUT PARA BACKTEST
-# ========================================================
 @st.cache_resource(show_spinner=False)
 def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
     codigos_filtro = list(codigos_tuple)
@@ -154,19 +139,88 @@ def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
 # ========================================================
 # INTERFAZ DE USUARIO
 # ========================================================
-st.subheader("1. Origen de los Datos")
+st.subheader("1. Origen de los Datos (Ventas)")
 archivos_subidos = st.file_uploader(
-    "Selecciona o arrastra todos los archivos Excel de la carpeta (Ctrl + E para seleccionar todos):",
+    "Selecciona o arrastra todos los archivos Excel de la carpeta de ventas:",
     type=["xlsx", "xls", "xlsm"],
-    accept_multiple_files=True
+    accept_multiple_files=True,
+    key="uploader_ventas"
+)
+
+# ========================================================
+# NUEVO: 1.2 CATALOGO DE PRODUCTOS
+# ========================================================
+st.subheader("1.2 Catálogo de Productos (Opcional)")
+st.markdown("Sube un Excel con tu catálogo. Debe tener una columna llamada **Codigo** (o IDProducto). Puedes agregar columnas como **Status**, **Categoria**, **Familia**, etc.")
+catalogo_subido = st.file_uploader(
+    "Selecciona el archivo de catálogo (Excel o CSV):",
+    type=["xlsx", "xls", "csv"],
+    key="uploader_catalogo"
 )
 
 if archivos_subidos:
     try:
         df_global, modelo_rf = cargar_y_entrenar(archivos_subidos)
 
-        st.success("Archivos cargados y modelo entrenado con exito! Revisa la seccion 1.5 para ver la evaluacion real.")
+        # --- CRUCE CON EL CATALOGO ---
+        if catalogo_subido:
+            try:
+                if catalogo_subido.name.endswith('.csv'):
+                    df_cat = pd.read_csv(catalogo_subido)
+                else:
+                    df_cat = pd.read_excel(catalogo_subido, engine='openpyxl')
+
+                # Limpieza basica del catalogo
+                df_cat.columns = [str(col).strip() for col in df_cat.columns]
+                for col in df_cat.columns:
+                    col_lower = col.lower()
+                    if 'codigo' in col_lower or 'código' in col_lower or 'idproducto' in col_lower:
+                        df_cat.rename(columns={col: 'Codigo'}, inplace=True)
+                
+                if 'Codigo' in df_cat.columns:
+                    df_cat['Codigo'] = pd.to_numeric(df_cat['Codigo'], errors='coerce')
+                    df_cat = df_cat.dropna(subset=['Codigo']).drop_duplicates(subset=['Codigo'])
+                    
+                    # Hacemos el cruce (Left Join) para no perder ventas si falta un producto en el catalogo
+                    df_global = df_global.merge(df_cat, on='Codigo', how='left', suffixes=('', '_cat'))
+                    st.success("Catálogo cruzado exitosamente con los datos de ventas.")
+                else:
+                    st.warning("El catálogo no tiene una columna llamada 'Codigo' o 'IDProducto'. No se pudo cruzar.")
+            except Exception as e:
+                st.error(f"Error al leer el catálogo: {e}")
+
+        st.success("Archivos de ventas cargados y modelo entrenado con éxito.")
         st.markdown("---")
+
+        # ========================================================
+        # DASHBOARD DE SEGMENTACION (Si hay catalogo)
+        # ========================================================
+        if catalogo_subido and 'Codigo' in df_cat.columns:
+            st.markdown("### 📊 Segmentación del Catálogo")
+            col_s1, col_s2 = st.columns(2)
+            
+            with col_s1:
+                # Buscar columnas de segmentacion comunes
+                col_segmento = None
+                for posible in ['Status', 'Estatus', 'Estado', 'Categoria', 'Familia']:
+                    if posible in df_global.columns:
+                        col_segmento = posible
+                        break
+                
+                if col_segmento:
+                    st.markdown(f"**Distribución por {col_segmento}:**")
+                    conteo_seg = df_global.drop_duplicates('Codigo')[col_segmento].value_counts().reset_index()
+                    conteo_seg.columns = [col_segmento, 'Cantidad de Productos']
+                    st.dataframe(conteo_seg, hide_index=True)
+                else:
+                    st.info("No se encontraron columnas como 'Status' o 'Categoria' para segmentar.")
+            
+            with col_s2:
+                # Mostrar tabla de catalogo
+                st.markdown("**Vista previa del catálogo:**")
+                st.dataframe(df_cat.head(10), hide_index=True)
+            
+            st.markdown("---")
 
         # Codigos globales
         CODIGOS_PREDICCION = [
@@ -221,7 +275,7 @@ if archivos_subidos:
             7502252488184, 7502252488214, 7502252488887, 7502252488894, 7502252488900, 7502252480584, 7502252485077 ]
          
         CODIGOS_TABLA = [
-      7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+         7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -269,47 +323,29 @@ if archivos_subidos:
             7506475128384, 7506475126694, 7502252484285, 7502252482694, 7502252481796, 7502252480928, 7502252480676, 
             7502252484247, 7502252482038, 7502252482045, 7502252480263, 7502252480287, 7502252483929, 7502252483936, 
             7502252483943, 7502252484469, 7502252482236, 7502252482359, 7502252482250, 7502252487637, 7502252487675, 
-            7502252488184, 7502252488214, 7502252488887, 7502252488894, 7502252488900, 7502252480584, 7502252485077]
+            7502252488184, 7502252488214, 7502252488887, 7502252488894, 7502252488900, 7502252480584, 7502252485077 ]
 
         # ========================================================
         # 1.5. VALIDACION HISTORICA POR SEMANA (BACKTEST)
         # ========================================================
         st.subheader("1.5. Validación Histórica por Semana (Backtest)")
-        st.markdown(
-            "Esta sección **entrena un modelo excluyendo las últimas N semanas** de historia real, "
-            "genera predicciones recursivas para esas semanas y las compara contra los valores reales. "
-            "Así puedes verificar la **veracidad** de las predicciones y elegir desde qué semana predecida medir el desempeño."
-        )
-
+        
         col_bt1, col_bt2 = st.columns(2)
         with col_bt1:
-            semanas_holdout = st.slider(
-                "Semanas historicas a reservar para validacion:",
-                min_value=1, max_value=12, value=4, key="slider_holdout",
-                help="Cuantas semanas del final de la historia se reservan para comparar contra el modelo."
-            )
+            semanas_holdout = st.slider("Semanas historicas a reservar:", 1, 12, 4, key="slider_holdout")
         with col_bt2:
-            semana_inicio_metrica = st.slider(
-                "Calcular metricas a partir de la semana predecida #:",
-                min_value=1, max_value=semanas_holdout, value=1, key="slider_semana_inicio",
-                help="Si eliges 2, las metricas usan las predicciones de la semana +2 en adelante."
-            )
+            semana_inicio_metrica = st.slider("Calcular a partir de semana #:", 1, semanas_holdout, 1, key="slider_semana_inicio")
 
         try:
-            modelo_bt, df_held_bt, df_train_bt = entrenar_backtest(
-                df_global, semanas_holdout, tuple(CODIGOS_PREDICCION)
-            )
+            modelo_bt, df_held_bt, df_train_bt = entrenar_backtest(df_global, semanas_holdout, tuple(CODIGOS_PREDICCION))
 
-            if df_held_bt.empty:
-                st.warning("No hay suficientes semanas historicas por producto para hacer el backtest.")
-            else:
+            if not df_held_bt.empty:
                 resultados_bt = []
                 for codigo, group in df_held_bt.groupby('Codigo'):
                     group = group.sort_values('Semana').reset_index(drop=True)
                     train_group = df_train_bt[df_train_bt['Codigo'] == codigo].sort_values('Semana')
 
-                    if train_group.empty or len(train_group) < 3:
-                        continue
+                    if train_group.empty or len(train_group) < 3: continue
 
                     last_train = train_group.iloc[-1]
                     venta_actual = last_train['Monto de ventas'] if pd.notna(last_train['Monto de ventas']) else 0.0
@@ -319,110 +355,42 @@ if archivos_subidos:
                     preds = predecir_futuro_recursivo(modelo_bt, venta_actual, venta_1_atras, n_semanas)
 
                     for i, (pred, actual) in enumerate(zip(preds, group['Monto de ventas'].tolist()), start=1):
-                        if pd.isna(actual):
-                            continue
+                        if pd.isna(actual): continue
                         resultados_bt.append({
                             'Codigo': codigo,
                             'Descripcion': group.iloc[i-1].get('Descripcion', 'Desconocido'),
-                            'Semana_Real': int(group.iloc[i-1]['Semana']), # <--- AGREGADO
+                            'Semana_Real': int(group.iloc[i-1]['Semana']),
                             'Semana_Predecida': i,
                             'Prediccion': float(pred),
                             'Actual': float(actual),
                         })
 
-                if not resultados_bt:
-                    st.warning("No se pudieron generar predicciones de backtest.")
-                else:
+                if resultados_bt:
                     df_bt = pd.DataFrame(resultados_bt)
-                    
                     df_bt['Error_Abs'] = (df_bt['Prediccion'] - df_bt['Actual']).abs()
-                    df_bt['Variacion_%'] = np.where(
-                        df_bt['Actual'] > 0,
-                        ((df_bt['Prediccion'] - df_bt['Actual']) / df_bt['Actual']) * 100,
-                        0.0
-                    )
+                    df_bt['Variacion_%'] = np.where(df_bt['Actual'] > 0, ((df_bt['Prediccion'] - df_bt['Actual']) / df_bt['Actual']) * 100, 0.0)
                     
                     df_bt_filt = df_bt[df_bt['Semana_Predecida'] >= semana_inicio_metrica].copy()
 
-                    if df_bt_filt.empty:
-                        st.warning("No hay datos para la semana seleccionada.")
-                    else:
+                    if not df_bt_filt.empty:
                         y_true = df_bt_filt['Actual'].values
                         y_pred = df_bt_filt['Prediccion'].values
-
-                        suma_abs_err = np.sum(np.abs(y_true - y_pred))
-                        suma_real = np.sum(np.abs(y_true))
-                        wape_bt = (suma_abs_err / suma_real) * 100 if suma_real > 0 else 0.0
-                        mae_bt = mean_absolute_error(y_true, y_pred)
-                        rmse_bt = np.sqrt(mean_squared_error(y_true, y_pred))
-                        r2_bt = r2_score(y_true, y_pred) if len(y_true) >= 2 else float('nan')
-
-                        st.markdown(
-                            f"#### 📊 Metricas de Backtest — Semanas +{semana_inicio_metrica} a +{semanas_holdout}"
-                        )
+                        wape_bt = (np.sum(np.abs(y_true - y_pred)) / np.sum(np.abs(y_true))) * 100 if np.sum(y_true) > 0 else 0.0
+                        
+                        st.markdown(f"#### 📊 Metricas de Backtest — Semanas +{semana_inicio_metrica} a +{semanas_holdout}")
                         c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("WAPE", f"{wape_bt:.2f}%", help="Error ponderado por volumen")
-                        c2.metric("MAE", f"${mae_bt:,.2f}", help="Error absoluto promedio")
-                        c3.metric("RMSE", f"${rmse_bt:,.2f}", help="Penaliza errores grandes")
-                        r2_display_bt = f"{max(0, r2_bt):.2f}" if not np.isnan(r2_bt) else "N/A"
-                        c4.metric("R²", r2_display_bt, help="Capacidad explicativa (0 a 1)")
+                        c1.metric("WAPE", f"{wape_bt:.2f}%")
+                        c2.metric("MAE", f"${mean_absolute_error(y_true, y_pred):,.2f}")
+                        c3.metric("RMSE", f"${np.sqrt(mean_squared_error(y_true, y_pred)):,.2f}")
+                        c4.metric("R²", f"{max(0, r2_score(y_true, y_pred)):.2f}")
 
-                        st.caption(
-                            f"Total de predicciones evaluadas: **{len(y_true)}** "
-                            f"({df_bt_filt['Codigo'].nunique()} productos × semanas seleccionadas)"
-                        )
-
-                        st.markdown("##### 🔍 Comparativa Real vs Predicho (suma agregada por semana)")
-                        df_chart = df_bt_filt.groupby('Semana_Predecida').agg({
-                            'Prediccion': 'sum', 'Actual': 'sum'
-                        }).reset_index()
-                        df_chart['Semana_Etiqueta'] = df_chart['Semana_Predecida'].apply(lambda x: f"Sem +{int(x)}")
-
-                        df_chart_melt = df_chart.melt(
-                            id_vars=['Semana_Etiqueta'],
-                            value_vars=['Prediccion', 'Actual'],
-                            var_name='Tipo', value_name='Monto'
-                        )
-
-                        chart_bt = alt.Chart(df_chart_melt).mark_bar().encode(
-                            x=alt.X('Semana_Etiqueta:O', title='Semana Predecida'),
-                            y=alt.Y('Monto:Q', title='Monto Total ($)', axis=alt.Axis(format='$,.2f')),
-                            color=alt.Color('Tipo:N', scale=alt.Scale(
-                                domain=['Actual', 'Prediccion'],
-                                range=['#2ca02c', '#ff7f0e']
-                            )),
-                            xOffset='Tipo:N',
-                            tooltip=['Semana_Etiqueta:O', 'Tipo:N', alt.Tooltip('Monto:Q', format='$,.2f')]
-                        ).properties(height=300)
-
-                        st.altair_chart(chart_bt, use_container_width=True)
-
-                        with st.expander("🔎 Ver detalle por producto (prediccion vs real)"):
-                            st.markdown("##### 🚨 Top 10 Peores Predicciones (Mayor Error Absoluto)")
+                        with st.expander("🔎 Ver detalle y Top 10 Peores Predicciones"):
+                            st.markdown("##### 🚨 Top 10 Peores Predicciones")
                             top_10 = df_bt_filt.nlargest(10, 'Error_Abs')
-                            st.dataframe(
-                                top_10[['Codigo', 'Descripcion', 'Semana_Real', 'Semana_Predecida', 'Prediccion', 'Actual', 'Error_Abs', 'Variacion_%']] # <--- Agregado
-                                .style.format({
-                                    'Prediccion': '${:,.2f}',
-                                    'Actual': '${:,.2f}',
-                                    'Error_Abs': '${:,.2f}',
-                                    'Variacion_%': '{:+.1f}%'
-                                }),
-                                use_container_width=True,
-                                hide_index=True
-                            )
+                            st.dataframe(top_10[['Codigo', 'Descripcion', 'Semana_Real', 'Semana_Predecida', 'Prediccion', 'Actual', 'Error_Abs', 'Variacion_%']].style.format({'Prediccion': '${:,.2f}', 'Actual': '${:,.2f}', 'Error_Abs': '${:,.2f}', 'Variacion_%': '{:+.1f}%'}), use_container_width=True, hide_index=True)
                             
                             st.markdown("##### 📋 Detalle Completo")
-                            st.dataframe(
-                                df_bt_filt.sort_values(['Codigo', 'Semana_Real']).style.format({ # <--- Modificado
-                                    'Prediccion': '${:,.2f}',
-                                    'Actual': '${:,.2f}',
-                                    'Error_Abs': '${:,.2f}',
-                                    'Variacion_%': '{:+.1f}%'
-                                }),
-                                use_container_width=True,
-                                hide_index=True
-                            )
+                            st.dataframe(df_bt_filt.sort_values(['Codigo', 'Semana_Real']).style.format({'Prediccion': '${:,.2f}', 'Actual': '${:,.2f}', 'Error_Abs': '${:,.2f}', 'Variacion_%': '{:+.1f}%'}), use_container_width=True, hide_index=True)
 
         except Exception as e:
             st.error(f"Error en backtest: {e}")
@@ -433,48 +401,26 @@ if archivos_subidos:
         # 2. PREDICCIÓN Y GRÁFICA
         # ========================================================
         st.subheader("2. Simulacion y Tendencia de Producto")
-
         df_pred = df_global.dropna(subset=['Codigo']).copy()
         df_pred = df_pred[df_pred['Codigo'].isin(CODIGOS_PREDICCION)]
 
-        if df_pred.empty:
-            st.warning("No se encontraron los codigos de CODIGOS_PREDICCION en los archivos subidos.")
-        else:
+        if not df_pred.empty:
             df_ultimos = df_pred.sort_values('Semana').groupby('Codigo').tail(1)
             opciones_productos = {int(row['Codigo']): f"{int(row['Codigo'])} - {row.get('Descripcion', 'Desconocido')}" for _, row in df_ultimos.iterrows()}
 
             col_sim1, col_sim2, col_sim3 = st.columns(3)
-
             with col_sim1:
-                codigo_seleccionado = st.selectbox(
-                    "Selecciona el Producto a analizar:", 
-                    options=list(opciones_productos.keys()),
-                    format_func=lambda x: opciones_productos[x]
-                )
-
+                codigo_seleccionado = st.selectbox("Selecciona el Producto:", options=list(opciones_productos.keys()), format_func=lambda x: opciones_productos[x])
             with col_sim2:
-                monto_enviar = st.number_input(
-                    "Monto de mercancia a enviar ($):", 
-                    min_value=0.0, 
-                    value=0.0, 
-                    step=1000.0
-                )
-
+                monto_enviar = st.number_input("Monto de mercancia a enviar ($):", min_value=0.0, value=0.0, step=1000.0)
             with col_sim3:
-                semanas_proyectar = st.slider(
-                    "Semanas a proyectar al futuro (Gráfica):",
-                    min_value=1,
-                    max_value=8,
-                    value=4,
-                    key="slider_grafica"
-                )
+                semanas_proyectar = st.slider("Semanas a proyectar (Gráfica):", 1, 8, 4, key="slider_grafica")
 
             df_hist_prod = df_pred[df_pred['Codigo'] == codigo_seleccionado].sort_values('Semana')
 
             if not df_hist_prod.empty:
                 semana_max = df_hist_prod['Semana'].max()
                 df_ultimo_registro = df_hist_prod[df_hist_prod['Semana'] == semana_max].iloc[0]
-
                 venta_actual = df_ultimo_registro['Monto de ventas']
                 venta_1_atras = df_ultimo_registro['Venta_1_Semana_Atras']
 
@@ -483,59 +429,31 @@ if archivos_subidos:
                 df_real = df_hist_prod[['Semana', 'Monto de ventas']].copy()
                 df_real['Tipo'] = 'Historico Real'
 
-                filas_futuras = []
+                filas_futuras = [{'Semana': semana_max, 'Monto de ventas': venta_actual, 'Tipo': 'Proyectado'}]
                 for idx, pred_val in enumerate(preds_futuras, start=1):
-                    sem_futura = semana_max + idx
-                    filas_futuras.append({
-                        'Semana': sem_futura,
-                        'Monto de ventas': pred_val,
-                        'Tipo': f'Proyeccion ({idx}a sem)'
-                    })
+                    filas_futuras.append({'Semana': semana_max + idx, 'Monto de ventas': pred_val, 'Tipo': 'Proyectado'})
 
-                filas_futuras.insert(0, {
-                    'Semana': semana_max,
-                    'Monto de ventas': venta_actual,
-                    'Tipo': 'Proyeccion'
-                })
-
-                df_futuro = pd.DataFrame(filas_futuras)
-                df_futuro['Tipo'] = 'Proyectado'
-
-                df_grafica_comb = pd.concat([df_real, df_futuro], ignore_index=True)
-
-                st.markdown(f"#### 📈 Tendencia Historica y Proyeccion Autorregresiva ({semanas_proyectar} Semanas)")
-
+                df_grafica_comb = pd.concat([df_real, pd.DataFrame(filas_futuras)], ignore_index=True)
+                
                 grafica = alt.Chart(df_grafica_comb).mark_line(point=True).encode(
                     x=alt.X('Semana:O', title='Semana', axis=alt.Axis(labelAngle=0)),
-                    y=alt.Y('Monto de ventas:Q', title='Monto de Ventas ($)', axis=alt.Axis(format='$,.2f')),
-                    color=alt.Color('Tipo:N', title='Origen', scale=alt.Scale(domain=['Historico Real', 'Proyectado'], range=['#1f77b4', '#ff7f0e'])),
-                    strokeDash=alt.condition(
-                        alt.datum.Tipo == 'Proyectado',
-                        alt.value([4, 4]),
-                        alt.value([0])
-                    ),
-                    tooltip=[
-                        alt.Tooltip('Semana:O', title='Semana'), 
-                        alt.Tooltip('Monto de ventas:Q', title='Monto ($)', format='$,.2f'),
-                        alt.Tooltip('Tipo:N', title='Estado')
-                    ]
+                    y=alt.Y('Monto de ventas:Q', title='Monto ($)', axis=alt.Axis(format='$,.2f')),
+                    color=alt.Color('Tipo:N', scale=alt.Scale(domain=['Historico Real', 'Proyectado'], range=['#1f77b4', '#ff7f0e'])),
+                    strokeDash=alt.condition(alt.datum.Tipo == 'Proyectado', alt.value([4, 4]), alt.value([0])),
+                    tooltip=['Semana:O', alt.Tooltip('Monto de ventas:Q', format='$,.2f'), 'Tipo:N']
                 ).properties(height=350).interactive()
-
                 st.altair_chart(grafica, use_container_width=True)
 
-                inv_actual = df_ultimo_registro['Inventario']
-                inv_actual = 0 if pd.isna(inv_actual) else inv_actual
+                inv_actual = df_ultimo_registro['Inventario'] if pd.notna(df_ultimo_registro['Inventario']) else 0
                 inv_futuro = inv_actual + monto_enviar
-
                 venta_prom_est = np.mean(preds_futuras)
                 dias_inv = (inv_futuro / venta_prom_est) * 30 if venta_prom_est > 0 else 0
-
-                st.markdown("### 📊 Resultados de la Proyeccion Multi-Semana")
+                
                 r1, r2, r3, r4 = st.columns(4)
-                r1.info(f"Inv. en Sistema:\n\n${inv_actual:,.2f}")
-                r2.warning(f"Inv. Total (Simulado):\n\n${inv_futuro:,.2f}")
-                r3.info(f"Venta Est. Prom. ({semanas_proyectar} sem):\n\n${venta_prom_est:,.2f}")
-                r4.success(f"Dias Cobertura Prom.:\n\n{dias_inv:.1f} dias")
+                r1.info(f"Inv. Sistema:\n\n${inv_actual:,.2f}")
+                r2.warning(f"Inv. Total:\n\n${inv_futuro:,.2f}")
+                r3.info(f"Venta Prom. Est.:\n\n${venta_prom_est:,.2f}")
+                r4.success(f"Dias Cobertura:\n\n{dias_inv:.1f} dias")
 
         st.markdown("---")
 
@@ -543,101 +461,93 @@ if archivos_subidos:
         # 3. REPORTE SEMANAL DE DÍAS DE INVENTARIO
         # ========================================================
         st.subheader("3. Reporte Semanal (Dias de Inventario)")
-
         df_tabla = df_global.dropna(subset=['Codigo']).copy()
         df_tabla = df_tabla[df_tabla['Codigo'].isin(CODIGOS_TABLA)]
 
-        if df_tabla.empty:
-            st.warning("No se encontraron los codigos de CODIGOS_TABLA en los archivos subidos.")
-        else:
+        if not df_tabla.empty:
             cols_indice = ['Codigo', 'Descripcion']
-            if 'Categoria' in df_tabla.columns:
-                cols_indice.append('Categoria')
-
-            df_pivot = df_tabla.pivot_table(
-                index=cols_indice,
-                columns='Semana', 
-                values='Dias Inv', 
-                aggfunc='sum'
-            ).reset_index().fillna(0)
-
+            if 'Categoria' in df_tabla.columns: cols_indice.append('Categoria')
+            df_pivot = df_tabla.pivot_table(index=cols_indice, columns='Semana', values='Dias Inv', aggfunc='sum').reset_index().fillna(0)
             semanas_cols = sorted([c for c in df_pivot.columns if isinstance(c, (int, float))])
-
             if len(semanas_cols) > 0:
-                col_antigua = semanas_cols[0]
-                col_reciente = semanas_cols[-1]
-                df_pivot['Variacion'] = df_pivot[col_reciente] - df_pivot[col_antigua]
-                df_pivot['% Meta'] = (df_pivot[col_reciente] / 60 * 100).round(1).astype(str) + '%'
+                df_pivot['Variacion'] = df_pivot[semanas_cols[-1]] - df_pivot[semanas_cols[0]]
+                df_pivot['% Meta'] = (df_pivot[semanas_cols[-1]] / 60 * 100).round(1).astype(str) + '%'
             else:
                 df_pivot['Variacion'] = 0.0
                 df_pivot['% Meta'] = '0%'
-
-            mapeo_fechas = {sem: obtener_rango_fechas(sem) for sem in semanas_cols}
-            df_pivot = df_pivot.rename(columns=mapeo_fechas)
-
+            df_pivot = df_pivot.rename(columns={sem: obtener_rango_fechas(sem) for sem in semanas_cols})
             st.dataframe(df_pivot, use_container_width=True)
 
         st.markdown("---")
 
         # ========================================================
-        # 4. TABLA GENERAL DE PREDICCIONES (CÓDIGOS PERMITIDOS)
+        # 4. TABLA GENERAL DE PREDICCIONES CON FILTROS DE CATALOGO
         # ========================================================
         st.subheader("4. Proyeccion Masiva de Inventario (Codigos Seleccionados)")
-        st.markdown(
-            "Ajusta manualmente los montos de inventario por semana en la **tabla editable**. "
-            "Los **Dias de Inventario** se recalculan automaticamente con base en tus valores editados."
-        )
-
+        
         CODIGOS_PERMITIDOS = list(set(CODIGOS_PREDICCION + CODIGOS_TABLA))
         df_todos = df_global.dropna(subset=['Codigo']).copy()
         df_todos = df_todos[df_todos['Codigo'].isin(CODIGOS_PERMITIDOS)]
-
         df_ultimos_masivo = df_todos.sort_values('Semana').groupby('Codigo').tail(1)
 
-        opciones_todos = {int(row['Codigo']): f"{int(row['Codigo'])} - {row.get('Descripcion', 'Desconocido')}" for _, row in df_ultimos_masivo.iterrows()}
-        opciones_filtro_tabla = ["Todos"] + list(opciones_todos.keys())
+        # --- NUEVOS FILTROS DINAMICOS BASADOS EN EL CATALOGO ---
+        st.markdown("##### 🎯 Filtros de Segmentación")
+        col_f1, col_f2, col_f3 = st.columns(3)
+        
+        df_filtrado = df_ultimos_masivo.copy()
 
-        col_masiva1, col_masiva2 = st.columns(2)
+        with col_f1:
+            # Filtro por Status (si existe en el catalogo)
+            if 'Status' in df_filtrado.columns or 'Estatus' in df_filtrado.columns:
+                col_status = 'Status' if 'Status' in df_filtrado.columns else 'Estatus'
+                opciones_status = ["Todos"] + list(df_filtrado[col_status].dropna().unique())
+                filtro_status = st.selectbox("Filtrar por Status:", opciones_status, key="filtro_status")
+                if filtro_status != "Todos":
+                    df_filtrado = df_filtrado[df_filtrado[col_status] == filtro_status]
 
-        with col_masiva1:
-            semanas_proyectar_masivo = st.slider(
-                "Semanas a predecir en la tabla masiva:",
-                min_value=1,
-                max_value=12,
-                value=4,
-                key="slider_masiva"
-            )
+        with col_f2:
+            # Filtro por Categoria (si existe en el catalogo)
+            if 'Categoria' in df_filtrado.columns:
+                opciones_cat = ["Todas"] + list(df_filtrado['Categoria'].dropna().unique())
+                filtro_cat = st.selectbox("Filtrar por Categoría:", opciones_cat, key="filtro_cat")
+                if filtro_cat != "Todas":
+                    df_filtrado = df_filtrado[df_filtrado['Categoria'] == filtro_cat]
 
-        with col_masiva2:
+        with col_f3:
+            # Filtro por Codigo especifico
+            opciones_todos = {int(row['Codigo']): f"{int(row['Codigo'])} - {row.get('Descripcion', 'Desconocido')}" for _, row in df_filtrado.iterrows()}
+            opciones_filtro_tabla = ["Todos"] + list(opciones_todos.keys())
+            
             filtro_seleccionado = st.selectbox(
-                "Filtra la tabla por un producto (o selecciona 'Todos'):",
+                "Filtrar por producto específico:",
                 options=opciones_filtro_tabla,
-                format_func=lambda x: "Todos los productos" if x == "Todos" else opciones_todos[x],
+                format_func=lambda x: "Todos los productos del filtro" if x == "Todos" else opciones_todos.get(x, str(x)),
                 key="filtro_seccion_4"
             )
 
-        with st.spinner("Calculando predicciones de venta... esto puede tomar unos segundos."):
-            df_a_procesar = (
-                df_ultimos_masivo 
-                if filtro_seleccionado == "Todos" 
-                else df_ultimos_masivo[df_ultimos_masivo['Codigo'] == filtro_seleccionado]
-            )
+        col_masiva1 = st.columns(1)[0]
+        with col_masiva1:
+            semanas_proyectar_masivo = st.slider("Semanas a predecir en la tabla masiva:", 1, 12, 4, key="slider_masiva")
 
-            if df_a_procesar.empty:
-                st.info("No hay informacion de productos para predecir.")
+        # Aplicar el ultimo filtro
+        if filtro_seleccionado != "Todos":
+            df_filtrado = df_filtrado[df_filtrado['Codigo'] == filtro_seleccionado]
+        # -----------------------------------------------------
+
+        with st.spinner("Calculando predicciones..."):
+            if df_filtrado.empty:
+                st.info("No hay productos que coincidan con los filtros seleccionados.")
             else:
                 predicciones_por_codigo = {}
                 base_por_codigo = {}
 
-                for _, row in df_a_procesar.iterrows():
+                for _, row in df_filtrado.iterrows():
                     codigo = int(row['Codigo'])
                     venta_actual = row['Monto de ventas'] if pd.notna(row['Monto de ventas']) else 0.0
                     venta_1_atras = row['Venta_1_Semana_Atras'] if pd.notna(row['Venta_1_Semana_Atras']) else 0.0
                     inv_actual = row['Inventario'] if pd.notna(row['Inventario']) else 0.0
 
-                    preds = predecir_futuro_recursivo(
-                        modelo_rf, venta_actual, venta_1_atras, semanas_proyectar_masivo
-                    )
+                    preds = predecir_futuro_recursivo(modelo_rf, venta_actual, venta_1_atras, semanas_proyectar_masivo)
                     predicciones_por_codigo[codigo] = preds
                     base_por_codigo[codigo] = {
                         'Descripcion': row.get('Descripcion', 'Desconocido'),
@@ -663,20 +573,12 @@ if archivos_subidos:
                 column_config = {
                     'Codigo': st.column_config.NumberColumn('Codigo', disabled=True, format='%d'),
                     'Descripcion': st.column_config.TextColumn('Descripcion', disabled=True),
-                    'Inv. Actual (Inicial)': st.column_config.NumberColumn(
-                        'Inv. Actual (Inicial)', disabled=True, format='$%.2f'
-                    ),
+                    'Inv. Actual (Inicial)': st.column_config.NumberColumn('Inv. Actual (Inicial)', disabled=True, format='$%.2f'),
                 }
                 for sem_idx in range(1, semanas_proyectar_masivo + 1):
-                    column_config[f'Inv. Sem +{sem_idx} ($)'] = st.column_config.NumberColumn(
-                        f'Inv. Sem +{sem_idx} ($)',
-                        min_value=0.0,
-                        step=100.0,
-                        format='$%.2f',
-                        help=f"Edita el inventario proyectado para la semana +{sem_idx}"
-                    )
+                    column_config[f'Inv. Sem +{sem_idx} ($)'] = st.column_config.NumberColumn(f'Inv. Sem +{sem_idx} ($)', min_value=0.0, step=100.0, format='$%.2f')
 
-                st.markdown("##### ✏️ Tabla editable — ajusta los montos de inventario por semana:")
+                st.markdown("##### ✏️ Tabla editable — ajusta los montos de inventario:")
                 edited_df = st.data_editor(
                     editor_df,
                     column_config=column_config,
@@ -712,11 +614,8 @@ if archivos_subidos:
                     format_dict[f'Pred. Sem +{sem_idx} ($)'] = '${:,.2f}'
                     format_dict[f'Dias Inv Sem +{sem_idx}'] = '{:.1f}'
 
-                st.markdown("##### 📊 Resultado final — Dias de inventario recalculados con tus ajustes:")
-                st.dataframe(
-                    df_resultados.style.format(format_dict),
-                    use_container_width=True
-                )
+                st.markdown("##### 📊 Resultado final:")
+                st.dataframe(df_resultados.style.format(format_dict), use_container_width=True)
 
     except Exception as e:
         st.error(f"Error al procesar: {e}")
