@@ -165,7 +165,7 @@ if archivos_subidos:
 
         # Lista base de códigos permitidos
         CODIGOS_PREDICCION = [
-          7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -419,13 +419,13 @@ if archivos_subidos:
         
         df_filtrado = df_ultimos_masivo.copy()
 
+        # CAMBIO AQUI: De Status a Tipo
         with col_m1:
-            if 'Status' in df_filtrado.columns or 'Estatus' in df_filtrado.columns:
-                col_status = 'Status' if 'Status' in df_filtrado.columns else 'Estatus'
-                opciones_status = ["Todos"] + list(df_filtrado[col_status].dropna().unique())
-                filtro_status = st.selectbox("Filtrar por Status:", opciones_status, key="filtro_status")
-                if filtro_status != "Todos":
-                    df_filtrado = df_filtrado[df_filtrado[col_status] == filtro_status]
+            if 'Tipo' in df_filtrado.columns:
+                opciones_tipo = ["Todos"] + list(df_filtrado['Tipo'].dropna().unique())
+                filtro_tipo = st.selectbox("Filtrar por Tipo:", opciones_tipo, key="filtro_tipo_masivo")
+                if filtro_tipo != "Todos":
+                    df_filtrado = df_filtrado[df_filtrado['Tipo'] == filtro_tipo]
 
         with col_m2:
             if 'Categoria' in df_filtrado.columns:
@@ -482,7 +482,6 @@ if archivos_subidos:
                     }
                     inv_sugerido = float(info['Inv_Actual'])
                     for sem_idx, p_val in enumerate(preds, start=1):
-                        # MODIFICACION: Sumar la ultima semana historica al indice
                         semana_calendario = ultima_semana_hist + sem_idx
                         row_data[f'Inv. Sem {semana_calendario} ($)'] = inv_sugerido
                         inv_sugerido = max(0.0, inv_sugerido - float(p_val))
@@ -496,7 +495,6 @@ if archivos_subidos:
                     'Inv. Actual (Inicial)': st.column_config.NumberColumn('Inv. Actual (Inicial)', disabled=True, format='$%.2f'),
                 }
                 for sem_idx in range(1, semanas_proyectar_masivo + 1):
-                    # MODIFICACION: Calcular nombre de columna basado en la semana real
                     semana_calendario = ultima_semana_hist + sem_idx
                     column_config[f'Inv. Sem {semana_calendario} ($)'] = st.column_config.NumberColumn(
                         f'Inv. Sem {semana_calendario} ($)', 
@@ -525,7 +523,6 @@ if archivos_subidos:
                         'Inv. Actual (Inicial)': float(row['Inv. Actual (Inicial)']) if pd.notna(row['Inv. Actual (Inicial)']) else 0.0,
                     }
                     for sem_idx, p_val in enumerate(preds, start=1):
-                        # MODIFICACION: Actualizar nombres para resultados finales
                         semana_calendario = ultima_semana_hist + sem_idx
                         col_name = f'Inv. Sem {semana_calendario} ($)'
                         inv_editado = float(row[col_name]) if pd.notna(row[col_name]) else 0.0
@@ -540,7 +537,6 @@ if archivos_subidos:
 
                 format_dict = {'Inv. Actual (Inicial)': '${:,.2f}'}
                 for sem_idx in range(1, semanas_proyectar_masivo + 1):
-                    # MODIFICACION: Actualizar formato de visualizacion
                     semana_calendario = ultima_semana_hist + sem_idx
                     format_dict[f'Inv. Sem {semana_calendario} ($)'] = '${:,.2f}'
                     format_dict[f'Pred. Sem {semana_calendario} ($)'] = '${:,.2f}'
