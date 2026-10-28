@@ -100,11 +100,9 @@ def cargar_y_entrenar(archivos_subidos):
     X = df_modelo[['Venta_1_Semana_Atras', 'Venta_2_Semanas_Atras']]
     y = df_modelo['Monto de ventas']
 
-    # Se elimina la evaluación con split aleatorio y se entrena directo con el 100% de los datos
     modelo_final = RandomForestRegressor(n_estimators=200, max_depth=15, random_state=42)
     modelo_final.fit(X, y)
     
-    # Retornamos solo 2 valores: el dataframe y el modelo entrenado
     return df, modelo_final
 
 # ========================================================
@@ -112,10 +110,6 @@ def cargar_y_entrenar(archivos_subidos):
 # ========================================================
 @st.cache_resource(show_spinner=False)
 def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
-    """
-    Entrena un modelo excluyendo las ultimas N semanas de cada producto.
-    Devuelve: (modelo, df_held, df_train)
-    """
     codigos_filtro = list(codigos_tuple)
     df_work = df.dropna(subset=['Codigo', 'Semana', 'Monto de ventas']).copy()
     df_work = df_work[df_work['Codigo'].isin(codigos_filtro)]
@@ -138,7 +132,6 @@ def entrenar_backtest(df, n_semanas_holdout, codigos_tuple):
     df_train = pd.concat(train_rows, ignore_index=True)
     df_held = pd.concat(held_rows, ignore_index=True) if held_rows else pd.DataFrame()
 
-    # Recalcular lags SOLO sobre train para no filtrar informacion futura
     df_train = df_train.sort_values(['Codigo', 'Semana'])
     df_train['Venta_1_Semana_Atras'] = df_train.groupby('Codigo')['Monto de ventas'].shift(1)
     df_train['Venta_2_Semanas_Atras'] = df_train.groupby('Codigo')['Monto de ventas'].shift(2)
@@ -170,7 +163,6 @@ archivos_subidos = st.file_uploader(
 
 if archivos_subidos:
     try:
-        # AHORA SOLO SE DESEMPAQUETAN 2 VARIABLES
         df_global, modelo_rf = cargar_y_entrenar(archivos_subidos)
 
         st.success("Archivos cargados y modelo entrenado con exito! Revisa la seccion 1.5 para ver la evaluacion real.")
@@ -178,7 +170,7 @@ if archivos_subidos:
 
         # Codigos globales
         CODIGOS_PREDICCION = [
-     7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+       7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -229,7 +221,7 @@ if archivos_subidos:
             7502252488184, 7502252488214, 7502252488887, 7502252488894, 7502252488900, 7502252480584, 7502252485077 ]
          
         CODIGOS_TABLA = [
-  7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+      7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -277,7 +269,7 @@ if archivos_subidos:
             7506475128384, 7506475126694, 7502252484285, 7502252482694, 7502252481796, 7502252480928, 7502252480676, 
             7502252484247, 7502252482038, 7502252482045, 7502252480263, 7502252480287, 7502252483929, 7502252483936, 
             7502252483943, 7502252484469, 7502252482236, 7502252482359, 7502252482250, 7502252487637, 7502252487675, 
-            7502252488184, 7502252488214, 7502252488887, 7502252488894, 7502252488900, 7502252480584, 7502252485077 ]
+            7502252488184, 7502252488214, 7502252488887, 7502252488894, 7502252488900, 7502252480584, 7502252485077]
 
         # ========================================================
         # 1.5. VALIDACION HISTORICA POR SEMANA (BACKTEST)
@@ -332,6 +324,7 @@ if archivos_subidos:
                         resultados_bt.append({
                             'Codigo': codigo,
                             'Descripcion': group.iloc[i-1].get('Descripcion', 'Desconocido'),
+                            'Semana_Real': int(group.iloc[i-1]['Semana']), # <--- AGREGADO
                             'Semana_Predecida': i,
                             'Prediccion': float(pred),
                             'Actual': float(actual),
@@ -408,7 +401,7 @@ if archivos_subidos:
                             st.markdown("##### 🚨 Top 10 Peores Predicciones (Mayor Error Absoluto)")
                             top_10 = df_bt_filt.nlargest(10, 'Error_Abs')
                             st.dataframe(
-                                top_10[['Codigo', 'Descripcion', 'Semana_Predecida', 'Prediccion', 'Actual', 'Error_Abs', 'Variacion_%']]
+                                top_10[['Codigo', 'Descripcion', 'Semana_Real', 'Semana_Predecida', 'Prediccion', 'Actual', 'Error_Abs', 'Variacion_%']] # <--- Agregado
                                 .style.format({
                                     'Prediccion': '${:,.2f}',
                                     'Actual': '${:,.2f}',
@@ -421,7 +414,7 @@ if archivos_subidos:
                             
                             st.markdown("##### 📋 Detalle Completo")
                             st.dataframe(
-                                df_bt_filt.sort_values(['Codigo', 'Semana_Predecida']).style.format({
+                                df_bt_filt.sort_values(['Codigo', 'Semana_Real']).style.format({ # <--- Modificado
                                     'Prediccion': '${:,.2f}',
                                     'Actual': '${:,.2f}',
                                     'Error_Abs': '${:,.2f}',
