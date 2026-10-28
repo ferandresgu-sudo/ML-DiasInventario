@@ -160,9 +160,12 @@ if archivos_subidos:
 
         st.markdown("---")
 
+        # Obtener la última semana histórica global
+        ultima_semana_hist = int(df_global['Semana'].max()) if not df_global.empty and pd.notna(df_global['Semana'].max()) else 0
+
         # Lista base de códigos permitidos
         CODIGOS_PREDICCION = [
-            7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+          7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -479,7 +482,9 @@ if archivos_subidos:
                     }
                     inv_sugerido = float(info['Inv_Actual'])
                     for sem_idx, p_val in enumerate(preds, start=1):
-                        row_data[f'Inv. Sem +{sem_idx} ($)'] = inv_sugerido
+                        # MODIFICACION: Sumar la ultima semana historica al indice
+                        semana_calendario = ultima_semana_hist + sem_idx
+                        row_data[f'Inv. Sem {semana_calendario} ($)'] = inv_sugerido
                         inv_sugerido = max(0.0, inv_sugerido - float(p_val))
                     editor_rows.append(row_data)
 
@@ -491,7 +496,14 @@ if archivos_subidos:
                     'Inv. Actual (Inicial)': st.column_config.NumberColumn('Inv. Actual (Inicial)', disabled=True, format='$%.2f'),
                 }
                 for sem_idx in range(1, semanas_proyectar_masivo + 1):
-                    column_config[f'Inv. Sem +{sem_idx} ($)'] = st.column_config.NumberColumn(f'Inv. Sem +{sem_idx} ($)', min_value=0.0, step=100.0, format='$%.2f')
+                    # MODIFICACION: Calcular nombre de columna basado en la semana real
+                    semana_calendario = ultima_semana_hist + sem_idx
+                    column_config[f'Inv. Sem {semana_calendario} ($)'] = st.column_config.NumberColumn(
+                        f'Inv. Sem {semana_calendario} ($)', 
+                        min_value=0.0, 
+                        step=100.0, 
+                        format='$%.2f'
+                    )
 
                 st.markdown("##### ✏️ Tabla editable — ajusta los montos de inventario:")
                 edited_df = st.data_editor(
@@ -513,21 +525,26 @@ if archivos_subidos:
                         'Inv. Actual (Inicial)': float(row['Inv. Actual (Inicial)']) if pd.notna(row['Inv. Actual (Inicial)']) else 0.0,
                     }
                     for sem_idx, p_val in enumerate(preds, start=1):
-                        col_name = f'Inv. Sem +{sem_idx} ($)'
+                        # MODIFICACION: Actualizar nombres para resultados finales
+                        semana_calendario = ultima_semana_hist + sem_idx
+                        col_name = f'Inv. Sem {semana_calendario} ($)'
                         inv_editado = float(row[col_name]) if pd.notna(row[col_name]) else 0.0
                         dias_inv = (inv_editado / p_val) * 30 if p_val > 0 else 0.0
+                        
                         res_dict[col_name] = inv_editado
-                        res_dict[f'Pred. Sem +{sem_idx} ($)'] = float(p_val)
-                        res_dict[f'Dias Inv Sem +{sem_idx}'] = dias_inv
+                        res_dict[f'Pred. Sem {semana_calendario} ($)'] = float(p_val)
+                        res_dict[f'Dias Inv Sem {semana_calendario}'] = dias_inv
                     resultados_finales.append(res_dict)
 
                 df_resultados = pd.DataFrame(resultados_finales)
 
                 format_dict = {'Inv. Actual (Inicial)': '${:,.2f}'}
                 for sem_idx in range(1, semanas_proyectar_masivo + 1):
-                    format_dict[f'Inv. Sem +{sem_idx} ($)'] = '${:,.2f}'
-                    format_dict[f'Pred. Sem +{sem_idx} ($)'] = '${:,.2f}'
-                    format_dict[f'Dias Inv Sem +{sem_idx}'] = '{:.1f}'
+                    # MODIFICACION: Actualizar formato de visualizacion
+                    semana_calendario = ultima_semana_hist + sem_idx
+                    format_dict[f'Inv. Sem {semana_calendario} ($)'] = '${:,.2f}'
+                    format_dict[f'Pred. Sem {semana_calendario} ($)'] = '${:,.2f}'
+                    format_dict[f'Dias Inv Sem {semana_calendario}'] = '{:.1f}'
 
                 st.markdown("##### 📊 Resultado final:")
                 st.dataframe(df_resultados.style.format(format_dict), use_container_width=True)
