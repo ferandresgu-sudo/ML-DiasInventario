@@ -151,7 +151,7 @@ archivos_subidos = st.file_uploader(
 # NUEVO: 1.2 CATALOGO DE PRODUCTOS
 # ========================================================
 st.subheader("1.2 Catálogo de Productos (Opcional)")
-st.markdown("Sube un Excel con tu catálogo. Debe tener una columna llamada **Codigo** (o IDProducto). Puedes agregar columnas como **Status**, **Categoria**, **Familia**, etc.")
+st.markdown("Sube un Excel con tu catálogo. Debe tener una columna con el ID del producto (ej. IDProducto) y puedes agregar columnas como Status, Categoria, etc.")
 catalogo_subido = st.file_uploader(
     "Selecciona el archivo de catálogo (Excel o CSV):",
     type=["xlsx", "xls", "csv"],
@@ -165,27 +165,46 @@ if archivos_subidos:
         # --- CRUCE CON EL CATALOGO ---
         if catalogo_subido:
             try:
+                # 1. Leer el archivo
                 if catalogo_subido.name.endswith('.csv'):
                     df_cat = pd.read_csv(catalogo_subido)
                 else:
                     df_cat = pd.read_excel(catalogo_subido, engine='openpyxl')
 
-                # Limpieza basica del catalogo
+                # 2. Limpiar nombres de columnas (quitar espacios en blanco invisibles)
                 df_cat.columns = [str(col).strip() for col in df_cat.columns]
-                for col in df_cat.columns:
-                    col_lower = col.lower()
-                    if 'codigo' in col_lower or 'código' in col_lower or 'idproducto' in col_lower:
-                        df_cat.rename(columns={col: 'Codigo'}, inplace=True)
                 
-                if 'Codigo' in df_cat.columns:
+                # 3. Buscar la columna del ID automáticamente
+                col_id_encontrada = None
+                for col in df_cat.columns:
+                    col_lower = col.lower().strip()
+                    if 'codigo' in col_lower or 'código' in col_lower or 'idproducto' in col_lower or 'id producto' in col_lower or 'sku' in col_lower:
+                        col_id_encontrada = col
+                        break
+                
+                # 4. Si no la encuentra, preguntar al usuario
+                if not col_id_encontrada:
+                    st.warning("⚠️ No se detectó automáticamente la columna del ID.")
+                    col_id_encontrada = st.selectbox(
+                        "Por favor, selecciona cuál es la columna que contiene el Código/ID del producto:",
+                        options=list(df_cat.columns)
+                    )
+
+                # 5. Hacer el cruce si se encontró (o seleccionó) la columna
+                if col_id_encontrada:
+                    # Renombrar a 'Codigo' para que coincida con ventas
+                    df_cat = df_cat.rename(columns={col_id_encontrada: 'Codigo'})
+                    
+                    # Asegurar que ambos sean numéricos para poder cruzar
                     df_cat['Codigo'] = pd.to_numeric(df_cat['Codigo'], errors='coerce')
                     df_cat = df_cat.dropna(subset=['Codigo']).drop_duplicates(subset=['Codigo'])
                     
-                    # Hacemos el cruce (Left Join) para no perder ventas si falta un producto en el catalogo
+                    # Realizar el Merge
                     df_global = df_global.merge(df_cat, on='Codigo', how='left', suffixes=('', '_cat'))
-                    st.success("Catálogo cruzado exitosamente con los datos de ventas.")
+                    st.success(f"✅ Catálogo cruzado exitosamente usando la columna: '{col_id_encontrada}'")
                 else:
-                    st.warning("El catálogo no tiene una columna llamada 'Codigo' o 'IDProducto'. No se pudo cruzar.")
+                    st.error("No se pudo cruzar el catálogo porque no se seleccionó ninguna columna válida.")
+                    
             except Exception as e:
                 st.error(f"Error al leer el catálogo: {e}")
 
