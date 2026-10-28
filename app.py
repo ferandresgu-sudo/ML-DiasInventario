@@ -162,7 +162,7 @@ if archivos_subidos:
 
         # Lista base de códigos permitidos
         CODIGOS_PREDICCION = [
-          7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
+            7506475104722, 7506475124614, 7506475128346, 7501058631961, 7506475112093, 7506475113861, 7506475120135, 
             7506475104708, 7501059211209, 7501058619563, 7501059278868, 7501058638076, 7501001600426, 7613030695295, 
             7501059234321, 7501058615541, 7501058611062, 7501058629517, 7506475121231, 7506475128179, 7506475100250, 
             7506475111690, 7506475131179, 7506475116367, 7501000913367, 7501000911967, 7501058628831, 7506475119443, 
@@ -398,29 +398,6 @@ if archivos_subidos:
                 r2.warning(f"Inv. Total:\n\n${inv_futuro:,.2f}")
                 r3.info(f"Venta Prom. Est.:\n\n${venta_prom_est:,.2f}")
                 r4.success(f"Dias Cobertura:\n\n{dias_inv:.1f} dias")
-
-        st.markdown("---")
-
-        # ========================================================
-        # 3. REPORTE SEMANAL DE DÍAS DE INVENTARIO
-        # ========================================================
-        st.subheader("3. Reporte Semanal (Dias de Inventario)")
-        df_tabla = df_global.dropna(subset=['Codigo']).copy()
-        df_tabla = df_tabla[df_tabla['Codigo'].isin(CODIGOS_PREDICCION)]
-
-        if not df_tabla.empty:
-            cols_indice = ['Codigo', 'Descripcion']
-            if 'Categoria' in df_tabla.columns: cols_indice.append('Categoria')
-            df_pivot = df_tabla.pivot_table(index=cols_indice, columns='Semana', values='Dias Inv', aggfunc='sum').reset_index().fillna(0)
-            semanas_cols = sorted([c for c in df_pivot.columns if isinstance(c, (int, float))])
-            if len(semanas_cols) > 0:
-                df_pivot['Variacion'] = df_pivot[semanas_cols[-1]] - df_pivot[semanas_cols[0]]
-                df_pivot['% Meta'] = (df_pivot[semanas_cols[-1]] / 60 * 100).round(1).astype(str) + '%'
-            else:
-                df_pivot['Variacion'] = 0.0
-                df_pivot['% Meta'] = '0%'
-            df_pivot = df_pivot.rename(columns={sem: obtener_rango_fechas(sem) for sem in semanas_cols})
-            st.dataframe(df_pivot, use_container_width=True)
 
         st.markdown("---")
 
