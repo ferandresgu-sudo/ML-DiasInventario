@@ -1,163 +1,171 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import ExtraTreesRegressor
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import altair as alt
 
-st.set_page_config(page_title='Prediccion mensual de ventas', page_icon='📦', layout='wide')
-st.title('📦 Simulador predictivo mensual optimizado')
-st.caption('Modelo global Extra Trees sobre log(venta), estacionalidad, rezagos y promedios moviles.')
+st.set_page_config(page_title='Prediccion ventas V2', page_icon='📦', layout='wide')
+st.title('📦 Prediccion mensual V2: ensamble optimizado por WAPE')
 
-MESES = {'ENERO':1,'FEBRERO':2,'MARZO':3,'ABRIL':4,'MAYO':5,'JUNIO':6,
-         'JULIO':7,'AGOSTO':8,'SEPTIEMBRE':9,'OCTUBRE':10,'NOVIEMBRE':11,'DICIEMBRE':12}
-FEATURES = ['lag1','lag2','lag3','lag4','lag6','lag12','mean3','std3','mean6','std6',
-            'mean12','std12','sin_mes','cos_mes']
+MESES={'ENERO':1,'FEBRERO':2,'MARZO':3,'ABRIL':4,'MAYO':5,'JUNIO':6,'JULIO':7,
+       'AGOSTO':8,'SEPTIEMBRE':9,'OCTUBRE':10,'NOVIEMBRE':11,'DICIEMBRE':12}
+LAGS=[1,2,3,4,5,6,9,12]
+FEATURES=[f'lag{x}' for x in LAGS]+[f'{x}{w}' for w in (3,6,12) for x in ('mean','median','std','min','max')]+[
+    'trend3','trend6','cero3','cero6','sin_mes','cos_mes']
+META=['DESCRIPCION','CATEGORIA','FAMILIA','TIPO']
 
-
-def completar_calendario(g):
-    salida=[]
-    meta=[c for c in ['DESCRIPCION','CATEGORIA','FAMILIA','TIPO'] if c in g.columns]
-    for codigo,x in g.groupby('CODIGO'):
-        x=x.sort_values('Periodo').copy()
-        fechas=pd.to_datetime(x['AÑO'].astype(int).astype(str)+'-'+x['MES_NUM'].astype(int).astype(str)+'-01')
-        x.index=fechas
-        idx=pd.date_range(fechas.min(),fechas.max(),freq='MS')
-        x=x.reindex(idx)
-        x['CODIGO']=codigo
-        # Si una hoja mensual existe pero el SKU no aparece, se interpreta como venta 0.
-        x['VENTA']=x['VENTA'].fillna(0.0)
-        x['MES_NUM']=x.index.month
-        x['AÑO']=x.index.year
-        x['Periodo']=x.index.year*100+x.index.month
-        for c in meta: x[c]=x[c].ffill().bfill()
-        salida.append(x.reset_index(drop=True))
-    return pd.concat(salida,ignore_index=True)
-
-
-def crear_features(df):
-    z=df.sort_values(['CODIGO','Periodo']).copy()
-    grp=z.groupby('CODIGO')['VENTA']
-    for lag in [1,2,3,4,6,12]: z[f'lag{lag}']=grp.shift(lag)
-    for w in [3,6,12]:
-        z[f'mean{w}']=grp.transform(lambda s:s.shift(1).rolling(w,min_periods=2).mean())
-        z[f'std{w}']=grp.transform(lambda s:s.shift(1).rolling(w,min_periods=2).std()).fillna(0)
-    z['sin_mes']=np.sin(2*np.pi*z['MES_NUM']/12)
-    z['cos_mes']=np.cos(2*np.pi*z['MES_NUM']/12)
-    return z
-
-
-def nuevo_modelo():
-    return ExtraTreesRegressor(n_estimators=400, min_samples_leaf=2, max_features=1.0,
-                               n_jobs=-1, random_state=42)
-
-
-def entrenar(df):
-    f=crear_features(df).dropna(subset=['lag1','lag2','VENTA']).copy()
-    medianas=f[FEATURES].median().fillna(0)
-    X=f[FEATURES].fillna(medianas)
-    modelo=nuevo_modelo()
-    # Log1p disminuye la dominancia de productos millonarios y mejora WAPE/MAE.
-    modelo.fit(X,np.log1p(f['VENTA'].clip(lower=0)))
-    return modelo,medianas
-
-
-def vector_futuro(hist, mes_num, medianas):
-    vals=hist.sort_values('Periodo')['VENTA'].astype(float).tolist()
-    q={f'lag{lag}': vals[-lag] if len(vals)>=lag else np.nan for lag in [1,2,3,4,6,12]}
-    for w in [3,6,12]:
-        a=np.asarray(vals[-w:],dtype=float)
-        q[f'mean{w}']=a.mean() if len(a)>=2 else np.nan
-        q[f'std{w}']=a.std(ddof=1) if len(a)>=2 else 0.0
-    q['sin_mes']=np.sin(2*np.pi*mes_num/12)
-    q['cos_mes']=np.cos(2*np.pi*mes_num/12)
-    return pd.DataFrame([q],columns=FEATURES).fillna(medianas)
-
-
-def predecir_recursivo(modelo, medianas, historico, periodos):
-    hist=historico.copy(); preds=[]
-    for periodo in periodos:
-        mes=periodo%100
-        p=float(np.expm1(modelo.predict(vector_futuro(hist,mes,medianas))[0]))
-        p=max(0.0,p); preds.append(p)
-        base=hist.iloc[-1].copy(); base['Periodo']=periodo;base['AÑO']=periodo//100;base['MES_NUM']=mes;base['VENTA']=p
-        hist=pd.concat([hist,pd.DataFrame([base])],ignore_index=True)
-    return preds
-
-@st.cache_data(show_spinner='Leyendo y normalizando archivos...')
+@st.cache_data(show_spinner='Leyendo archivos...')
 def cargar(archivos):
     partes=[]
     for archivo in archivos:
-        for _,h in pd.read_excel(archivo,sheet_name=None,engine='openpyxl').items(): partes.append(h)
-    df=pd.concat(partes,ignore_index=True); df.columns=[str(c).strip().upper() for c in df.columns]
-    oblig=['CODIGO','VENTA','MES','AÑO']
-    falt=[c for c in oblig if c not in df.columns]
+        for _,h in pd.read_excel(archivo,sheet_name=None,engine='openpyxl').items():
+            partes.append(h)
+    d=pd.concat(partes,ignore_index=True)
+    d.columns=[str(c).strip().upper() for c in d.columns]
+    req=['CODIGO','VENTA','MES','AÑO']
+    falt=[c for c in req if c not in d.columns]
     if falt: raise ValueError('Faltan columnas: '+', '.join(falt))
-    df['MES_NUM']=df['MES'].astype(str).str.strip().str.upper().map(MESES)
-    df['AÑO']=pd.to_numeric(df['AÑO'],errors='coerce');df['VENTA']=pd.to_numeric(df['VENTA'],errors='coerce')
-    # Mantener CODIGO como texto evita perdida de precision/notacion cientifica.
-    df['CODIGO']=df['CODIGO'].astype(str).str.replace(r'\.0$','',regex=True).str.strip()
-    df=df.dropna(subset=['MES_NUM','AÑO','VENTA']);df['Periodo']=(df['AÑO']*100+df['MES_NUM']).astype(int)
-    meta={c:'first' for c in ['DESCRIPCION','CATEGORIA','FAMILIA','TIPO'] if c in df.columns}
-    g=df.groupby(['CODIGO','Periodo','MES_NUM','AÑO'],as_index=False).agg({'VENTA':'sum',**meta})
-    return completar_calendario(g).sort_values(['CODIGO','Periodo']).reset_index(drop=True)
+    d['MES_NUM']=d.MES.astype(str).str.strip().str.upper().map(MESES)
+    d['AÑO']=pd.to_numeric(d['AÑO'],errors='coerce')
+    d['VENTA']=pd.to_numeric(d.VENTA,errors='coerce').clip(lower=0)
+    d['CODIGO']=d.CODIGO.astype(str).str.replace(r'\.0$','',regex=True).str.strip()
+    d=d.dropna(subset=['MES_NUM','AÑO','VENTA','CODIGO'])
+    d['Periodo']=(d['AÑO']*100+d.MES_NUM).astype(int)
+    agg={'VENTA':'sum',**{c:'first' for c in META if c in d.columns}}
+    g=d.groupby(['CODIGO','Periodo','MES_NUM','AÑO'],as_index=False).agg(agg)
+    salida=[]
+    for cod,x in g.groupby('CODIGO'):
+        x=x.sort_values('Periodo').copy()
+        fechas=pd.to_datetime(x.AÑO.astype(int).astype(str)+'-'+x.MES_NUM.astype(int).astype(str)+'-01')
+        x.index=fechas
+        x=x.reindex(pd.date_range(fechas.min(),fechas.max(),freq='MS'))
+        x['CODIGO']=cod; x['VENTA']=x.VENTA.fillna(0.0)
+        x['MES_NUM']=x.index.month; x['AÑO']=x.index.year
+        x['Periodo']=x.index.year*100+x.index.month
+        for c in META:
+            if c in x: x[c]=x[c].ffill().bfill()
+        salida.append(x.reset_index(drop=True))
+    return pd.concat(salida,ignore_index=True).sort_values(['CODIGO','Periodo']).reset_index(drop=True)
 
+def features(d):
+    z=d.sort_values(['CODIGO','Periodo']).copy(); grp=z.groupby('CODIGO').VENTA
+    for lag in LAGS: z[f'lag{lag}']=grp.shift(lag)
+    for w in (3,6,12):
+        roll=grp.transform(lambda s:s.shift(1).rolling(w,min_periods=2).mean())
+        z[f'mean{w}']=roll
+        z[f'median{w}']=grp.transform(lambda s:s.shift(1).rolling(w,min_periods=2).median())
+        z[f'std{w}']=grp.transform(lambda s:s.shift(1).rolling(w,min_periods=2).std()).fillna(0)
+        z[f'min{w}']=grp.transform(lambda s:s.shift(1).rolling(w,min_periods=2).min())
+        z[f'max{w}']=grp.transform(lambda s:s.shift(1).rolling(w,min_periods=2).max())
+    z['trend3']=(z.lag1-z.lag3)/3
+    z['trend6']=(z.lag1-z.lag6)/6
+    z['cero3']=grp.transform(lambda s:s.shift(1).rolling(3,min_periods=2).apply(lambda a:(a==0).mean()))
+    z['cero6']=grp.transform(lambda s:s.shift(1).rolling(6,min_periods=2).apply(lambda a:(a==0).mean()))
+    z['sin_mes']=np.sin(2*np.pi*z.MES_NUM/12); z['cos_mes']=np.cos(2*np.pi*z.MES_NUM/12)
+    return z
 
-def backtest(df,n_holdout=2):
-    tamanos=df.groupby('CODIGO').size(); codigos=tamanos[tamanos>=n_holdout+3].index
-    base=df[df.CODIGO.isin(codigos)].copy()
-    held=base.groupby('CODIGO',group_keys=False).tail(n_holdout)
-    train=base.drop(index=held.index)
-    modelo,medianas=entrenar(train)
-    filas=[]
-    for codigo,real in held.groupby('CODIGO'):
-        real=real.sort_values('Periodo'); hist=train[train.CODIGO==codigo].sort_values('Periodo')
-        pred=predecir_recursivo(modelo,medianas,hist,real.Periodo.astype(int).tolist())
-        for paso,((_,r),p) in enumerate(zip(real.iterrows(),pred),1):
-            filas.append({'CODIGO':codigo,'DESCRIPCION':r.get('DESCRIPCION',''),'CATEGORIA':r.get('CATEGORIA',''),
-                          'Periodo_Real':int(r.Periodo),'Mes_Predecido':paso,'Prediccion':p,'Actual':float(r.VENTA)})
+def modelos():
+    raw=RandomForestRegressor(n_estimators=350,max_depth=16,min_samples_leaf=2,max_features=.8,n_jobs=-1,random_state=42)
+    log=ExtraTreesRegressor(n_estimators=450,min_samples_leaf=2,max_features=1.0,n_jobs=-1,random_state=42)
+    return raw,log
+
+def entrenar(d):
+    f=features(d).dropna(subset=['lag1','lag2','VENTA']).copy()
+    med=f[FEATURES].median().fillna(0); X=f[FEATURES].fillna(med); y=f.VENTA
+    raw,log=modelos(); raw.fit(X,y); log.fit(X,np.log1p(y))
+    return raw,log,med
+
+def vector(hist,mes,med):
+    v=hist.sort_values('Periodo').VENTA.astype(float).tolist(); q={}
+    for lag in LAGS: q[f'lag{lag}']=v[-lag] if len(v)>=lag else np.nan
+    for w in (3,6,12):
+        a=np.asarray(v[-w:],float)
+        q[f'mean{w}']=a.mean() if len(a)>=2 else np.nan
+        q[f'median{w}']=np.median(a) if len(a)>=2 else np.nan
+        q[f'std{w}']=a.std(ddof=1) if len(a)>=2 else 0
+        q[f'min{w}']=a.min() if len(a)>=2 else np.nan
+        q[f'max{w}']=a.max() if len(a)>=2 else np.nan
+    q['trend3']=(q['lag1']-q['lag3'])/3 if pd.notna(q['lag3']) else 0
+    q['trend6']=(q['lag1']-q['lag6'])/6 if pd.notna(q['lag6']) else 0
+    q['cero3']=np.mean(np.asarray(v[-3:])==0) if len(v)>=2 else 0
+    q['cero6']=np.mean(np.asarray(v[-6:])==0) if len(v)>=2 else 0
+    q['sin_mes']=np.sin(2*np.pi*mes/12); q['cos_mes']=np.cos(2*np.pi*mes/12)
+    return pd.DataFrame([q],columns=FEATURES).fillna(med)
+
+def predecir(raw,log,med,hist,periodos,alpha):
+    h=hist.copy(); out=[]
+    for per in periodos:
+        X=vector(h,per%100,med)
+        p_raw=max(0,float(raw.predict(X)[0]))
+        p_log=max(0,float(np.expm1(log.predict(X)[0])))
+        # alpha alto favorece log (menor WAPE); alpha bajo favorece raw (menor RMSE en volumen alto)
+        p=alpha*p_log+(1-alpha)*p_raw
+        out.append(p)
+        r=h.iloc[-1].copy();r['Periodo']=per;r['AÑO']=per//100;r['MES_NUM']=per%100;r['VENTA']=p
+        h=pd.concat([h,pd.DataFrame([r])],ignore_index=True)
+    return out
+
+def corte(d,n):
+    valid=d.groupby('CODIGO').filter(lambda x:len(x)>=n+3)
+    held=valid.groupby('CODIGO',group_keys=False).tail(n)
+    return valid.drop(index=held.index),held
+
+def pronosticar_holdout(train,held,alpha):
+    raw,log,med=entrenar(train); filas=[]
+    for cod,r in held.groupby('CODIGO'):
+        r=r.sort_values('Periodo'); h=train[train.CODIGO==cod]
+        ps=predecir(raw,log,med,h,r.Periodo.astype(int).tolist(),alpha)
+        for i,((_,x),p) in enumerate(zip(r.iterrows(),ps),1):
+            filas.append({'CODIGO':cod,'DESCRIPCION':x.get('DESCRIPCION',''),'CATEGORIA':x.get('CATEGORIA',''),
+                          'Periodo_Real':int(x.Periodo),'Mes_Predecido':i,'Actual':float(x.VENTA),'Prediccion':p})
     return pd.DataFrame(filas)
 
-archivos=st.file_uploader('Sube ventas 2024, 2025 y 2026',type=['xlsx','xlsm'],accept_multiple_files=True)
+def wape(df):
+    return 100*(df.Actual-df.Prediccion).abs().sum()/max(df.Actual.abs().sum(),1)
+
+def seleccionar_alpha(train_externo,n_inner=2):
+    tr,va=corte(train_externo,n_inner)
+    candidatos=np.arange(0,1.01,.1); mejor=(1e99,.7)
+    # Se generan raw y log una sola vez usando alpha 0 y 1; luego se prueban mezclas sin reentrenar.
+    a=pronosticar_holdout(tr,va,0.0); b=pronosticar_holdout(tr,va,1.0)
+    for alpha in candidatos:
+        t=a.copy();t['Prediccion']=alpha*b.Prediccion.values+(1-alpha)*a.Prediccion.values
+        score=wape(t)
+        if score<mejor[0]: mejor=(score,float(alpha))
+    return mejor[1],mejor[0]
+
+archivos=st.file_uploader('Sube los archivos 2024, 2025 y 2026',type=['xlsx','xlsm'],accept_multiple_files=True)
 if archivos:
     try:
-        df=cargar(archivos)
-        st.success(f'{len(df):,} observaciones mensuales normalizadas | {df.CODIGO.nunique():,} productos')
-        holdout=st.slider('Meses de backtest',1,4,2)
-        with st.spinner('Entrenando y validando...'):
-            bt=backtest(df,holdout)
-            y=bt.Actual.to_numpy();p=bt.Prediccion.to_numpy()
-            wape=100*np.abs(y-p).sum()/max(np.abs(y).sum(),1)
-            c1,c2,c3,c4=st.columns(4)
-            c1.metric('WAPE',f'{wape:.2f}%');c2.metric('MAE',f'${mean_absolute_error(y,p):,.2f}')
-            c3.metric('RMSE',f'${mean_squared_error(y,p)**0.5:,.2f}');c4.metric('R²',f'{r2_score(y,p):.3f}')
-            bt['Error_Abs']=(bt.Prediccion-bt.Actual).abs()
-            bt['Variacion_%']=np.where(bt.Actual>0,100*(bt.Prediccion-bt.Actual)/bt.Actual,np.nan)
-            st.dataframe(bt.nlargest(10,'Error_Abs'),use_container_width=True,hide_index=True)
+        d=cargar(archivos)
+        st.success(f'{d.CODIGO.nunique():,} productos y {len(d):,} observaciones mensuales')
+        n=st.slider('Meses reservados para backtest final',1,4,2)
+        train,held=corte(d,n)
+        with st.spinner('Seleccionando ensamble con validacion temporal interna...'):
+            alpha,wape_inner=seleccionar_alpha(train,min(2,n))
+            bt=pronosticar_holdout(train,held,alpha)
+        y=bt.Actual.values;p=bt.Prediccion.values
+        W=wape(bt);MAE=mean_absolute_error(y,p);RMSE=mean_squared_error(y,p)**.5;R2=r2_score(y,p)
+        st.info(f'Peso log seleccionado: {alpha:.1f} | WAPE validacion interna: {wape_inner:.2f}%')
+        c1,c2,c3,c4=st.columns(4)
+        c1.metric('WAPE',f'{W:.2f}%');c2.metric('MAE',f'${MAE:,.2f}')
+        c3.metric('RMSE',f'${RMSE:,.2f}');c4.metric('R²',f'{R2:.3f}')
+        bt['Error_Abs']=(bt.Actual-bt.Prediccion).abs()
+        bt['Variacion_%']=np.where(bt.Actual>0,100*(bt.Prediccion-bt.Actual)/bt.Actual,np.nan)
+        st.dataframe(bt.nlargest(20,'Error_Abs'),use_container_width=True,hide_index=True)
 
-        modelo,medianas=entrenar(df)
-        ult=df.sort_values('Periodo').groupby('CODIGO').tail(1)
-        opciones={r.CODIGO:f'{r.CODIGO} - {r.get("DESCRIPCION","")}' for _,r in ult.iterrows()}
-        codigo=st.selectbox('Producto',list(opciones),format_func=lambda x:opciones[x])
-        hist=df[df.CODIGO==codigo].sort_values('Periodo')
-        ultimo=int(df.Periodo.max()); fecha=pd.Timestamp(ultimo//100,ultimo%100,1)
+        raw,log,med=entrenar(d); ultimo=int(d.Periodo.max()); f=pd.Timestamp(ultimo//100,ultimo%100,1)
         periodos=[]
-        for i in [1,2]:
-            f=fecha+pd.DateOffset(months=i);periodos.append(f.year*100+f.month)
-        pred=predecir_recursivo(modelo,medianas,hist,periodos)
-        st.write(f'**{periodos[0]}:** ${pred[0]:,.2f} | **{periodos[1]}:** ${pred[1]:,.2f}')
-        graf=pd.concat([hist[['Periodo','VENTA']].assign(Tipo='Real'),pd.DataFrame({'Periodo':periodos,'VENTA':pred,'Tipo':'Proyectado'})])
-        ch=alt.Chart(graf).mark_line(point=True).encode(x=alt.X('Periodo:O'),y=alt.Y('VENTA:Q'),color='Tipo:N',tooltip=['Periodo','VENTA','Tipo']).properties(height=350)
-        st.altair_chart(ch,use_container_width=True)
-
-        filas=[]
+        for i in (1,2):
+            x=f+pd.DateOffset(months=i);periodos.append(x.year*100+x.month)
+        ult=d.groupby('CODIGO',group_keys=False).tail(1); filas=[]
         for _,r in ult.iterrows():
-            h=df[df.CODIGO==r.CODIGO]; pr=predecir_recursivo(modelo,medianas,h,periodos)
+            h=d[d.CODIGO==r.CODIGO];ps=predecir(raw,log,med,h,periodos,alpha)
             filas.append({'CODIGO':r.CODIGO,'DESCRIPCION':r.get('DESCRIPCION',''),'CATEGORIA':r.get('CATEGORIA',''),
-                          f'Pred {periodos[0]}':pr[0],f'Pred {periodos[1]}':pr[1]})
-        resultado=pd.DataFrame(filas)
-        st.subheader('Proyeccion masiva');st.dataframe(resultado,use_container_width=True,hide_index=True)
-        st.download_button('Descargar proyeccion CSV',resultado.to_csv(index=False).encode('utf-8-sig'),'proyeccion_ventas.csv','text/csv')
+                          f'Pred {periodos[0]}':ps[0],f'Pred {periodos[1]}':ps[1]})
+        res=pd.DataFrame(filas)
+        st.subheader('Proyeccion masiva');st.dataframe(res,use_container_width=True,hide_index=True)
+        st.download_button('Descargar CSV',res.to_csv(index=False).encode('utf-8-sig'),'proyeccion_v2.csv','text/csv')
     except Exception as e:
         st.exception(e)
 
