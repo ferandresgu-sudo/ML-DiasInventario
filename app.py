@@ -8,7 +8,8 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import altair as alt
 
 st.set_page_config(page_title='Prediccion por categoria', page_icon='📦', layout='wide')
-st.title('📦 Prediccion Noviembre-Diciembre 2026 por CATEGORIA')
+st.title('📦 Prediccion Noviembre-Diciembre 2026 V7, calibración automática de RMSE')
+st.caption('Ensamble log/raw, suavizado por volatilidad y límites históricos para controlar errores extremos.')
 
 MESES={'ENERO':1,'FEBRERO':2,'MARZO':3,'ABRIL':4,'MAYO':5,'JUNIO':6,'JULIO':7,'AGOSTO':8,'SEPTIEMBRE':9,'OCTUBRE':10,'NOVIEMBRE':11,'DICIEMBRE':12}
 LAGS=[1,2,3,4,6,12]
@@ -167,34 +168,94 @@ def crear_features(df):
 
 
 def entrenar(df,cfg):
+    """Entrena dos Extra Trees: log reduce WAPE/MAE y raw protege productos de alto volumen."""
     f=crear_features(df).dropna(subset=['lag1','lag2','VENTA']).copy()
-    if f.empty: raise ValueError('No hay historial suficiente para entrenar esta categoría.')
+    if f.empty:
+        raise ValueError('No hay historial suficiente para entrenar esta categoría.')
     medianas=f[FEATURES].median().fillna(0)
-    X=f[FEATURES].fillna(medianas).astype('float32')
-    y=np.log1p(f['VENTA'].clip(lower=0))
+    X=f[FEATURES].replace([np.inf,-np.inf],np.nan).fillna(medianas).astype('float32')
+    y_raw=f['VENTA'].clip(lower=0).astype('float32')
+    y_log=np.log1p(y_raw)
     pesos=np.where(f['MES_NUM'].isin([11,12]) & f['AÑO'].isin([2024,2025]),cfg['peso'],1.0)
-    modelo=ExtraTreesRegressor(n_estimators=cfg['arboles'],max_depth=cfg['profundidad'],
-        min_samples_leaf=cfg['hoja'],max_features=cfg['variables'],n_jobs=-1,random_state=42)
-    modelo.fit(X,y,sample_weight=pesos)
-    return modelo,medianas
+
+    comunes=dict(
+        n_estimators=cfg['arboles'],
+        max_depth=cfg['profundidad'],
+        min_samples_leaf=cfg['hoja'],
+        max_features=cfg['variables'],
+        n_jobs=-1,
+        random_state=42
+    )
+    modelo_log=ExtraTreesRegressor(**comunes)
+    modelo_raw=ExtraTreesRegressor(**comunes)
+    modelo_log.fit(X,y_log,sample_weight=pesos)
+    modelo_raw.fit(X,y_raw,sample_weight=pesos)
+    return {'log':modelo_log,'raw':modelo_raw},medianas
 
 
 def vector(hist,mes,medianas):
     ventas=hist.sort_values('Periodo')['VENTA'].to_numpy(float); d={}
-    for lag in LAGS: d[f'lag{lag}']=ventas[-lag] if len(ventas)>=lag else np.nan
+    for lag in LAGS:
+        d[f'lag{lag}']=ventas[-lag] if len(ventas)>=lag else np.nan
     for w in VENTANAS:
-        a=ventas[-w:]; d[f'mean{w}']=a.mean() if len(a)>=2 else np.nan; d[f'std{w}']=a.std(ddof=1) if len(a)>=2 else 0
+        a=ventas[-w:]
+        d[f'mean{w}']=a.mean() if len(a)>=2 else np.nan
+        d[f'std{w}']=a.std(ddof=1) if len(a)>=2 else 0
     d['sin_mes']=np.sin(2*np.pi*mes/12); d['cos_mes']=np.cos(2*np.pi*mes/12)
-    return pd.DataFrame([d],columns=FEATURES).fillna(medianas).astype('float32')
+    return pd.DataFrame([d],columns=FEATURES).replace([np.inf,-np.inf],np.nan).fillna(medianas).astype('float32')
 
 
-def predecir(modelo,medianas,hist,periodos):
-    h=hist.copy(); pred=[]
+def ajustar_rmse(pred_modelo,hist,cfg):
+    """Suaviza y recorta únicamente según el patrón histórico de cada SKU."""
+    ventas=hist.sort_values('Periodo')['VENTA'].tail(12).astype(float)
+    if len(ventas)<4:
+        return max(0.0,float(pred_modelo)),'SIN_AJUSTE'
+
+    ult6=ventas.tail(6)
+    media6=float(ult6.mean())
+    mediana6=float(ult6.median())
+    std6=float(ult6.std(ddof=1)) if len(ult6)>1 else 0.0
+    cv6=std6/media6 if media6>0 else 0.0
+    ceros6=int((ult6==0).sum())
+
+    if ceros6>=3:
+        positivos=ventas[ventas>0]
+        pred=(ventas.gt(0).mean()*positivos.median()) if not positivos.empty else 0.0
+        return max(0.0,float(pred)),'INTERMITENTE'
+
+    # Los SKU volátiles reciben más estabilización; los estables conservan el modelo.
+    if cv6<=0.35:
+        peso_modelo=0.90; segmento='ESTABLE'
+    elif cv6<1.00:
+        peso_modelo=0.80; segmento='VARIABLE'
+    else:
+        peso_modelo=0.65; segmento='VOLATIL'
+
+    pred=peso_modelo*float(pred_modelo)+(1-peso_modelo)*mediana6
+
+    if cfg['limites'] and len(ventas)>=6:
+        q10=float(ventas.quantile(0.10)); q90=float(ventas.quantile(0.90))
+        inferior=max(0.0,min(q10,0.50*mediana6))
+        # Volátiles/estacionales mantienen más espacio que los SKU estables.
+        multiplicador=2.50 if segmento=='VOLATIL' else (2.00 if segmento=='VARIABLE' else 1.75)
+        superior=max(q90,multiplicador*mediana6,float(ventas.iloc[-1])*1.15)
+        pred=float(np.clip(pred,inferior,superior))
+    return max(0.0,float(pred)),segmento
+
+
+def predecir(modelos,medianas,hist,periodos,cfg):
+    h=hist.copy(); pred=[]; segmentos=[]
     for periodo in periodos:
-        p=max(0,float(np.expm1(modelo.predict(vector(h,periodo%100,medianas))[0])))
-        pred.append(p); fila=h.iloc[-1].copy(); fila['Periodo']=periodo; fila['AÑO']=periodo//100; fila['MES_NUM']=periodo%100; fila['VENTA']=p
+        X=vector(h,periodo%100,medianas)
+        p_log=max(0.0,float(np.expm1(modelos['log'].predict(X)[0])))
+        p_raw=max(0.0,float(modelos['raw'].predict(X)[0]))
+        # 70% log conserva WAPE; 30% raw reduce grandes errores de alto volumen.
+        p_base=(1-cfg['peso_raw'])*p_log+cfg['peso_raw']*p_raw
+        p,segmento=ajustar_rmse(p_base,h,cfg)
+        pred.append(p); segmentos.append(segmento)
+        fila=h.iloc[-1].copy(); fila['Periodo']=periodo; fila['AÑO']=periodo//100; fila['MES_NUM']=periodo%100; fila['VENTA']=p
         h=pd.concat([h,pd.DataFrame([fila])],ignore_index=True)
-    return pred
+    return pred,segmentos
 
 
 def metricas(r):
@@ -204,25 +265,71 @@ def metricas(r):
 
 
 def backtest(df,cfg):
-    tamanos=df.groupby('CODIGO').size(); codigos=tamanos[tamanos>=5].index
+    """Entrena una vez y calibra automáticamente el peso raw para minimizar RMSE."""
+    tamanos=df.groupby('CODIGO').size()
+    codigos=tamanos[tamanos>=5].index
     base=df[df['CODIGO'].isin(codigos)].copy()
-    held=base.groupby('CODIGO',group_keys=False).tail(2); train=base.drop(index=held.index)
-    modelo,medianas=entrenar(train,cfg); historicos={c:g for c,g in train.groupby('CODIGO',sort=False)}; filas=[]
-    for codigo,real in held.groupby('CODIGO',sort=False):
-        if codigo not in historicos: continue
-        real=real.sort_values('Periodo'); ps=predecir(modelo,medianas,historicos[codigo],real['Periodo'].astype(int).tolist())
-        for (_,r),p in zip(real.iterrows(),ps):
-            filas.append({'CODIGO':codigo,'DESCRIPCION':r.get('DESCRIPCION',''),'CATEGORIA':r.get('CATEGORIA',''),
-                          'Periodo':int(r['Periodo']),'Actual':float(r['VENTA']),'Prediccion':p})
-    return pd.DataFrame(filas)
+    held=base.groupby('CODIGO',group_keys=False).tail(2)
+    train=base.drop(index=held.index)
+    modelos,medianas=entrenar(train,cfg)
+    historicos={c:g for c,g in train.groupby('CODIGO',sort=False)}
+
+    candidatos=[]
+    # Incluye modelo log puro y mezclas que prestan más atención a alto volumen.
+    for peso_raw_cand in [0.00,0.10,0.20,0.30,0.40,0.50]:
+        for usar_limites in [False,True]:
+            cfg_cand=dict(cfg)
+            cfg_cand['peso_raw']=peso_raw_cand
+            cfg_cand['limites']=usar_limites
+            filas=[]
+            for codigo,real in held.groupby('CODIGO',sort=False):
+                if codigo not in historicos:
+                    continue
+                real=real.sort_values('Periodo')
+                ps,segmentos=predecir(
+                    modelos,medianas,historicos[codigo],
+                    real['Periodo'].astype(int).tolist(),cfg_cand
+                )
+                for ((_,r),pred,segmento) in zip(real.iterrows(),ps,segmentos):
+                    filas.append({
+                        'CODIGO':codigo,'DESCRIPCION':r.get('DESCRIPCION',''),
+                        'CATEGORIA':r.get('CATEGORIA',''),'Periodo':int(r['Periodo']),
+                        'Actual':float(r['VENTA']),'Prediccion':pred,'Segmento':segmento
+                    })
+            resultado=pd.DataFrame(filas)
+            if resultado.empty:
+                continue
+            m=metricas(resultado)
+            candidatos.append({
+                'peso_raw':peso_raw_cand,'limites':usar_limites,
+                'WAPE':m['WAPE'],'MAE':m['MAE'],'RMSE':m['RMSE'],'R2':m['R2'],
+                'resultado':resultado
+            })
+
+    if not candidatos:
+        return pd.DataFrame(),pd.DataFrame(),cfg
+
+    comparacion=pd.DataFrame([{k:v for k,v in c.items() if k!='resultado'} for c in candidatos])
+    base_log=min(candidatos,key=lambda x:abs(x['peso_raw'])+(1 if x['limites'] else 0))
+    # Solo acepta menor RMSE si WAPE no aumenta más de 1 punto y MAE no sube más de 5%.
+    elegibles=[c for c in candidatos
+               if c['WAPE']<=base_log['WAPE']+1.0
+               and c['MAE']<=base_log['MAE']*1.05]
+    mejor=min(elegibles or candidatos,key=lambda x:x['RMSE'])
+    cfg_opt=dict(cfg)
+    cfg_opt['peso_raw']=mejor['peso_raw']
+    cfg_opt['limites']=mejor['limites']
+    return mejor['resultado'],comparacion.sort_values('RMSE'),cfg_opt
 
 archivos=st.file_uploader('Sube ventas 2024, 2025 y 2026',type=['xlsx','xlsm'],accept_multiple_files=True)
 with st.sidebar.form('config'):
-    arboles=st.select_slider('Árboles',[100,150,200,250,300,400],value=250)
-    profundidad=st.selectbox('Profundidad',[10,14,16,20,None],index=3,format_func=lambda x:'Sin límite' if x is None else str(x))
-    hoja=st.select_slider('Mínimo por hoja',[2,3,4,5],value=2)
-    variables=st.select_slider('Variables por árbol',[0.7,0.8,0.9,1.0],value=1.0)
+    arboles=st.select_slider('Árboles por modelo',[75,100,125,150,200],value=150,help='Se entrenan dos modelos; 150 equivale a 300 árboles totales.')
+    profundidad=st.selectbox('Profundidad',[10,12,14,16,20,None],index=2,format_func=lambda x:'Sin límite' if x is None else str(x))
+    hoja=st.select_slider('Mínimo por hoja',[2,3,4,5,8],value=4)
+    variables=st.select_slider('Variables por árbol',[0.6,0.7,0.8,0.9,1.0],value=0.8)
     peso=st.slider('Peso Nov-Dic 2024/2025',1.0,3.0,1.5,0.25)
+    peso_raw=st.slider('Peso modelo raw para reducir RMSE',0.0,0.5,0.30,0.05)
+    limites=st.checkbox('Suavizar y limitar errores extremos',value=True)
     st.form_submit_button('Aplicar')
 
 if archivos:
@@ -237,36 +344,46 @@ if archivos:
         categorias=sorted(total['CATEGORIA'].dropna().astype(str).unique())
         categoria=st.selectbox('CATEGORIA para métricas y entrenamiento',['Todas']+categorias)
         df=total.copy() if categoria=='Todas' else total[total['CATEGORIA'].astype(str)==categoria].copy()
-        cfg={'arboles':arboles,'profundidad':profundidad,'hoja':hoja,'variables':variables,'peso':peso}
+        cfg={'arboles':arboles,'profundidad':profundidad,'hoja':hoja,'variables':variables,'peso':peso,'peso_raw':peso_raw,'limites':limites}
         firma=(tuple((a.name,a.size) for a in archivos),categoria,tuple(cfg.items()),len(df),int(df['Periodo'].max()))
-        for k,v in [('modelo_cat',None),('firma_modelo_cat',None),('bt_cat',None),('firma_bt_cat',None)]:
+        for k,v in [('modelo_cat',None),('firma_modelo_cat',None),('bt_cat',None),('firma_bt_cat',None),('comparacion_rmse',None),('cfg_opt',None)]:
             if k not in st.session_state: st.session_state[k]=v
 
         c1,c2=st.columns(2)
         with c1:
             if st.button('Calcular métricas de la categoría',type='primary'):
                 with st.spinner('Calculando métricas...'):
-                    st.session_state.bt_cat=backtest(df,cfg); st.session_state.firma_bt_cat=firma
+                    st.session_state.bt_cat,st.session_state.comparacion_rmse,st.session_state.cfg_opt=backtest(df,cfg)
+                    st.session_state.firma_bt_cat=firma
         with c2:
             if st.button('Entrenar modelo de la categoría'):
                 with st.spinner('Entrenando modelo...'):
-                    st.session_state.modelo_cat=entrenar(df,cfg); st.session_state.firma_modelo_cat=firma
+                    cfg_entrenar=st.session_state.cfg_opt if st.session_state.cfg_opt is not None else cfg
+                    st.session_state.modelo_cat=entrenar(df,cfg_entrenar); st.session_state.firma_modelo_cat=firma
 
         if st.session_state.bt_cat is not None and st.session_state.firma_bt_cat==firma and not st.session_state.bt_cat.empty:
             bt=st.session_state.bt_cat.copy(); m=metricas(bt); a,b,c,d=st.columns(4)
             a.metric('WAPE',f"{m['WAPE']:.2f}%"); b.metric('MAE',f"${m['MAE']:,.2f}"); c.metric('RMSE',f"${m['RMSE']:,.2f}"); d.metric('R²',f"{m['R2']:.3f}")
             bt['Error_Abs']=(bt['Actual']-bt['Prediccion']).abs(); bt['Aporte_WAPE_pp']=100*bt['Error_Abs']/max(bt['Actual'].abs().sum(),1)
+            st.caption(f"Relación RMSE/MAE: {m['RMSE']/max(m['MAE'],1):.2f}x. El objetivo es reducirla sin elevar WAPE más de 1 punto.")
+            if st.session_state.cfg_opt is not None:
+                opt=st.session_state.cfg_opt
+                st.success(f"Configuración automática seleccionada: peso raw {opt['peso_raw']:.2f}, límites {'activados' if opt['limites'] else 'desactivados'}.")
+            if st.session_state.comparacion_rmse is not None:
+                st.markdown('#### Comparación automática de configuraciones')
+                st.dataframe(st.session_state.comparacion_rmse.style.format({'peso_raw':'{:.2f}','WAPE':'{:.2f}%','MAE':'${:,.2f}','RMSE':'${:,.2f}','R2':'{:.3f}'}),use_container_width=True,hide_index=True)
             st.dataframe(bt.nlargest(15,'Error_Abs'),use_container_width=True,hide_index=True)
 
         if st.session_state.modelo_cat is not None and st.session_state.firma_modelo_cat==firma:
             modelo,medianas=st.session_state.modelo_cat
+            cfg_pred=st.session_state.cfg_opt if st.session_state.cfg_opt is not None else cfg
             historicos={codigo:g.sort_values('Periodo') for codigo,g in df.groupby('CODIGO',sort=False)}
             ultimos=df.sort_values('Periodo').groupby('CODIGO').tail(1)
             opciones={r['CODIGO']:f"{r['CODIGO']} - {r.get('DESCRIPCION','')}" for _,r in ultimos.iterrows()}
             codigo=st.selectbox('Producto',list(opciones),format_func=lambda x:opciones[x])
             ultimo=int(df['Periodo'].max()); fecha=pd.Timestamp(ultimo//100,ultimo%100,1)
             periodos=[(fecha+pd.DateOffset(months=i)).year*100+(fecha+pd.DateOffset(months=i)).month for i in [1,2]]
-            ps=predecir(modelo,medianas,historicos[codigo],periodos)
+            ps,segmentos=predecir(modelo,medianas,historicos[codigo],periodos,cfg_pred)
             st.write(f"**{periodos[0]}:** ${ps[0]:,.2f} | **{periodos[1]}:** ${ps[1]:,.2f}")
             graf=pd.concat([historicos[codigo][['Periodo','VENTA']].assign(Tipo='Real'),pd.DataFrame({'Periodo':periodos,'VENTA':ps,'Tipo':'Proyectado'})])
             st.altair_chart(alt.Chart(graf).mark_line(point=True).encode(x='Periodo:O',y='VENTA:Q',color='Tipo:N',tooltip=['Periodo','VENTA','Tipo']).properties(height=350),use_container_width=True)
