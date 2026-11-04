@@ -189,7 +189,7 @@ if archivos:
 
         c1,c2=st.columns(2)
         with c1:
-            if st.button("Validar Nov-Dic 2024 y 2025"):
+            if st.button("Calcular metricas WAPE, MAE, RMSE y R2", type="primary"):
                 resultados=[]
                 with st.spinner("Ejecutando backtest estacional..."):
                     for anio in [2024,2025]:
@@ -202,16 +202,44 @@ if archivos:
                     st.session_state.modelos_v4={h:entrenar_modelo(df,h,cfg) for h in [1,2]}
                     st.session_state.firma_v4=firma
 
-        if st.session_state.backtest_v4 is not None:
-            bt=st.session_state.backtest_v4; m=metricas(bt)
+        st.subheader("Metricas de validacion Noviembre-Diciembre")
+        if st.session_state.backtest_v4 is not None and not st.session_state.backtest_v4.empty:
+            bt=st.session_state.backtest_v4.copy()
+            m=metricas(bt)
             a,b,c,d=st.columns(4)
-            a.metric("WAPE",f"{m['WAPE']:.2f}%"); b.metric("MAE",f"${m['MAE']:,.2f}")
-            c.metric("RMSE",f"${m['RMSE']:,.2f}"); d.metric("R²",f"{m['R2']:.3f}")
+            a.metric("WAPE global",f"{m['WAPE']:.2f}%",help="Error absoluto total dividido entre venta real total")
+            b.metric("MAE",f"${m['MAE']:,.2f}",help="Error absoluto promedio por producto-mes")
+            c.metric("RMSE",f"${m['RMSE']:,.2f}",help="Penaliza con mayor fuerza los errores grandes")
+            d.metric("R²",f"{m['R2']:.3f}",help="Proporcion de variabilidad explicada por el modelo")
+
             resumen=[]
-            for anio,g in bt.groupby("Anio"): resumen.append({"Año":anio,**metricas(g)})
-            st.dataframe(pd.DataFrame(resumen),use_container_width=True,hide_index=True)
-            bt2=bt.copy(); bt2["Error_Abs"]=(bt2.Actual-bt2.Prediccion).abs()
-            st.dataframe(bt2.nlargest(15,"Error_Abs"),use_container_width=True,hide_index=True)
+            for (anio,periodo),g in bt.groupby(["Anio","Periodo"]):
+                mm=metricas(g)
+                resumen.append({"Año":int(anio),"Mes":"Noviembre" if int(periodo)%100==11 else "Diciembre",
+                                "WAPE":mm["WAPE"],"MAE":mm["MAE"],"RMSE":mm["RMSE"],"R²":mm["R2"],
+                                "Observaciones":len(g)})
+            resumen_df=pd.DataFrame(resumen)
+            st.markdown("#### Metricas por año y mes")
+            st.dataframe(resumen_df.style.format({"WAPE":"{:.2f}%","MAE":"${:,.2f}",
+                                                  "RMSE":"${:,.2f}","R²":"{:.3f}"}),
+                         use_container_width=True,hide_index=True)
+
+            bt["Error_Abs"]=(bt["Actual"]-bt["Prediccion"]).abs()
+            total_real=max(bt["Actual"].abs().sum(),1)
+            bt["Aporte_WAPE_pp"]=100*bt["Error_Abs"]/total_real
+            bt["Error_%"]=np.where(bt["Actual"]>0,100*(bt["Prediccion"]-bt["Actual"])/bt["Actual"],np.nan)
+            st.markdown("#### 15 productos-mes con mayor error")
+            columnas=["Anio","Periodo","CODIGO","DESCRIPCION","Actual","Prediccion",
+                      "Error_Abs","Error_%","Aporte_WAPE_pp","Metodo"]
+            st.dataframe(bt.nlargest(15,"Error_Abs")[columnas].style.format({
+                "Actual":"${:,.2f}","Prediccion":"${:,.2f}","Error_Abs":"${:,.2f}",
+                "Error_%":"{:+.1f}%","Aporte_WAPE_pp":"{:.3f}"
+            }),use_container_width=True,hide_index=True)
+            st.download_button("Descargar detalle de metricas",
+                bt.to_csv(index=False).encode("utf-8-sig"),
+                "metricas_backtest_nov_dic_v4_1.csv","text/csv")
+        else:
+            st.info("Presiona 'Calcular metricas WAPE, MAE, RMSE y R2'. El sistema entrenara hasta octubre de 2024 y 2025 y evaluara noviembre y diciembre de cada año.")
 
         if st.session_state.modelos_v4 is not None:
             if st.session_state.firma_v4!=firma:
@@ -246,4 +274,5 @@ if archivos:
             st.warning("Presiona 'Entrenar modelo final 2026' para habilitar predicciones.")
     except Exception as e:
         st.exception(e)
+
 
