@@ -1,684 +1,163 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
+from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import altair as alt
 
-st.set_page_config(page_title="Prediccion mensual V3", page_icon="📦", layout="wide")
-st.title("📦 Pronostico mensual definitivo por TIPO")
-st.caption("TIPO define la clasificacion comercial. TIPO=COMBO/COMBOS prevalece aunque la columna COMBO sea 0.")
+st.set_page_config(page_title='Prediccion mensual de ventas', page_icon='📦', layout='wide')
+st.title('📦 Simulador predictivo mensual optimizado')
+st.caption('Modelo global Extra Trees sobre log(venta), estacionalidad, rezagos y promedios moviles.')
 
-MESES = {
-    "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4,
-    "MAYO": 5, "JUNIO": 6, "JULIO": 7, "AGOSTO": 8,
-    "SEPTIEMBRE": 9, "OCTUBRE": 10, "NOVIEMBRE": 11, "DICIEMBRE": 12,
-}
-META = ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO", "COMBO"]
-LAGS = [1, 2, 3, 4, 6, 9, 12]
-FEATURES = (
-    [f"lag{x}" for x in LAGS]
-    + [f"{m}{w}" for w in (3, 6, 12) for m in ("mean", "median", "std", "min", "max")]
-    + ["trend3", "trend6", "cero3", "cero6", "registro3", "registro6",
-       "venta_mismo_mes_anterior", "COMBO", "combo_lag1", "combo_mean3",
-       "tipo_linea", "tipo_promocional", "tipo_inout", "tipo_out", "tipo_np",
-       "tipo_revision", "tipo_baja", "indice_estacional_sku",
-       "indice_estacional_categoria", "sin_mes", "cos_mes"]
-)
+MESES = {'ENERO':1,'FEBRERO':2,'MARZO':3,'ABRIL':4,'MAYO':5,'JUNIO':6,
+         'JULIO':7,'AGOSTO':8,'SEPTIEMBRE':9,'OCTUBRE':10,'NOVIEMBRE':11,'DICIEMBRE':12}
+FEATURES = ['lag1','lag2','lag3','lag4','lag6','lag12','mean3','std3','mean6','std6',
+            'mean12','std12','sin_mes','cos_mes']
 
 
-def periodo_siguiente(periodo, pasos=1):
-    fecha = pd.Timestamp(periodo // 100, periodo % 100, 1) + pd.DateOffset(months=pasos)
-    return fecha.year * 100 + fecha.month
-
-
-def asegurar_periodo(df):
-    """Garantiza MES_NUM, AÑO y Periodo aun si una transformacion previa los altero."""
-    z = df.copy()
-    z.columns = [str(c).strip() for c in z.columns]
-    if "MES_NUM" not in z.columns:
-        if "MES" not in z.columns:
-            raise ValueError("No existe MES ni MES_NUM para construir Periodo.")
-        z["MES_NUM"] = z["MES"].astype(str).str.strip().str.upper().map(MESES)
-    z["MES_NUM"] = pd.to_numeric(z["MES_NUM"], errors="coerce")
-    if "AÑO" not in z.columns:
-        if "ANO" in z.columns:
-            z["AÑO"] = z["ANO"]
-        else:
-            raise ValueError("No existe la columna AÑO para construir Periodo.")
-    z["AÑO"] = pd.to_numeric(z["AÑO"], errors="coerce")
-    z = z.dropna(subset=["AÑO", "MES_NUM"]).copy()
-    z["AÑO"] = z["AÑO"].astype(int)
-    z["MES_NUM"] = z["MES_NUM"].astype(int)
-    if not z["MES_NUM"].between(1, 12).all():
-        raise ValueError("MES_NUM contiene valores fuera del rango 1 a 12.")
-    z["Periodo"] = (z["AÑO"] * 100 + z["MES_NUM"]).astype(int)
-    return z
-
-
-@st.cache_data(show_spinner="Leyendo y normalizando archivos...")
-def cargar_datos(archivos):
-    partes = []
-    for archivo in archivos:
-        hojas = pd.read_excel(archivo, sheet_name=None, engine="openpyxl")
-        for nombre_hoja, hoja in hojas.items():
-            hoja = hoja.copy()
-            hoja["ARCHIVO_ORIGEN"] = archivo.name
-            hoja["HOJA_ORIGEN"] = nombre_hoja
-            partes.append(hoja)
-
-    df = pd.concat(partes, ignore_index=True)
-    df.columns = [str(c).strip().upper() for c in df.columns]
-    requeridas = ["CODIGO", "VENTA", "MES", "AÑO"]
-    faltantes = [c for c in requeridas if c not in df.columns]
-    if faltantes:
-        raise ValueError("Faltan columnas obligatorias: " + ", ".join(faltantes))
-
-    df["MES_NUM"] = df["MES"].astype(str).str.strip().str.upper().map(MESES)
-    df["AÑO"] = pd.to_numeric(df["AÑO"], errors="coerce")
-    df["VENTA"] = pd.to_numeric(df["VENTA"], errors="coerce")
-    if "TIPO" not in df.columns:
-        df["TIPO"] = "SIN CLASIFICAR"
-    df["TIPO"] = (
-        df["TIPO"].fillna("SIN CLASIFICAR").astype(str).str.strip().str.upper()
-        .replace({"0": "SIN CLASIFICAR", "#N/D": "SIN CLASIFICAR", "NAN": "SIN CLASIFICAR"})
-    )
-    # REGLA DEFINITIVA: TIPO manda sobre la columna COMBO.
-    # Si TIPO dice COMBO o COMBOS, COMBO_MODELO=1 aunque COMBO original sea 0.
-    if "COMBO" not in df.columns:
-        df["COMBO"] = 0
-    df["COMBO_ORIGINAL"] = pd.to_numeric(df["COMBO"], errors="coerce").fillna(0).clip(0, 1).astype(int)
-    df["COMBO"] = df["TIPO"].isin(["COMBO", "COMBOS"]).astype(int)
-    df["CODIGO"] = df["CODIGO"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-    df = df.dropna(subset=["MES_NUM", "AÑO", "VENTA", "CODIGO"])
-    df = df[df["CODIGO"].ne("")]
-    df["VENTA"] = df["VENTA"].clip(lower=0)
-    df["Periodo"] = (df["AÑO"] * 100 + df["MES_NUM"]).astype(int)
-
-    agregaciones = {
-        "VENTA": "sum", "COMBO_ORIGINAL": "max",
-        **{c: "first" for c in META if c in df.columns}
-    }
-    base = df.groupby(["CODIGO", "Periodo", "MES_NUM", "AÑO"], as_index=False).agg(agregaciones)
-
-    # Calendario completo. REGISTRO_EXISTENTE diferencia cero real de ausencia en el archivo.
-    salida = []
-    for codigo, grupo in base.groupby("CODIGO"):
-        grupo = grupo.sort_values("Periodo").copy()
-        fechas = pd.to_datetime(
-            grupo["AÑO"].astype(int).astype(str) + "-" +
-            grupo["MES_NUM"].astype(int).astype(str) + "-01"
-        )
-        grupo.index = fechas
-        grupo["REGISTRO_EXISTENTE"] = 1
-        indice = pd.date_range(fechas.min(), fechas.max(), freq="MS")
-        grupo = grupo.reindex(indice)
-        grupo["CODIGO"] = codigo
-        grupo["REGISTRO_EXISTENTE"] = grupo["REGISTRO_EXISTENTE"].fillna(0).astype(int)
-        grupo["VENTA"] = grupo["VENTA"].fillna(0.0)
-        grupo["MES_NUM"] = grupo.index.month
-        grupo["AÑO"] = grupo.index.year
-        grupo["Periodo"] = grupo.index.year * 100 + grupo.index.month
-        for c in META:
-            if c in grupo.columns:
-                grupo[c] = grupo[c].ffill().bfill()
-        grupo["TIPO"] = grupo["TIPO"].fillna("SIN CLASIFICAR").astype(str).str.strip().str.upper()
-        grupo["COMBO"] = grupo["TIPO"].isin(["COMBO", "COMBOS"]).astype(int)
-        if "COMBO_ORIGINAL" in grupo.columns:
-            grupo["COMBO_ORIGINAL"] = grupo["COMBO_ORIGINAL"].fillna(0).astype(int)
-        salida.append(grupo.reset_index(drop=True))
-
-    completo = pd.concat(salida, ignore_index=True)
-    completo = asegurar_periodo(completo)
-    if "Periodo" not in completo.columns:
-        raise ValueError("No fue posible crear la columna Periodo durante la carga.")
-    return completo.sort_values(["CODIGO", "Periodo"]).reset_index(drop=True)
-
-
-def clasificar_productos(df):
-    resumen = df.groupby("CODIGO").agg(
-        PROMEDIO=("VENTA", "mean"),
-        DESVIACION=("VENTA", "std"),
-        PROP_CEROS=("VENTA", lambda s: float((s == 0).mean())),
-        MESES=("VENTA", "size"),
-    ).reset_index()
-    resumen["CV"] = np.where(
-        resumen["PROMEDIO"] > 0,
-        resumen["DESVIACION"].fillna(0) / resumen["PROMEDIO"],
-        999.0,
-    )
-    resumen["SEGMENTO"] = np.select(
-        [resumen["PROP_CEROS"] >= 0.25, resumen["CV"] >= 0.50],
-        ["Intermitente", "Volatil"],
-        default="Estable",
-    )
-    return df.merge(resumen[["CODIGO", "PROMEDIO", "CV", "PROP_CEROS", "SEGMENTO"]], on="CODIGO", how="left")
-
-
-def marcar_atipicos(df):
-    salida = []
-    for codigo, grupo in df.groupby("CODIGO", sort=False):
-        grupo = grupo.sort_values("Periodo").copy()
-        historico = grupo["VENTA"].shift(1)
-        mediana = historico.rolling(6, min_periods=3).median()
-        mad = (historico - mediana).abs().rolling(6, min_periods=3).median()
-        limite = mediana + 4 * mad.replace(0, np.nan)
-        grupo["VENTA_EXTRAORDINARIA"] = (grupo["VENTA"] > limite).fillna(False).astype(int)
-        grupo["CODIGO"] = codigo
-        salida.append(grupo)
-    return pd.concat(salida, ignore_index=True) if salida else df.copy()
-
-
-def calcular_indices_estacionales(df):
-    """Indice multiplicativo: promedio mensual del SKU / promedio global del SKU.
-    Usa suavizado hacia el indice de categoria cuando el SKU tiene pocos años observados.
-    Solo utiliza historia disponible; nunca incluye el mes objetivo.
-    """
-    z = df.sort_values(["CODIGO", "Periodo"]).copy()
-    z["indice_estacional_sku"] = 1.0
-    z["indice_estacional_categoria"] = 1.0
-
-    for idx, fila in z.iterrows():
-        historico = z[z["Periodo"] < fila["Periodo"]]
-        if historico.empty:
-            continue
-        mes = fila["MES_NUM"]
-        sku_hist = historico[historico["CODIGO"].eq(fila["CODIGO"])]
-        prom_sku = sku_hist["VENTA"].mean()
-        prom_mes_sku = sku_hist.loc[sku_hist["MES_NUM"].eq(mes), "VENTA"].mean()
-        n_sku = sku_hist.loc[sku_hist["MES_NUM"].eq(mes), "AÑO"].nunique()
-        indice_sku = prom_mes_sku / prom_sku if pd.notna(prom_mes_sku) and prom_sku > 0 else 1.0
-
-        if "CATEGORIA" in historico.columns:
-            cat_hist = historico[historico["CATEGORIA"].eq(fila.get("CATEGORIA"))]
-            prom_cat = cat_hist["VENTA"].mean()
-            prom_mes_cat = cat_hist.loc[cat_hist["MES_NUM"].eq(mes), "VENTA"].mean()
-            indice_cat = prom_mes_cat / prom_cat if pd.notna(prom_mes_cat) and prom_cat > 0 else 1.0
-        else:
-            indice_cat = 1.0
-
-        # Con tres anos el SKU recibe hasta 75% del peso; categoria estabiliza series cortas.
-        peso_sku = min(n_sku / 3.0, 0.75)
-        indice_suavizado = peso_sku * indice_sku + (1 - peso_sku) * indice_cat
-        z.at[idx, "indice_estacional_sku"] = float(np.clip(indice_suavizado, 0.35, 2.50))
-        z.at[idx, "indice_estacional_categoria"] = float(np.clip(indice_cat, 0.35, 2.50))
-    return z
-
-
-def indice_estacional_futuro(hist, mes):
-    """Calcula estacionalidad con todos los anos historicos disponibles del SKU."""
-    prom_sku = hist["VENTA"].mean()
-    ventas_mes = hist.loc[hist["MES_NUM"].eq(mes), "VENTA"]
-    indice_sku = ventas_mes.mean() / prom_sku if len(ventas_mes) and prom_sku > 0 else 1.0
-    n_sku = hist.loc[hist["MES_NUM"].eq(mes), "AÑO"].nunique()
-
-    # El indice de categoria entrenado se toma de las filas historicas del SKU.
-    indice_cat = hist.loc[hist["MES_NUM"].eq(mes), "indice_estacional_categoria"].tail(1)
-    indice_cat = float(indice_cat.iloc[0]) if len(indice_cat) else 1.0
-    peso_sku = min(n_sku / 3.0, 0.75)
-    return float(np.clip(peso_sku * indice_sku + (1 - peso_sku) * indice_cat, 0.35, 2.50))
-
-
-def agregar_variables_tipo(df):
-    z = df.copy()
-    tipo = z["TIPO"].fillna("SIN CLASIFICAR").astype(str).str.strip().str.upper()
-    z["COMBO"] = tipo.isin(["COMBO", "COMBOS"]).astype(int)
-    z["tipo_linea"] = tipo.eq("LINEA").astype(int)
-    z["tipo_promocional"] = tipo.eq("PROMOCIONAL").astype(int)
-    z["tipo_inout"] = tipo.isin(["IN & OUT", "IN&OUT", "IN OUT"]).astype(int)
-    z["tipo_out"] = tipo.eq("OUT").astype(int)
-    z["tipo_np"] = tipo.eq("NP").astype(int)
-    z["tipo_revision"] = tipo.eq("REVISION").astype(int)
-    z["tipo_baja"] = tipo.str.contains("BAJA", na=False).astype(int)
-    return z
+def completar_calendario(g):
+    salida=[]
+    meta=[c for c in ['DESCRIPCION','CATEGORIA','FAMILIA','TIPO'] if c in g.columns]
+    for codigo,x in g.groupby('CODIGO'):
+        x=x.sort_values('Periodo').copy()
+        fechas=pd.to_datetime(x['AÑO'].astype(int).astype(str)+'-'+x['MES_NUM'].astype(int).astype(str)+'-01')
+        x.index=fechas
+        idx=pd.date_range(fechas.min(),fechas.max(),freq='MS')
+        x=x.reindex(idx)
+        x['CODIGO']=codigo
+        # Si una hoja mensual existe pero el SKU no aparece, se interpreta como venta 0.
+        x['VENTA']=x['VENTA'].fillna(0.0)
+        x['MES_NUM']=x.index.month
+        x['AÑO']=x.index.year
+        x['Periodo']=x.index.year*100+x.index.month
+        for c in meta: x[c]=x[c].ffill().bfill()
+        salida.append(x.reset_index(drop=True))
+    return pd.concat(salida,ignore_index=True)
 
 
 def crear_features(df):
-    z = agregar_variables_tipo(calcular_indices_estacionales(df))
-    venta = z.groupby("CODIGO")["VENTA"]
-    combo = z.groupby("CODIGO")["COMBO"]
-    registro = z.groupby("CODIGO")["REGISTRO_EXISTENTE"]
-
-    for lag in LAGS:
-        z[f"lag{lag}"] = venta.shift(lag)
-
-    for ventana in (3, 6, 12):
-        z[f"mean{ventana}"] = venta.transform(lambda s: s.shift(1).rolling(ventana, min_periods=2).mean())
-        z[f"median{ventana}"] = venta.transform(lambda s: s.shift(1).rolling(ventana, min_periods=2).median())
-        z[f"std{ventana}"] = venta.transform(lambda s: s.shift(1).rolling(ventana, min_periods=2).std()).fillna(0)
-        z[f"min{ventana}"] = venta.transform(lambda s: s.shift(1).rolling(ventana, min_periods=2).min())
-        z[f"max{ventana}"] = venta.transform(lambda s: s.shift(1).rolling(ventana, min_periods=2).max())
-
-    z["trend3"] = (z["lag1"] - z["lag3"]) / 3
-    z["trend6"] = (z["lag1"] - z["lag6"]) / 6
-    z["cero3"] = venta.transform(lambda s: s.shift(1).rolling(3, min_periods=2).apply(lambda a: (a == 0).mean()))
-    z["cero6"] = venta.transform(lambda s: s.shift(1).rolling(6, min_periods=2).apply(lambda a: (a == 0).mean()))
-    z["registro3"] = registro.transform(lambda s: s.shift(1).rolling(3, min_periods=2).mean())
-    z["registro6"] = registro.transform(lambda s: s.shift(1).rolling(6, min_periods=2).mean())
-    z["venta_mismo_mes_anterior"] = z["lag12"]
-    z["combo_lag1"] = combo.shift(1).fillna(0)
-    z["combo_mean3"] = combo.transform(lambda x: x.shift(1).rolling(3, min_periods=1).mean()).fillna(0)
-    z["sin_mes"] = np.sin(2 * np.pi * z["MES_NUM"] / 12)
-    z["cos_mes"] = np.cos(2 * np.pi * z["MES_NUM"] / 12)
+    z=df.sort_values(['CODIGO','Periodo']).copy()
+    grp=z.groupby('CODIGO')['VENTA']
+    for lag in [1,2,3,4,6,12]: z[f'lag{lag}']=grp.shift(lag)
+    for w in [3,6,12]:
+        z[f'mean{w}']=grp.transform(lambda s:s.shift(1).rolling(w,min_periods=2).mean())
+        z[f'std{w}']=grp.transform(lambda s:s.shift(1).rolling(w,min_periods=2).std()).fillna(0)
+    z['sin_mes']=np.sin(2*np.pi*z['MES_NUM']/12)
+    z['cos_mes']=np.cos(2*np.pi*z['MES_NUM']/12)
     return z
 
 
-def modelos_nuevos():
-    modelo_log = ExtraTreesRegressor(
-        n_estimators=500, min_samples_leaf=2, max_features=1.0,
-        n_jobs=-1, random_state=42,
-    )
-    modelo_raw = RandomForestRegressor(
-        n_estimators=400, max_depth=16, min_samples_leaf=2,
-        max_features=0.8, n_jobs=-1, random_state=42,
-    )
-    return modelo_log, modelo_raw
+def nuevo_modelo():
+    return ExtraTreesRegressor(n_estimators=400, min_samples_leaf=2, max_features=1.0,
+                               n_jobs=-1, random_state=42)
 
 
 def entrenar(df):
-    f = crear_features(df).dropna(subset=["lag1", "lag2", "VENTA"]).copy()
-    medianas = f[FEATURES].median().fillna(0)
-    X = f[FEATURES].fillna(medianas)
-    y = f["VENTA"].clip(lower=0)
-
-    # Menor peso a ausencias convertidas a cero y a ventas extraordinarias.
-    pesos = np.ones(len(f), dtype=float)
-    pesos[f["REGISTRO_EXISTENTE"].eq(0).to_numpy()] *= 0.25
-    pesos[f["VENTA_EXTRAORDINARIA"].eq(1).to_numpy()] *= 0.40
-    pesos[f["SEGMENTO"].eq("Intermitente").to_numpy()] *= 0.80
-
-    modelo_log, modelo_raw = modelos_nuevos()
-    modelo_log.fit(X, np.log1p(y), sample_weight=pesos)
-    modelo_raw.fit(X, y, sample_weight=pesos)
-    return modelo_log, modelo_raw, medianas
+    f=crear_features(df).dropna(subset=['lag1','lag2','VENTA']).copy()
+    medianas=f[FEATURES].median().fillna(0)
+    X=f[FEATURES].fillna(medianas)
+    modelo=nuevo_modelo()
+    # Log1p disminuye la dominancia de productos millonarios y mejora WAPE/MAE.
+    modelo.fit(X,np.log1p(f['VENTA'].clip(lower=0)))
+    return modelo,medianas
 
 
-def vector_futuro(hist, mes, medianas):
-    hist = hist.sort_values("Periodo")
-    valores = hist["VENTA"].astype(float).tolist()
-    registros = hist["REGISTRO_EXISTENTE"].astype(float).tolist()
-    q = {}
-    for lag in LAGS:
-        q[f"lag{lag}"] = valores[-lag] if len(valores) >= lag else np.nan
-    for ventana in (3, 6, 12):
-        a = np.asarray(valores[-ventana:], dtype=float)
-        q[f"mean{ventana}"] = a.mean() if len(a) >= 2 else np.nan
-        q[f"median{ventana}"] = np.median(a) if len(a) >= 2 else np.nan
-        q[f"std{ventana}"] = a.std(ddof=1) if len(a) >= 2 else 0
-        q[f"min{ventana}"] = a.min() if len(a) >= 2 else np.nan
-        q[f"max{ventana}"] = a.max() if len(a) >= 2 else np.nan
-    q["trend3"] = (q["lag1"] - q["lag3"]) / 3 if pd.notna(q["lag3"]) else 0
-    q["trend6"] = (q["lag1"] - q["lag6"]) / 6 if pd.notna(q["lag6"]) else 0
-    q["cero3"] = np.mean(np.asarray(valores[-3:]) == 0) if len(valores) >= 2 else 0
-    q["cero6"] = np.mean(np.asarray(valores[-6:]) == 0) if len(valores) >= 2 else 0
-    q["registro3"] = np.mean(registros[-3:]) if registros else 0
-    q["registro6"] = np.mean(registros[-6:]) if registros else 0
-    q["venta_mismo_mes_anterior"] = q["lag12"]
-    combo_actual = float(hist["COMBO"].iloc[-1]) if "COMBO" in hist.columns else 0.0
-    tipo_actual = str(hist["TIPO"].iloc[-1]).strip().upper() if "TIPO" in hist.columns else "SIN CLASIFICAR"
-    combo_actual = float(tipo_actual in ["COMBO", "COMBOS"])
-    q["COMBO"] = combo_actual
-    q["combo_lag1"] = combo_actual
-    q["combo_mean3"] = float(hist["TIPO"].astype(str).str.strip().str.upper().tail(3).isin(["COMBO", "COMBOS"]).mean()) if "TIPO" in hist.columns else 0.0
-    q["tipo_linea"] = float(tipo_actual == "LINEA")
-    q["tipo_promocional"] = float(tipo_actual == "PROMOCIONAL")
-    q["tipo_inout"] = float(tipo_actual in ["IN & OUT", "IN&OUT", "IN OUT"])
-    q["tipo_out"] = float(tipo_actual == "OUT")
-    q["tipo_np"] = float(tipo_actual == "NP")
-    q["tipo_revision"] = float(tipo_actual == "REVISION")
-    q["tipo_baja"] = float("BAJA" in tipo_actual)
-    q["indice_estacional_sku"] = indice_estacional_futuro(hist, mes)
-    indice_cat = hist.loc[hist["MES_NUM"].eq(mes), "indice_estacional_categoria"].tail(1)
-    q["indice_estacional_categoria"] = float(indice_cat.iloc[0]) if len(indice_cat) else 1.0
-    q["sin_mes"] = np.sin(2 * np.pi * mes / 12)
-    q["cos_mes"] = np.cos(2 * np.pi * mes / 12)
-    return pd.DataFrame([q], columns=FEATURES).fillna(medianas)
+def vector_futuro(hist, mes_num, medianas):
+    vals=hist.sort_values('Periodo')['VENTA'].astype(float).tolist()
+    q={f'lag{lag}': vals[-lag] if len(vals)>=lag else np.nan for lag in [1,2,3,4,6,12]}
+    for w in [3,6,12]:
+        a=np.asarray(vals[-w:],dtype=float)
+        q[f'mean{w}']=a.mean() if len(a)>=2 else np.nan
+        q[f'std{w}']=a.std(ddof=1) if len(a)>=2 else 0.0
+    q['sin_mes']=np.sin(2*np.pi*mes_num/12)
+    q['cos_mes']=np.cos(2*np.pi*mes_num/12)
+    return pd.DataFrame([q],columns=FEATURES).fillna(medianas)
 
 
-def croston_tsb(ventas, alpha=0.25, beta=0.15):
-    ventas = np.asarray(ventas, dtype=float)
-    if len(ventas) == 0 or np.all(ventas <= 0):
-        return 0.0
-    demanda = ventas[ventas > 0]
-    z = demanda[0]
-    p = float(ventas[0] > 0)
-    for valor in ventas[1:]:
-        ocurrio = float(valor > 0)
-        p = beta * ocurrio + (1 - beta) * p
-        if valor > 0:
-            z = alpha * valor + (1 - alpha) * z
-    return max(0.0, p * z)
-
-
-def predecir_recursivo(modelo_log, modelo_raw, medianas, historico, periodos, alpha_log=0.8):
-    hist = historico.copy()
-    predicciones = []
-    segmento = hist["SEGMENTO"].iloc[-1]
-
+def predecir_recursivo(modelo, medianas, historico, periodos):
+    hist=historico.copy(); preds=[]
     for periodo in periodos:
-        X = vector_futuro(hist, periodo % 100, medianas)
-        pred_log = max(0.0, float(np.expm1(modelo_log.predict(X)[0])))
-        pred_raw = max(0.0, float(modelo_raw.predict(X)[0]))
-        pred_ml = alpha_log * pred_log + (1 - alpha_log) * pred_raw
+        mes=periodo%100
+        p=float(np.expm1(modelo.predict(vector_futuro(hist,mes,medianas))[0]))
+        p=max(0.0,p); preds.append(p)
+        base=hist.iloc[-1].copy(); base['Periodo']=periodo;base['AÑO']=periodo//100;base['MES_NUM']=mes;base['VENTA']=p
+        hist=pd.concat([hist,pd.DataFrame([base])],ignore_index=True)
+    return preds
 
-        reciente = X["median3"].iloc[0]
-        indice_estacional = X["indice_estacional_sku"].iloc[0]
-        # Formula estacional multiplicativa sobre el nivel base sin estacionalidad.
-        nivel_base = 0.60 * X["mean12"].iloc[0] + 0.40 * X["median6"].iloc[0]
-        pred_estacional = max(0.0, nivel_base * indice_estacional)
-        es_combo = X["COMBO"].iloc[0] >= 0.5
-
-        if segmento == "Intermitente":
-            pred = 0.55 * croston_tsb(hist["VENTA"].values) + 0.30 * pred_log + 0.15 * pred_estacional
-        elif segmento == "Volatil":
-            pred = 0.65 * pred_ml + 0.25 * pred_estacional + 0.10 * reciente
-        else:
-            pred = 0.70 * pred_ml + 0.25 * pred_estacional + 0.05 * reciente
-
-        # Los combos suelen ser temporales: mayor peso a su historia reciente y menor al patron anual.
-        if es_combo:
-            pred = 0.75 * pred_ml + 0.15 * pred_estacional + 0.10 * reciente
-
-        pred = max(0.0, float(pred))
-        predicciones.append(pred)
-        fila = hist.iloc[-1].copy()
-        fila["Periodo"] = periodo
-        fila["AÑO"] = periodo // 100
-        fila["MES_NUM"] = periodo % 100
-        fila["VENTA"] = pred
-        fila["REGISTRO_EXISTENTE"] = 1
-        fila["VENTA_EXTRAORDINARIA"] = 0
-        hist = pd.concat([hist, pd.DataFrame([fila])], ignore_index=True)
-    return predicciones
+@st.cache_data(show_spinner='Leyendo y normalizando archivos...')
+def cargar(archivos):
+    partes=[]
+    for archivo in archivos:
+        for _,h in pd.read_excel(archivo,sheet_name=None,engine='openpyxl').items(): partes.append(h)
+    df=pd.concat(partes,ignore_index=True); df.columns=[str(c).strip().upper() for c in df.columns]
+    oblig=['CODIGO','VENTA','MES','AÑO']
+    falt=[c for c in oblig if c not in df.columns]
+    if falt: raise ValueError('Faltan columnas: '+', '.join(falt))
+    df['MES_NUM']=df['MES'].astype(str).str.strip().str.upper().map(MESES)
+    df['AÑO']=pd.to_numeric(df['AÑO'],errors='coerce');df['VENTA']=pd.to_numeric(df['VENTA'],errors='coerce')
+    # Mantener CODIGO como texto evita perdida de precision/notacion cientifica.
+    df['CODIGO']=df['CODIGO'].astype(str).str.replace(r'\.0$','',regex=True).str.strip()
+    df=df.dropna(subset=['MES_NUM','AÑO','VENTA']);df['Periodo']=(df['AÑO']*100+df['MES_NUM']).astype(int)
+    meta={c:'first' for c in ['DESCRIPCION','CATEGORIA','FAMILIA','TIPO'] if c in df.columns}
+    g=df.groupby(['CODIGO','Periodo','MES_NUM','AÑO'],as_index=False).agg({'VENTA':'sum',**meta})
+    return completar_calendario(g).sort_values(['CODIGO','Periodo']).reset_index(drop=True)
 
 
-def separar_holdout(df, meses):
-    valido = df.groupby("CODIGO").filter(lambda g: len(g) >= meses + 4)
-    held = valido.groupby("CODIGO", group_keys=False).tail(meses)
-    train = valido.drop(index=held.index)
-    return train, held
-
-
-def ejecutar_backtest(train, held, alpha_log):
-    modelo_log, modelo_raw, medianas = entrenar(train)
-    filas = []
-    for codigo, reales in held.groupby("CODIGO"):
-        reales = reales.sort_values("Periodo")
-        historico = train[train["CODIGO"].eq(codigo)].sort_values("Periodo")
-        periodos = reales["Periodo"].astype(int).tolist()
-        preds = predecir_recursivo(modelo_log, modelo_raw, medianas, historico, periodos, alpha_log)
-        for paso, ((_, real), pred) in enumerate(zip(reales.iterrows(), preds), start=1):
-            filas.append({
-                "CODIGO": codigo,
-                "DESCRIPCION": real.get("DESCRIPCION", ""),
-                "CATEGORIA": real.get("CATEGORIA", ""),
-                "SEGMENTO": real["SEGMENTO"],
-                "Periodo_Real": int(real["Periodo"]),
-                "Mes_Predecido": paso,
-                "Actual": float(real["VENTA"]),
-                "Prediccion": float(pred),
-            })
+def backtest(df,n_holdout=2):
+    tamanos=df.groupby('CODIGO').size(); codigos=tamanos[tamanos>=n_holdout+3].index
+    base=df[df.CODIGO.isin(codigos)].copy()
+    held=base.groupby('CODIGO',group_keys=False).tail(n_holdout)
+    train=base.drop(index=held.index)
+    modelo,medianas=entrenar(train)
+    filas=[]
+    for codigo,real in held.groupby('CODIGO'):
+        real=real.sort_values('Periodo'); hist=train[train.CODIGO==codigo].sort_values('Periodo')
+        pred=predecir_recursivo(modelo,medianas,hist,real.Periodo.astype(int).tolist())
+        for paso,((_,r),p) in enumerate(zip(real.iterrows(),pred),1):
+            filas.append({'CODIGO':codigo,'DESCRIPCION':r.get('DESCRIPCION',''),'CATEGORIA':r.get('CATEGORIA',''),
+                          'Periodo_Real':int(r.Periodo),'Mes_Predecido':paso,'Prediccion':p,'Actual':float(r.VENTA)})
     return pd.DataFrame(filas)
 
-
-def calcular_metricas(df):
-    y = df["Actual"].to_numpy()
-    p = df["Prediccion"].to_numpy()
-    denominador = np.abs(y).sum()
-    return {
-        "WAPE": 100 * np.abs(y - p).sum() / denominador if denominador > 0 else np.nan,
-        "MAE": mean_absolute_error(y, p),
-        "RMSE": np.sqrt(mean_squared_error(y, p)),
-        "R2": r2_score(y, p),
-    }
-
-
-archivos = st.file_uploader(
-    "Sube los archivos mensuales de ventas",
-    type=["xlsx", "xlsm"], accept_multiple_files=True,
-)
-
+archivos=st.file_uploader('Sube ventas 2024, 2025 y 2026',type=['xlsx','xlsm'],accept_multiple_files=True)
 if archivos:
     try:
-        df = cargar_datos(archivos)
-        df = asegurar_periodo(df)
-        columnas_obligatorias = {"CODIGO", "VENTA", "MES_NUM", "AÑO", "Periodo", "COMBO"}
-        faltantes = columnas_obligatorias.difference(df.columns)
-        if faltantes:
-            raise ValueError("Faltan columnas despues de normalizar: " + ", ".join(sorted(faltantes)))
-        df = clasificar_productos(df)
-        df = calcular_indices_estacionales(df)
-        df = marcar_atipicos(df)
-        df = asegurar_periodo(df)
+        df=cargar(archivos)
+        st.success(f'{len(df):,} observaciones mensuales normalizadas | {df.CODIGO.nunique():,} productos')
+        holdout=st.slider('Meses de backtest',1,4,2)
+        with st.spinner('Entrenando y validando...'):
+            bt=backtest(df,holdout)
+            y=bt.Actual.to_numpy();p=bt.Prediccion.to_numpy()
+            wape=100*np.abs(y-p).sum()/max(np.abs(y).sum(),1)
+            c1,c2,c3,c4=st.columns(4)
+            c1.metric('WAPE',f'{wape:.2f}%');c2.metric('MAE',f'${mean_absolute_error(y,p):,.2f}')
+            c3.metric('RMSE',f'${mean_squared_error(y,p)**0.5:,.2f}');c4.metric('R²',f'{r2_score(y,p):.3f}')
+            bt['Error_Abs']=(bt.Prediccion-bt.Actual).abs()
+            bt['Variacion_%']=np.where(bt.Actual>0,100*(bt.Prediccion-bt.Actual)/bt.Actual,np.nan)
+            st.dataframe(bt.nlargest(10,'Error_Abs'),use_container_width=True,hide_index=True)
 
-        st.success(f"{df['CODIGO'].nunique():,} productos y {len(df):,} observaciones normalizadas")
-        st.dataframe(
-            df.groupby("SEGMENTO")["CODIGO"].nunique().rename("Productos").reset_index(),
-            hide_index=True, use_container_width=True,
-        )
+        modelo,medianas=entrenar(df)
+        ult=df.sort_values('Periodo').groupby('CODIGO').tail(1)
+        opciones={r.CODIGO:f'{r.CODIGO} - {r.get("DESCRIPCION","")}' for _,r in ult.iterrows()}
+        codigo=st.selectbox('Producto',list(opciones),format_func=lambda x:opciones[x])
+        hist=df[df.CODIGO==codigo].sort_values('Periodo')
+        ultimo=int(df.Periodo.max()); fecha=pd.Timestamp(ultimo//100,ultimo%100,1)
+        periodos=[]
+        for i in [1,2]:
+            f=fecha+pd.DateOffset(months=i);periodos.append(f.year*100+f.month)
+        pred=predecir_recursivo(modelo,medianas,hist,periodos)
+        st.write(f'**{periodos[0]}:** ${pred[0]:,.2f} | **{periodos[1]}:** ${pred[1]:,.2f}')
+        graf=pd.concat([hist[['Periodo','VENTA']].assign(Tipo='Real'),pd.DataFrame({'Periodo':periodos,'VENTA':pred,'Tipo':'Proyectado'})])
+        ch=alt.Chart(graf).mark_line(point=True).encode(x=alt.X('Periodo:O'),y=alt.Y('VENTA:Q'),color='Tipo:N',tooltip=['Periodo','VENTA','Tipo']).properties(height=350)
+        st.altair_chart(ch,use_container_width=True)
 
-        meses_holdout = st.slider("Meses reservados para backtest", 1, 4, 2)
-        alpha_log = st.slider("Peso del modelo logaritmico", 0.0, 1.0, 0.8, 0.05)
-        train, held = separar_holdout(df, meses_holdout)
-
-        with st.spinner("Entrenando y ejecutando backtest temporal..."):
-            bt = ejecutar_backtest(train, held, alpha_log)
-
-        metricas = calcular_metricas(bt)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("WAPE", f"{metricas['WAPE']:.2f}%")
-        c2.metric("MAE", f"${metricas['MAE']:,.2f}")
-        c3.metric("RMSE", f"${metricas['RMSE']:,.2f}")
-        c4.metric("R²", f"{metricas['R2']:.3f}")
-
-        st.subheader("Resultados por segmento")
-        por_segmento = []
-        for segmento, grupo in bt.groupby("SEGMENTO"):
-            m = calcular_metricas(grupo)
-            por_segmento.append({"SEGMENTO": segmento, "Registros": len(grupo), **m})
-        st.dataframe(pd.DataFrame(por_segmento), hide_index=True, use_container_width=True)
-
-        bt["Error_Abs"] = (bt["Actual"] - bt["Prediccion"]).abs()
-        bt["Variacion_%"] = np.where(
-            bt["Actual"] > 0,
-            100 * (bt["Prediccion"] - bt["Actual"]) / bt["Actual"],
-            np.nan,
-        )
-        st.subheader("20 predicciones con mayor error")
-        st.dataframe(bt.nlargest(20, "Error_Abs"), hide_index=True, use_container_width=True)
-
-        # ========================================================
-        # ANALISIS DE SKU QUE GENERAN ERRORES EXTREMOS
-        # ========================================================
-        st.subheader("Analisis de SKU con errores extremos")
-        st.caption(
-            "Un error se considera extremo cuando supera el mayor valor entre "
-            "el percentil seleccionado y el multiplicador del MAE global."
-        )
-
-        col_ext1, col_ext2 = st.columns(2)
-        with col_ext1:
-            percentil_extremo = st.slider(
-                "Percentil para error extremo", 90, 99, 95, 1,
-                help="95 identifica el 5% de observaciones con mayor error absoluto."
-            )
-        with col_ext2:
-            multiplicador_mae = st.slider(
-                "Multiplicador del MAE", 1.0, 5.0, 2.0, 0.25,
-                help="2.0 exige que el error sea al menos dos veces el MAE global."
-            )
-
-        umbral_percentil = bt["Error_Abs"].quantile(percentil_extremo / 100)
-        umbral_mae = metricas["MAE"] * multiplicador_mae
-        umbral_extremo = max(umbral_percentil, umbral_mae)
-        bt["ES_ERROR_EXTREMO"] = bt["Error_Abs"].ge(umbral_extremo)
-        bt["Error_Signado"] = bt["Prediccion"] - bt["Actual"]
-        bt["TIPO_ERROR"] = np.select(
-            [bt["Error_Signado"] > 0, bt["Error_Signado"] < 0],
-            ["Sobreestimacion", "Subestimacion"],
-            default="Exacto"
-        )
-
-        errores_extremos = bt[bt["ES_ERROR_EXTREMO"]].copy()
-        error_total = bt["Error_Abs"].sum()
-        error_extremo_total = errores_extremos["Error_Abs"].sum()
-        aporte_extremos = 100 * error_extremo_total / error_total if error_total > 0 else 0
-
-        e1, e2, e3, e4 = st.columns(4)
-        e1.metric("Umbral extremo", f"${umbral_extremo:,.2f}")
-        e2.metric("Registros extremos", f"{len(errores_extremos):,}")
-        e3.metric("SKU involucrados", f"{errores_extremos['CODIGO'].nunique():,}")
-        e4.metric("Aporte al error total", f"{aporte_extremos:.1f}%")
-
-        if errores_extremos.empty:
-            st.info("No se detectaron errores extremos con los umbrales seleccionados.")
-        else:
-            sku_extremos = errores_extremos.groupby(
-                ["CODIGO", "DESCRIPCION", "CATEGORIA", "SEGMENTO"],
-                dropna=False, as_index=False
-            ).agg(
-                Veces_Extremo=("ES_ERROR_EXTREMO", "sum"),
-                Error_Abs_Total=("Error_Abs", "sum"),
-                Error_Abs_Promedio=("Error_Abs", "mean"),
-                Error_Abs_Maximo=("Error_Abs", "max"),
-                Venta_Real=("Actual", "sum"),
-                Venta_Predicha=("Prediccion", "sum"),
-                Sesgo=("Error_Signado", "sum"),
-            )
-            sku_extremos["WAPE_SKU"] = np.where(
-                sku_extremos["Venta_Real"].abs() > 0,
-                100 * sku_extremos["Error_Abs_Total"] / sku_extremos["Venta_Real"].abs(),
-                np.nan
-            )
-            sku_extremos["Aporte_Error_%"] = np.where(
-                error_total > 0,
-                100 * sku_extremos["Error_Abs_Total"] / error_total,
-                0.0
-            )
-            sku_extremos["Diagnostico"] = np.select(
-                [
-                    sku_extremos["Sesgo"] > 0.20 * sku_extremos["Error_Abs_Total"],
-                    sku_extremos["Sesgo"] < -0.20 * sku_extremos["Error_Abs_Total"],
-                    sku_extremos["SEGMENTO"].eq("Intermitente"),
-                    sku_extremos["SEGMENTO"].eq("Volatil"),
-                ],
-                [
-                    "Sobreestimacion recurrente: revisar ceros, bajas o descontinuacion",
-                    "Subestimacion recurrente: revisar promocion, estacionalidad o quiebre previo",
-                    "Demanda intermitente: revisar Croston/TSB y disponibilidad",
-                    "Alta volatilidad: revisar promociones, precio e inventario",
-                ],
-                default="Error puntual: revisar dato, precio, promocion e inventario"
-            )
-            sku_extremos = sku_extremos.sort_values("Error_Abs_Total", ascending=False)
-            sku_extremos["Aporte_Acumulado_%"] = sku_extremos["Aporte_Error_%"].cumsum()
-            sku_extremos["PRIORIDAD"] = np.select(
-                [
-                    sku_extremos["Aporte_Acumulado_%"] <= 50,
-                    sku_extremos["Aporte_Acumulado_%"] <= 80,
-                ],
-                ["A - Critica", "B - Alta"],
-                default="C - Seguimiento"
-            )
-
-            st.markdown("#### Ranking de SKU por contribucion al error")
-            st.dataframe(
-                sku_extremos[[
-                    "PRIORIDAD", "CODIGO", "DESCRIPCION", "CATEGORIA", "SEGMENTO",
-                    "Veces_Extremo", "Error_Abs_Total", "Error_Abs_Maximo", "WAPE_SKU",
-                    "Aporte_Error_%", "Aporte_Acumulado_%", "Sesgo", "Diagnostico"
-                ]],
-                hide_index=True, use_container_width=True,
-                column_config={
-                    "Error_Abs_Total": st.column_config.NumberColumn(format="$%,.2f"),
-                    "Error_Abs_Maximo": st.column_config.NumberColumn(format="$%,.2f"),
-                    "WAPE_SKU": st.column_config.NumberColumn(format="%.2f%%"),
-                    "Aporte_Error_%": st.column_config.NumberColumn(format="%.2f%%"),
-                    "Aporte_Acumulado_%": st.column_config.NumberColumn(format="%.2f%%"),
-                    "Sesgo": st.column_config.NumberColumn(format="$%,.2f"),
-                }
-            )
-
-            st.markdown("#### Pareto de contribucion al error")
-            top_pareto = sku_extremos.head(20).set_index("CODIGO")[["Aporte_Error_%"]]
-            st.bar_chart(top_pareto, horizontal=True)
-
-            codigos_extremos = sku_extremos["CODIGO"].tolist()
-            sku_seleccionado = st.selectbox(
-                "Revisar detalle de un SKU extremo",
-                codigos_extremos,
-                format_func=lambda codigo: (
-                    f"{codigo} - " + str(
-                        sku_extremos.loc[sku_extremos['CODIGO'].eq(codigo), 'DESCRIPCION'].iloc[0]
-                    )
-                ),
-                key="sku_extremo_detalle"
-            )
-            detalle_sku = bt[bt["CODIGO"].eq(sku_seleccionado)].sort_values("Periodo_Real").copy()
-            st.dataframe(
-                detalle_sku[[
-                    "CODIGO", "DESCRIPCION", "Periodo_Real", "Mes_Predecido",
-                    "Actual", "Prediccion", "Error_Abs", "Variacion_%",
-                    "TIPO_ERROR", "ES_ERROR_EXTREMO"
-                ]],
-                hide_index=True, use_container_width=True
-            )
-
-            st.download_button(
-                "Descargar analisis de SKU extremos",
-                sku_extremos.to_csv(index=False).encode("utf-8-sig"),
-                "analisis_sku_errores_extremos.csv",
-                "text/csv",
-            )
-            st.download_button(
-                "Descargar detalle de observaciones extremas",
-                errores_extremos.to_csv(index=False).encode("utf-8-sig"),
-                "detalle_errores_extremos.csv",
-                "text/csv",
-            )
-
-        with st.spinner("Entrenando modelo final y generando proyeccion..."):
-            modelo_log, modelo_raw, medianas = entrenar(df)
-            ultimo_periodo = int(df["Periodo"].max())
-            periodos_futuros = [periodo_siguiente(ultimo_periodo, 1), periodo_siguiente(ultimo_periodo, 2)]
-            ultimos = df.groupby("CODIGO", group_keys=False).tail(1)
-            filas = []
-            for _, registro in ultimos.iterrows():
-                codigo = registro["CODIGO"]
-                historico = df[df["CODIGO"].eq(codigo)]
-                preds = predecir_recursivo(
-                    modelo_log, modelo_raw, medianas, historico, periodos_futuros, alpha_log
-                )
-                filas.append({
-                    "CODIGO": codigo,
-                    "DESCRIPCION": registro.get("DESCRIPCION", ""),
-                    "CATEGORIA": registro.get("CATEGORIA", ""),
-                    "TIPO": registro.get("TIPO", "SIN CLASIFICAR"),
-                    "COMBO_ORIGINAL": int(registro.get("COMBO_ORIGINAL", 0)),
-                    "COMBO": int(str(registro.get("TIPO", "")).strip().upper() in ["COMBO", "COMBOS"]),
-                    "SEGMENTO": registro["SEGMENTO"],
-                    "Indice estacional mes 1": indice_estacional_futuro(historico, periodos_futuros[0] % 100),
-                    "Indice estacional mes 2": indice_estacional_futuro(historico, periodos_futuros[1] % 100),
-                    f"Pred {periodos_futuros[0]}": preds[0],
-                    f"Pred {periodos_futuros[1]}": preds[1],
-                })
-            pronostico = pd.DataFrame(filas)
-
-        st.subheader("Proyeccion masiva")
-        st.dataframe(pronostico, hide_index=True, use_container_width=True)
-        st.download_button(
-            "Descargar proyeccion CSV",
-            pronostico.to_csv(index=False).encode("utf-8-sig"),
-            "proyeccion_ventas_v3.csv",
-            "text/csv",
-        )
-        st.download_button(
-            "Descargar backtest CSV",
-            bt.to_csv(index=False).encode("utf-8-sig"),
-            "backtest_ventas_v3.csv",
-            "text/csv",
-        )
-
-    except Exception as exc:
-        st.exception(exc)
-
+        filas=[]
+        for _,r in ult.iterrows():
+            h=df[df.CODIGO==r.CODIGO]; pr=predecir_recursivo(modelo,medianas,h,periodos)
+            filas.append({'CODIGO':r.CODIGO,'DESCRIPCION':r.get('DESCRIPCION',''),'CATEGORIA':r.get('CATEGORIA',''),
+                          f'Pred {periodos[0]}':pr[0],f'Pred {periodos[1]}':pr[1]})
+        resultado=pd.DataFrame(filas)
+        st.subheader('Proyeccion masiva');st.dataframe(resultado,use_container_width=True,hide_index=True)
+        st.download_button('Descargar proyeccion CSV',resultado.to_csv(index=False).encode('utf-8-sig'),'proyeccion_ventas.csv','text/csv')
+    except Exception as e:
+        st.exception(e)
 
