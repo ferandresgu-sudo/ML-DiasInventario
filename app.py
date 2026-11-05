@@ -5,8 +5,8 @@ from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 st.set_page_config(page_title="Prediccion mensual V3", page_icon="📦", layout="wide")
-st.title("📦 Pronostico mensual V3")
-st.caption("Segmentacion de productos, estacionalidad, faltantes, atipicos, pesos y ensamble temporal.")
+st.title("📦 Pronostico mensual definitivo por TIPO")
+st.caption("TIPO define la clasificacion comercial. TIPO=COMBO/COMBOS prevalece aunque la columna COMBO sea 0.")
 
 MESES = {
     "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4,
@@ -20,7 +20,9 @@ FEATURES = (
     + [f"{m}{w}" for w in (3, 6, 12) for m in ("mean", "median", "std", "min", "max")]
     + ["trend3", "trend6", "cero3", "cero6", "registro3", "registro6",
        "venta_mismo_mes_anterior", "COMBO", "combo_lag1", "combo_mean3",
-       "indice_estacional_sku", "indice_estacional_categoria", "sin_mes", "cos_mes"]
+       "tipo_linea", "tipo_promocional", "tipo_inout", "tipo_out", "tipo_np",
+       "tipo_revision", "tipo_baja", "indice_estacional_sku",
+       "indice_estacional_categoria", "sin_mes", "cos_mes"]
 )
 
 
@@ -74,16 +76,28 @@ def cargar_datos(archivos):
     df["MES_NUM"] = df["MES"].astype(str).str.strip().str.upper().map(MESES)
     df["AÑO"] = pd.to_numeric(df["AÑO"], errors="coerce")
     df["VENTA"] = pd.to_numeric(df["VENTA"], errors="coerce")
+    if "TIPO" not in df.columns:
+        df["TIPO"] = "SIN CLASIFICAR"
+    df["TIPO"] = (
+        df["TIPO"].fillna("SIN CLASIFICAR").astype(str).str.strip().str.upper()
+        .replace({"0": "SIN CLASIFICAR", "#N/D": "SIN CLASIFICAR", "NAN": "SIN CLASIFICAR"})
+    )
+    # REGLA DEFINITIVA: TIPO manda sobre la columna COMBO.
+    # Si TIPO dice COMBO o COMBOS, COMBO_MODELO=1 aunque COMBO original sea 0.
     if "COMBO" not in df.columns:
         df["COMBO"] = 0
-    df["COMBO"] = pd.to_numeric(df["COMBO"], errors="coerce").fillna(0).clip(0, 1).astype(int)
+    df["COMBO_ORIGINAL"] = pd.to_numeric(df["COMBO"], errors="coerce").fillna(0).clip(0, 1).astype(int)
+    df["COMBO"] = df["TIPO"].isin(["COMBO", "COMBOS"]).astype(int)
     df["CODIGO"] = df["CODIGO"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
     df = df.dropna(subset=["MES_NUM", "AÑO", "VENTA", "CODIGO"])
     df = df[df["CODIGO"].ne("")]
     df["VENTA"] = df["VENTA"].clip(lower=0)
     df["Periodo"] = (df["AÑO"] * 100 + df["MES_NUM"]).astype(int)
 
-    agregaciones = {"VENTA": "sum", **{c: "first" for c in META if c in df.columns}}
+    agregaciones = {
+        "VENTA": "sum", "COMBO_ORIGINAL": "max",
+        **{c: "first" for c in META if c in df.columns}
+    }
     base = df.groupby(["CODIGO", "Periodo", "MES_NUM", "AÑO"], as_index=False).agg(agregaciones)
 
     # Calendario completo. REGISTRO_EXISTENTE diferencia cero real de ausencia en el archivo.
@@ -107,6 +121,10 @@ def cargar_datos(archivos):
         for c in META:
             if c in grupo.columns:
                 grupo[c] = grupo[c].ffill().bfill()
+        grupo["TIPO"] = grupo["TIPO"].fillna("SIN CLASIFICAR").astype(str).str.strip().str.upper()
+        grupo["COMBO"] = grupo["TIPO"].isin(["COMBO", "COMBOS"]).astype(int)
+        if "COMBO_ORIGINAL" in grupo.columns:
+            grupo["COMBO_ORIGINAL"] = grupo["COMBO_ORIGINAL"].fillna(0).astype(int)
         salida.append(grupo.reset_index(drop=True))
 
     completo = pd.concat(salida, ignore_index=True)
@@ -200,8 +218,22 @@ def indice_estacional_futuro(hist, mes):
     return float(np.clip(peso_sku * indice_sku + (1 - peso_sku) * indice_cat, 0.35, 2.50))
 
 
+def agregar_variables_tipo(df):
+    z = df.copy()
+    tipo = z["TIPO"].fillna("SIN CLASIFICAR").astype(str).str.strip().str.upper()
+    z["COMBO"] = tipo.isin(["COMBO", "COMBOS"]).astype(int)
+    z["tipo_linea"] = tipo.eq("LINEA").astype(int)
+    z["tipo_promocional"] = tipo.eq("PROMOCIONAL").astype(int)
+    z["tipo_inout"] = tipo.isin(["IN & OUT", "IN&OUT", "IN OUT"]).astype(int)
+    z["tipo_out"] = tipo.eq("OUT").astype(int)
+    z["tipo_np"] = tipo.eq("NP").astype(int)
+    z["tipo_revision"] = tipo.eq("REVISION").astype(int)
+    z["tipo_baja"] = tipo.str.contains("BAJA", na=False).astype(int)
+    return z
+
+
 def crear_features(df):
-    z = calcular_indices_estacionales(df)
+    z = agregar_variables_tipo(calcular_indices_estacionales(df))
     venta = z.groupby("CODIGO")["VENTA"]
     combo = z.groupby("CODIGO")["COMBO"]
     registro = z.groupby("CODIGO")["REGISTRO_EXISTENTE"]
@@ -282,9 +314,18 @@ def vector_futuro(hist, mes, medianas):
     q["registro6"] = np.mean(registros[-6:]) if registros else 0
     q["venta_mismo_mes_anterior"] = q["lag12"]
     combo_actual = float(hist["COMBO"].iloc[-1]) if "COMBO" in hist.columns else 0.0
+    tipo_actual = str(hist["TIPO"].iloc[-1]).strip().upper() if "TIPO" in hist.columns else "SIN CLASIFICAR"
+    combo_actual = float(tipo_actual in ["COMBO", "COMBOS"])
     q["COMBO"] = combo_actual
     q["combo_lag1"] = combo_actual
-    q["combo_mean3"] = float(hist["COMBO"].tail(3).mean()) if "COMBO" in hist.columns else 0.0
+    q["combo_mean3"] = float(hist["TIPO"].astype(str).str.strip().str.upper().tail(3).isin(["COMBO", "COMBOS"]).mean()) if "TIPO" in hist.columns else 0.0
+    q["tipo_linea"] = float(tipo_actual == "LINEA")
+    q["tipo_promocional"] = float(tipo_actual == "PROMOCIONAL")
+    q["tipo_inout"] = float(tipo_actual in ["IN & OUT", "IN&OUT", "IN OUT"])
+    q["tipo_out"] = float(tipo_actual == "OUT")
+    q["tipo_np"] = float(tipo_actual == "NP")
+    q["tipo_revision"] = float(tipo_actual == "REVISION")
+    q["tipo_baja"] = float("BAJA" in tipo_actual)
     q["indice_estacional_sku"] = indice_estacional_futuro(hist, mes)
     indice_cat = hist.loc[hist["MES_NUM"].eq(mes), "indice_estacional_categoria"].tail(1)
     q["indice_estacional_categoria"] = float(indice_cat.iloc[0]) if len(indice_cat) else 1.0
@@ -611,7 +652,9 @@ if archivos:
                     "CODIGO": codigo,
                     "DESCRIPCION": registro.get("DESCRIPCION", ""),
                     "CATEGORIA": registro.get("CATEGORIA", ""),
-                    "COMBO": int(registro.get("COMBO", 0)),
+                    "TIPO": registro.get("TIPO", "SIN CLASIFICAR"),
+                    "COMBO_ORIGINAL": int(registro.get("COMBO_ORIGINAL", 0)),
+                    "COMBO": int(str(registro.get("TIPO", "")).strip().upper() in ["COMBO", "COMBOS"]),
                     "SEGMENTO": registro["SEGMENTO"],
                     "Indice estacional mes 1": indice_estacional_futuro(historico, periodos_futuros[0] % 100),
                     "Indice estacional mes 2": indice_estacional_futuro(historico, periodos_futuros[1] % 100),
@@ -637,4 +680,5 @@ if archivos:
 
     except Exception as exc:
         st.exception(exc)
+
 
