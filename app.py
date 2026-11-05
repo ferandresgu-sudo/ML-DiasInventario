@@ -16,7 +16,7 @@ st.set_page_config(
 st.title("📦 Simulador predictivo mensual optimizado")
 st.caption(
     "Modelo global Extra Trees sobre log(venta), estacionalidad, rezagos "
-    "y promedios moviles. Las graficas y segmentaciones son diagnosticas "
+    "y promedios moviles. Las graficas, segmentadores y segmentaciones son diagnosticas "
     "y no modifican las predicciones."
 )
 
@@ -262,6 +262,7 @@ def backtest(df, n_holdout=2):
                 "CODIGO": codigo,
                 "DESCRIPCION": r.get("DESCRIPCION", ""),
                 "CATEGORIA": r.get("CATEGORIA", ""),
+                "TIPO": r.get("TIPO", ""),
                 "Periodo_Real": int(r.Periodo),
                 "Mes_Predecido": paso,
                 "Prediccion": p,
@@ -349,6 +350,89 @@ def preparar_diagnostico_backtest(bt, segmentos):
         "Subestimacion",
     )
     return diag
+
+
+def aplicar_segmentadores_diagnostico(bt_diag):
+    """Filtra tablas y graficas sin reentrenar ni modificar predicciones."""
+    st.subheader("Segmentadores del diagnostico")
+    st.caption(
+        "Los filtros de CATEGORIA, TIPO y PRODUCTO solo cambian las metricas, "
+        "tablas y graficas mostradas. El modelo V2 y sus predicciones permanecen iguales."
+    )
+
+    datos = bt_diag.copy()
+    for col in ["CATEGORIA", "TIPO", "DESCRIPCION"]:
+        if col not in datos.columns:
+            datos[col] = "Sin dato"
+        datos[col] = datos[col].fillna("Sin dato").astype(str).str.strip()
+        datos.loc[datos[col].eq(""), col] = "Sin dato"
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        categorias = sorted(datos["CATEGORIA"].unique().tolist())
+        categorias_sel = st.multiselect(
+            "CATEGORIA",
+            options=categorias,
+            default=[],
+            placeholder="Todas las categorias",
+            key="seg_categoria_bt",
+        )
+    if categorias_sel:
+        datos = datos[datos["CATEGORIA"].isin(categorias_sel)].copy()
+
+    with f2:
+        tipos = sorted(datos["TIPO"].unique().tolist())
+        tipos_sel = st.multiselect(
+            "TIPO",
+            options=tipos,
+            default=[],
+            placeholder="Todos los tipos",
+            key="seg_tipo_bt",
+        )
+    if tipos_sel:
+        datos = datos[datos["TIPO"].isin(tipos_sel)].copy()
+
+    opciones_producto = (
+        datos[["CODIGO", "DESCRIPCION"]]
+        .drop_duplicates()
+        .assign(
+            Producto=lambda x: x["CODIGO"].astype(str)
+            + " - "
+            + x["DESCRIPCION"].astype(str)
+        )
+        .sort_values("Producto")
+    )
+    mapa_producto = dict(zip(opciones_producto["Producto"], opciones_producto["CODIGO"]))
+
+    with f3:
+        productos_sel = st.multiselect(
+            "PRODUCTO",
+            options=list(mapa_producto.keys()),
+            default=[],
+            placeholder="Todos los productos",
+            key="seg_producto_bt",
+        )
+    if productos_sel:
+        codigos_sel = [mapa_producto[x] for x in productos_sel]
+        datos = datos[datos["CODIGO"].isin(codigos_sel)].copy()
+
+    if datos.empty:
+        st.warning("No hay registros para la combinacion de filtros seleccionada.")
+        return datos
+
+    y_f = datos["Actual"].to_numpy(float)
+    p_f = datos["Prediccion"].to_numpy(float)
+    wape_f = 100 * np.abs(y_f - p_f).sum() / max(np.abs(y_f).sum(), 1)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Registros filtrados", f"{len(datos):,}")
+    m2.metric("WAPE filtrado", f"{wape_f:.2f}%")
+    m3.metric("MAE filtrado", f"${mean_absolute_error(y_f, p_f):,.2f}")
+    m4.metric("RMSE filtrado", f"${mean_squared_error(y_f, p_f) ** 0.5:,.2f}")
+    r2_f = r2_score(y_f, p_f) if len(datos) >= 2 else np.nan
+    m5.metric("R² filtrado", f"{r2_f:.3f}" if pd.notna(r2_f) else "N/D")
+
+    return datos
 
 
 def mostrar_graficas_backtest(bt_diag):
@@ -841,16 +925,19 @@ if archivos:
                 segmentos_detalle,
             )
 
-            mostrar_graficas_backtest(bt_diag)
+            bt_visual = aplicar_segmentadores_diagnostico(bt_diag)
+            if not bt_visual.empty:
+                mostrar_graficas_backtest(bt_visual)
 
             st.subheader("Predicciones con mayor error absoluto")
             columnas_error = [
-                "CODIGO", "DESCRIPCION", "CATEGORIA", "SEGMENTO",
+                "CODIGO", "DESCRIPCION", "CATEGORIA", "TIPO", "SEGMENTO",
                 "Periodo_Real", "Mes_Predecido", "Actual", "Prediccion",
                 "Error_Abs", "Variacion_%",
             ]
             st.dataframe(
-                bt_diag.nlargest(15, "Error_Abs")[columnas_error],
+                bt_visual.nlargest(15, "Error_Abs")[columnas_error]
+                if not bt_visual.empty else bt_visual,
                 use_container_width=True,
                 hide_index=True,
             )
@@ -869,16 +956,48 @@ if archivos:
             .groupby("CODIGO")
             .tail(1)
         )
+        st.subheader("Consulta individual con segmentadores")
+        ult_filtro = ult.copy()
+        for col in ["CATEGORIA", "TIPO", "DESCRIPCION"]:
+            if col not in ult_filtro.columns:
+                ult_filtro[col] = "Sin dato"
+            ult_filtro[col] = ult_filtro[col].fillna("Sin dato").astype(str).str.strip()
+            ult_filtro.loc[ult_filtro[col].eq(""), col] = "Sin dato"
+
+        sf1, sf2, sf3 = st.columns(3)
+        with sf1:
+            categoria_ind = st.selectbox(
+                "CATEGORIA",
+                ["Todas"] + sorted(ult_filtro["CATEGORIA"].unique().tolist()),
+                key="categoria_individual",
+            )
+        if categoria_ind != "Todas":
+            ult_filtro = ult_filtro[ult_filtro["CATEGORIA"] == categoria_ind].copy()
+
+        with sf2:
+            tipo_ind = st.selectbox(
+                "TIPO",
+                ["Todos"] + sorted(ult_filtro["TIPO"].unique().tolist()),
+                key="tipo_individual",
+            )
+        if tipo_ind != "Todos":
+            ult_filtro = ult_filtro[ult_filtro["TIPO"] == tipo_ind].copy()
+
         opciones = {
             r.CODIGO: f'{r.CODIGO} - {r.get("DESCRIPCION", "")}'
-            for _, r in ult.iterrows()
+            for _, r in ult_filtro.sort_values(["DESCRIPCION", "CODIGO"]).iterrows()
         }
+        if not opciones:
+            st.warning("No hay productos para la combinacion seleccionada.")
+            st.stop()
 
-        codigo = st.selectbox(
-            "Producto",
-            list(opciones),
-            format_func=lambda x: opciones[x],
-        )
+        with sf3:
+            codigo = st.selectbox(
+                "PRODUCTO",
+                list(opciones),
+                format_func=lambda x: opciones[x],
+                key="producto_individual",
+            )
 
         hist = (
             df[df.CODIGO == codigo]
@@ -977,6 +1096,7 @@ if archivos:
                 "CODIGO": r.CODIGO,
                 "DESCRIPCION": r.get("DESCRIPCION", ""),
                 "CATEGORIA": r.get("CATEGORIA", ""),
+                "TIPO": r.get("TIPO", ""),
                 "SEGMENTO_DIAGNOSTICO": segmento,
                 f"Pred {periodos[0]}": pr[0],
                 f"Pred {periodos[1]}": pr[1],
@@ -998,3 +1118,4 @@ if archivos:
 
     except Exception as e:
         st.exception(e)
+
