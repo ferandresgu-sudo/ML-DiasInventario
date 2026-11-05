@@ -5,301 +5,489 @@ import re
 import unicodedata
 from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import altair as alt
 
-st.set_page_config(page_title="Prediccion V7 RMSE", page_icon="📦", layout="wide")
-st.title("📦 Prediccion V8: RMSE controlado y analisis de SKU extremos")
-st.caption("Busqueda rapida de hiperparametros, segmentador de categoria, cache y entrenamiento bajo demanda.")
+st.set_page_config(page_title='Prediccion por categoria', page_icon='📦', layout='wide')
+st.title('📦 Prediccion Noviembre-Diciembre 2026 V8, RMSE y diagnóstico visual')
+st.caption('Ensamble log/raw, suavizado por volatilidad y límites históricos para controlar errores extremos.')
 
-MESES={"ENERO":1,"FEBRERO":2,"MARZO":3,"ABRIL":4,"MAYO":5,"JUNIO":6,
-       "JULIO":7,"AGOSTO":8,"SEPTIEMBRE":9,"OCTUBRE":10,"NOVIEMBRE":11,"DICIEMBRE":12}
+MESES={'ENERO':1,'FEBRERO':2,'MARZO':3,'ABRIL':4,'MAYO':5,'JUNIO':6,'JULIO':7,'AGOSTO':8,'SEPTIEMBRE':9,'OCTUBRE':10,'NOVIEMBRE':11,'DICIEMBRE':12}
 LAGS=[1,2,3,4,6,12]
 VENTANAS=[3,6,12]
-FEATURES=([f"lag{x}" for x in LAGS]+[f"mean{x}" for x in VENTANAS]
-          +[f"median{x}" for x in VENTANAS]+[f"std{x}" for x in VENTANAS]
-          +["sin_mes","cos_mes","ceros6","cv6","es_promocion"])
+FEATURES=([f'lag{x}' for x in LAGS]+[f'mean{x}' for x in VENTANAS]+[f'std{x}' for x in VENTANAS]+['sin_mes','cos_mes'])
 
-# Cuatro candidatos pequenos para que la seleccion automatica no tarde demasiado.
-CANDIDATOS=[
-    {"max_depth":12,"min_samples_leaf":4,"max_features":0.70},
-    {"max_depth":14,"min_samples_leaf":4,"max_features":0.80},
-    {"max_depth":16,"min_samples_leaf":3,"max_features":0.80},
-    {"max_depth":20,"min_samples_leaf":2,"max_features":1.00},
-]
-
-
-def limpiar_columna(c):
-    s=str(c).replace("\ufeff","").replace("\xa0"," ").strip().upper()
-    s=unicodedata.normalize("NFKD",s).encode("ascii","ignore").decode("ascii")
-    return re.sub(r"[^A-Z0-9]+","_",s).strip("_")
+# =========================================================
+# CORRECCION PRINCIPAL DEL KEYERROR 'CODIGO'
+# =========================================================
+def limpiar_nombre_columna(nombre):
+    """Normaliza BOM, acentos, saltos, espacios y caracteres invisibles."""
+    texto=str(nombre).replace('\ufeff','').replace('\xa0',' ').strip().upper()
+    texto=unicodedata.normalize('NFKD',texto).encode('ascii','ignore').decode('ascii')
+    texto=re.sub(r'[\r\n\t]+',' ',texto)
+    texto=re.sub(r'[^A-Z0-9]+','_',texto).strip('_')
+    return texto
 
 
 def normalizar_columnas(df):
-    df=df.copy(); df.columns=[limpiar_columna(c) for c in df.columns]
-    alias={"COD_PRODUCTO":"CODIGO","CODIGO_PRODUCTO":"CODIGO","COD_ARTICULO":"CODIGO",
-           "SKU":"CODIGO","MATERIAL":"CODIGO","VENTAS":"VENTA","VENTA_NETA":"VENTA",
-           "MONTO_VENTA":"VENTA","IMPORTE":"VENTA","ANO":"AÑO","ANIO":"AÑO",
-           "YEAR":"AÑO","MONTH":"MES","CATEGORY":"CATEGORIA","CAT":"CATEGORIA"}
+    df=df.copy()
+    df.columns=[limpiar_nombre_columna(c) for c in df.columns]
+
+    # Alias comunes encontrados en archivos Excel.
+    alias={
+        'COD_PRODUCTO':'CODIGO','CODIGO_PRODUCTO':'CODIGO','CODIGOArtículo'.upper():'CODIGO',
+        'COD_ARTICULO':'CODIGO','ID_PRODUCTO':'CODIGO','SKU':'CODIGO','MATERIAL':'CODIGO',
+        'VENTAS':'VENTA','VENTA_NETA':'VENTA','MONTO_VENTA':'VENTA','IMPORTE':'VENTA',
+        'ANO':'AÑO','YEAR':'AÑO','ANIO':'AÑO',
+        'MONTH':'MES','NOMBRE_MES':'MES',
+        'CATEGORY':'CATEGORIA','CAT':'CATEGORIA',
+        'DESCRIPCION_PRODUCTO':'DESCRIPCION','PRODUCTO':'DESCRIPCION'
+    }
+    # Las claves también deben pasar por la misma limpieza.
+    alias={limpiar_nombre_columna(k):v for k,v in alias.items()}
     df=df.rename(columns={c:alias.get(c,c) for c in df.columns})
+
+    # Si una columna quedó repetida después de renombrar, conserva la primera no nula.
     if df.columns.duplicated().any():
-        unido={}
+        unicas={}
         for c in dict.fromkeys(df.columns):
-            unido[c]=df.loc[:,df.columns==c].bfill(axis=1).iloc[:,0]
-        df=pd.DataFrame(unido,index=df.index)
+            mismas=df.loc[:,df.columns==c]
+            unicas[c]=mismas.bfill(axis=1).iloc[:,0]
+        df=pd.DataFrame(unicas,index=df.index)
     return df
 
 
-def fila_encabezado(raw):
-    for i in range(min(15,len(raw))):
-        vals={limpiar_columna(v) for v in raw.iloc[i].dropna().tolist()}
-        vals={"CODIGO" if v in {"SKU","MATERIAL","COD_PRODUCTO","CODIGO_PRODUCTO","COD_ARTICULO"} else v for v in vals}
-        vals={"VENTA" if v in {"VENTAS","VENTA_NETA","MONTO_VENTA","IMPORTE"} else v for v in vals}
-        if {"CODIGO","VENTA"}.issubset(vals): return i
+def buscar_fila_encabezado(raw, max_filas=15):
+    """Detecta archivos donde el encabezado no está en la primera fila."""
+    requeridas={'CODIGO','VENTA'}
+    for i in range(min(max_filas,len(raw))):
+        valores={limpiar_nombre_columna(v) for v in raw.iloc[i].tolist() if pd.notna(v)}
+        valores_alias=set(normalizar_columnas(pd.DataFrame(columns=list(valores))).columns)
+        if requeridas.issubset(valores_alias) and ('MES' in valores_alias or 'AÑO' in valores_alias or 'ANO' in valores_alias):
+            return i
     return 0
 
 
-@st.cache_data(show_spinner="Leyendo archivos...")
+def leer_hoja_segura(archivo,nombre_hoja):
+    # Primero lee sin asumir encabezado para localizarlo correctamente.
+    raw=pd.read_excel(archivo,sheet_name=nombre_hoja,header=None,engine='openpyxl')
+    if raw.empty:
+        return pd.DataFrame()
+    fila=buscar_fila_encabezado(raw)
+    encabezados=raw.iloc[fila].tolist()
+    df=raw.iloc[fila+1:].copy()
+    df.columns=encabezados
+    df=df.dropna(how='all').reset_index(drop=True)
+    return normalizar_columnas(df)
+
+
+@st.cache_data(show_spinner='Leyendo y validando archivos...')
 def cargar(archivos):
-    partes=[]; omitidas=[]
+    partes=[]
+    problemas=[]
     for archivo in archivos:
-        excel=pd.ExcelFile(archivo,engine="openpyxl")
-        for hoja in excel.sheet_names:
-            raw=pd.read_excel(archivo,sheet_name=hoja,header=None,engine="openpyxl")
-            if raw.empty: continue
-            i=fila_encabezado(raw); h=raw.iloc[i+1:].copy(); h.columns=raw.iloc[i].tolist()
-            h=normalizar_columnas(h.dropna(how="all"))
-            faltan=[c for c in ["CODIGO","VENTA","MES","AÑO","CATEGORIA"] if c not in h]
-            if faltan:
-                omitidas.append(f"{archivo.name}/{hoja}: faltan {faltan}")
-                continue
-            partes.append(h)
-    if not partes: raise ValueError("No hay hojas validas con CODIGO, VENTA, MES, AÑO y CATEGORIA.")
+        try:
+            excel=pd.ExcelFile(archivo,engine='openpyxl')
+            for hoja in excel.sheet_names:
+                try:
+                    h=leer_hoja_segura(archivo,hoja)
+                    if h.empty:
+                        continue
+                    faltantes=[c for c in ['CODIGO','VENTA','MES','AÑO','CATEGORIA'] if c not in h.columns]
+                    if faltantes:
+                        problemas.append(f'{archivo.name} / {hoja}: faltan {faltantes}; columnas={list(h.columns)}')
+                        continue
+                    h['ARCHIVO_ORIGEN']=archivo.name
+                    h['HOJA_ORIGEN']=hoja
+                    partes.append(h)
+                except Exception as e:
+                    problemas.append(f'{archivo.name} / {hoja}: {e}')
+        except Exception as e:
+            problemas.append(f'{archivo.name}: no se pudo abrir: {e}')
+
+    if not partes:
+        detalle='\n'.join(problemas[:15])
+        raise ValueError('Ninguna hoja contiene CODIGO, VENTA, MES, AÑO y CATEGORIA después de normalizar.\n'+detalle)
+
     df=pd.concat(partes,ignore_index=True,sort=False)
-    df["MES_NUM"]=df["MES"].astype(str).str.strip().str.upper().map(MESES)
-    df["MES_NUM"]=df["MES_NUM"].fillna(pd.to_numeric(df["MES"],errors="coerce"))
-    df["AÑO"]=pd.to_numeric(df["AÑO"],errors="coerce")
-    df["VENTA"]=pd.to_numeric(df["VENTA"],errors="coerce").clip(lower=0)
-    df["CODIGO"]=df["CODIGO"].astype(str).str.strip().str.replace(r"\.0$","",regex=True)
-    df["CATEGORIA"]=df["CATEGORIA"].astype(str).str.strip()
-    df=df.dropna(subset=["MES_NUM","AÑO","VENTA"])
-    df=df[~df["CODIGO"].isin(["","nan","None"])]
-    df=df[df["MES_NUM"].between(1,12)]
-    df["Periodo"]=(df["AÑO"].astype(int)*100+df["MES_NUM"].astype(int)).astype(int)
-    meta={c:"first" for c in ["DESCRIPCION","CATEGORIA","FAMILIA","TIPO"] if c in df}
-    g=df.groupby(["CODIGO","Periodo","MES_NUM","AÑO"],as_index=False).agg({"VENTA":"sum",**meta})
+    # Validación antes de cualquier df['CODIGO'].
+    requeridas=['CODIGO','VENTA','MES','AÑO','CATEGORIA']
+    faltantes=[c for c in requeridas if c not in df.columns]
+    if faltantes:
+        raise ValueError(f'Faltan columnas requeridas después de concatenar: {faltantes}. Disponibles: {list(df.columns)}')
+
+    df['MES_NUM']=df['MES'].astype(str).str.strip().str.upper().map(MESES)
+    # También admite meses numéricos.
+    mes_numerico=pd.to_numeric(df['MES'],errors='coerce')
+    df['MES_NUM']=df['MES_NUM'].fillna(mes_numerico)
+    df['AÑO']=pd.to_numeric(df['AÑO'],errors='coerce')
+    df['VENTA']=pd.to_numeric(df['VENTA'],errors='coerce')
+    df['CODIGO']=df['CODIGO'].astype(str).str.strip().str.replace(r'\.0$','',regex=True)
+    df['CATEGORIA']=df['CATEGORIA'].astype(str).str.strip()
+    df=df.dropna(subset=['MES_NUM','AÑO','VENTA'])
+    df=df[~df['CODIGO'].isin(['','nan','None'])]
+    df=df[df['MES_NUM'].between(1,12)]
+    if df.empty:
+        raise ValueError('Después de convertir MES, AÑO, CODIGO y VENTA no quedaron registros válidos.')
+    df['Periodo']=(df['AÑO'].astype(int)*100+df['MES_NUM'].astype(int)).astype(int)
+
+    meta={c:'first' for c in ['DESCRIPCION','CATEGORIA','FAMILIA','TIPO'] if c in df.columns}
+    g=df.groupby(['CODIGO','Periodo','MES_NUM','AÑO'],as_index=False).agg({'VENTA':'sum',**meta})
+
     salida=[]
-    for code,x in g.groupby("CODIGO",sort=False):
-        x=x.sort_values("Periodo").copy()
-        fechas=pd.to_datetime(x["AÑO"].astype(int).astype(str)+"-"+x["MES_NUM"].astype(int).astype(str)+"-01")
-        x.index=fechas; x=x.reindex(pd.date_range(fechas.min(),fechas.max(),freq="MS"))
-        x["CODIGO"]=code; x["VENTA"]=x["VENTA"].fillna(0.0)
-        x["MES_NUM"]=x.index.month; x["AÑO"]=x.index.year; x["Periodo"]=x.index.year*100+x.index.month
-        for c in meta: x[c]=x[c].ffill().bfill()
+    for codigo,x in g.groupby('CODIGO',sort=False):
+        x=x.sort_values('Periodo').copy()
+        fechas=pd.to_datetime(x['AÑO'].astype(int).astype(str)+'-'+x['MES_NUM'].astype(int).astype(str)+'-01')
+        x.index=fechas
+        x=x.reindex(pd.date_range(fechas.min(),fechas.max(),freq='MS'))
+        x['CODIGO']=codigo
+        x['VENTA']=x['VENTA'].fillna(0.0)
+        x['MES_NUM']=x.index.month
+        x['AÑO']=x.index.year
+        x['Periodo']=x.index.year*100+x.index.month
+        for c in meta:
+            x[c]=x[c].ffill().bfill()
         salida.append(x.reset_index(drop=True))
-    resultado=pd.concat(salida,ignore_index=True).sort_values(["CODIGO","Periodo"]).reset_index(drop=True)
-    texto=(resultado.get("DESCRIPCION",pd.Series("",index=resultado.index)).fillna("").astype(str)+" "+
-           resultado.get("TIPO",pd.Series("",index=resultado.index)).fillna("").astype(str)).str.upper()
-    resultado["ES_PROMOCION"]=texto.str.contains(
-        r"PACK|TRIPACK|COMBO|PROMO|GRATIS|BONUS|\+|IN ?& ?OUT|IN ?OUT",
-        regex=True,na=False
-    ).astype("int8")
-    return resultado,omitidas
+
+    resultado=pd.concat(salida,ignore_index=True).sort_values(['CODIGO','Periodo']).reset_index(drop=True)
+    # Garantía final para impedir el KeyError reportado.
+    if 'CODIGO' not in resultado.columns:
+        raise ValueError(f'Error de estructura: CODIGO se perdió durante la normalización. Columnas: {list(resultado.columns)}')
+    return resultado,problemas
 
 
-@st.cache_data(show_spinner=False)
 def crear_features(df):
-    z=df.sort_values(["CODIGO","Periodo"]).copy(); grp=z.groupby("CODIGO",sort=False)["VENTA"]
-    for lag in LAGS: z[f"lag{lag}"]=grp.shift(lag)
+    z=df.sort_values(['CODIGO','Periodo']).copy()
+    grp=z.groupby('CODIGO',sort=False)['VENTA']
+    for lag in LAGS: z[f'lag{lag}']=grp.shift(lag)
     for w in VENTANAS:
-        z[f"mean{w}"]=grp.transform(lambda s,w=w:s.shift(1).rolling(w,min_periods=2).mean())
-        z[f"median{w}"]=grp.transform(lambda s,w=w:s.shift(1).rolling(w,min_periods=2).median())
-        z[f"std{w}"]=grp.transform(lambda s,w=w:s.shift(1).rolling(w,min_periods=2).std()).fillna(0)
-    z["sin_mes"]=np.sin(2*np.pi*z["MES_NUM"]/12); z["cos_mes"]=np.cos(2*np.pi*z["MES_NUM"]/12)
-    z["ceros6"]=grp.transform(lambda s:s.shift(1).rolling(6,min_periods=2).apply(lambda a:(a==0).mean(),raw=True))
-    z["cv6"]=(z["std6"]/z["mean6"].replace(0,np.nan)).clip(0,10)
-    z["es_promocion"]=z["ES_PROMOCION"].fillna(0).astype(float)
+        z[f'mean{w}']=grp.transform(lambda s,w=w:s.shift(1).rolling(w,min_periods=2).mean())
+        z[f'std{w}']=grp.transform(lambda s,w=w:s.shift(1).rolling(w,min_periods=2).std()).fillna(0)
+    z['sin_mes']=np.sin(2*np.pi*z['MES_NUM']/12)
+    z['cos_mes']=np.cos(2*np.pi*z['MES_NUM']/12)
     return z
 
 
-def preparar(df):
-    tamanos=df.groupby("CODIGO").size(); codigos=tamanos[tamanos>=5].index
-    base=df[df["CODIGO"].isin(codigos)].copy()
-    held=base.groupby("CODIGO",group_keys=False).tail(2); train=base.drop(index=held.index)
-    f=crear_features(train).dropna(subset=["lag1","lag2","VENTA"]).copy()
+def entrenar(df,cfg):
+    """Entrena dos Extra Trees: log reduce WAPE/MAE y raw protege productos de alto volumen."""
+    f=crear_features(df).dropna(subset=['lag1','lag2','VENTA']).copy()
+    if f.empty:
+        raise ValueError('No hay historial suficiente para entrenar esta categoría.')
     medianas=f[FEATURES].median().fillna(0)
-    return train,held,f[FEATURES].fillna(medianas).astype("float32"),f["VENTA"].astype(float),medianas
+    X=f[FEATURES].replace([np.inf,-np.inf],np.nan).fillna(medianas).astype('float32')
+    y_raw=f['VENTA'].clip(lower=0).astype('float32')
+    y_log=np.log1p(y_raw)
+    pesos=np.where(f['MES_NUM'].isin([11,12]) & f['AÑO'].isin([2024,2025]),cfg['peso'],1.0)
 
-
-def nuevo_modelo(config,n_arboles):
-    return ExtraTreesRegressor(n_estimators=n_arboles,max_depth=config["max_depth"],
-        min_samples_leaf=config["min_samples_leaf"],max_features=config["max_features"],
-        n_jobs=-1,random_state=42)
+    comunes=dict(
+        n_estimators=cfg['arboles'],
+        max_depth=cfg['profundidad'],
+        min_samples_leaf=cfg['hoja'],
+        max_features=cfg['variables'],
+        n_jobs=-1,
+        random_state=42
+    )
+    modelo_log=ExtraTreesRegressor(**comunes)
+    modelo_raw=ExtraTreesRegressor(**comunes)
+    modelo_log.fit(X,y_log,sample_weight=pesos)
+    modelo_raw.fit(X,y_raw,sample_weight=pesos)
+    return {'log':modelo_log,'raw':modelo_raw},medianas
 
 
 def vector(hist,mes,medianas):
-    v=hist.sort_values("Periodo")["VENTA"].to_numpy(float); d={}
-    for lag in LAGS: d[f"lag{lag}"]=v[-lag] if len(v)>=lag else np.nan
+    ventas=hist.sort_values('Periodo')['VENTA'].to_numpy(float); d={}
+    for lag in LAGS:
+        d[f'lag{lag}']=ventas[-lag] if len(ventas)>=lag else np.nan
     for w in VENTANAS:
-        a=v[-w:]; d[f"mean{w}"]=a.mean() if len(a)>=2 else np.nan
-        d[f"median{w}"]=np.median(a) if len(a)>=2 else np.nan
-        d[f"std{w}"]=a.std(ddof=1) if len(a)>=2 else 0
-    d["sin_mes"]=np.sin(2*np.pi*mes/12); d["cos_mes"]=np.cos(2*np.pi*mes/12)
-    a6=v[-6:]; d["ceros6"]=np.mean(a6==0) if len(a6)>=2 else 0
-    media=a6.mean() if len(a6) else 0; desv=a6.std(ddof=1) if len(a6)>=2 else 0
-    d["cv6"]=min(desv/media,10) if media>0 else np.nan
-    d["es_promocion"]=float(hist.sort_values("Periodo").iloc[-1].get("ES_PROMOCION",0))
-    return pd.DataFrame([d],columns=FEATURES).fillna(medianas).astype("float32")
+        a=ventas[-w:]
+        d[f'mean{w}']=a.mean() if len(a)>=2 else np.nan
+        d[f'std{w}']=a.std(ddof=1) if len(a)>=2 else 0
+    d['sin_mes']=np.sin(2*np.pi*mes/12); d['cos_mes']=np.cos(2*np.pi*mes/12)
+    return pd.DataFrame([d],columns=FEATURES).replace([np.inf,-np.inf],np.nan).fillna(medianas).astype('float32')
 
 
-def predecir(modelo,medianas,hist,periodos,mezcla_mediana=0.15):
-    h=hist.copy(); pred=[]
+def ajustar_rmse(pred_modelo,hist,cfg):
+    """Suaviza y recorta únicamente según el patrón histórico de cada SKU."""
+    ventas=hist.sort_values('Periodo')['VENTA'].tail(12).astype(float)
+    if len(ventas)<4:
+        return max(0.0,float(pred_modelo)),'SIN_AJUSTE'
+
+    ult6=ventas.tail(6)
+    media6=float(ult6.mean())
+    mediana6=float(ult6.median())
+    std6=float(ult6.std(ddof=1)) if len(ult6)>1 else 0.0
+    cv6=std6/media6 if media6>0 else 0.0
+    ceros6=int((ult6==0).sum())
+
+    if ceros6>=3:
+        positivos=ventas[ventas>0]
+        pred=(ventas.gt(0).mean()*positivos.median()) if not positivos.empty else 0.0
+        return max(0.0,float(pred)),'INTERMITENTE'
+
+    # Los SKU volátiles reciben más estabilización; los estables conservan el modelo.
+    if cv6<=0.35:
+        peso_modelo=0.90; segmento='ESTABLE'
+    elif cv6<1.00:
+        peso_modelo=0.80; segmento='VARIABLE'
+    else:
+        peso_modelo=0.65; segmento='VOLATIL'
+
+    pred=peso_modelo*float(pred_modelo)+(1-peso_modelo)*mediana6
+
+    if cfg['limites'] and len(ventas)>=6:
+        q10=float(ventas.quantile(0.10)); q90=float(ventas.quantile(0.90))
+        inferior=max(0.0,min(q10,0.50*mediana6))
+        # Volátiles/estacionales mantienen más espacio que los SKU estables.
+        multiplicador=2.50 if segmento=='VOLATIL' else (2.00 if segmento=='VARIABLE' else 1.75)
+        superior=max(q90,multiplicador*mediana6,float(ventas.iloc[-1])*1.15)
+        pred=float(np.clip(pred,inferior,superior))
+    return max(0.0,float(pred)),segmento
+
+
+def predecir(modelos,medianas,hist,periodos,cfg):
+    h=hist.copy(); pred=[]; segmentos=[]
     for periodo in periodos:
-        p_ml=max(0,float(np.expm1(modelo.predict(vector(h,periodo%100,medianas))[0])))
-        med6=float(h.sort_values("Periodo")["VENTA"].tail(6).median())
-        p=(1-mezcla_mediana)*p_ml+mezcla_mediana*med6
-        pred.append(max(0,p)); r=h.iloc[-1].copy(); r["Periodo"]=periodo; r["AÑO"]=periodo//100; r["MES_NUM"]=periodo%100; r["VENTA"]=p
-        h=pd.concat([h,pd.DataFrame([r])],ignore_index=True)
-    return pred
-
-
-def evaluar(modelo,medianas,train,held,mezcla):
-    historicos={c:g for c,g in train.groupby("CODIGO",sort=False)}; filas=[]
-    for code,reales in held.groupby("CODIGO",sort=False):
-        if code not in historicos: continue
-        reales=reales.sort_values("Periodo"); ps=predecir(modelo,medianas,historicos[code],reales["Periodo"].astype(int).tolist(),mezcla)
-        for (_,r),p in zip(reales.iterrows(),ps):
-            filas.append({"CODIGO":code,"DESCRIPCION":r.get("DESCRIPCION",""),"CATEGORIA":r.get("CATEGORIA",""),
-                          "Periodo":int(r["Periodo"]),"Actual":float(r["VENTA"]),"Prediccion":p})
-    return pd.DataFrame(filas)
+        X=vector(h,periodo%100,medianas)
+        p_log=max(0.0,float(np.expm1(modelos['log'].predict(X)[0])))
+        p_raw=max(0.0,float(modelos['raw'].predict(X)[0]))
+        # 70% log conserva WAPE; 30% raw reduce grandes errores de alto volumen.
+        p_base=(1-cfg['peso_raw'])*p_log+cfg['peso_raw']*p_raw
+        p,segmento=ajustar_rmse(p_base,h,cfg)
+        pred.append(p); segmentos.append(segmento)
+        fila=h.iloc[-1].copy(); fila['Periodo']=periodo; fila['AÑO']=periodo//100; fila['MES_NUM']=periodo%100; fila['VENTA']=p
+        h=pd.concat([h,pd.DataFrame([fila])],ignore_index=True)
+    return pred,segmentos
 
 
 def metricas(r):
-    y=r["Actual"].to_numpy(float); p=r["Prediccion"].to_numpy(float)
-    return {"WAPE":100*np.abs(y-p).sum()/max(np.abs(y).sum(),1),"MAE":mean_absolute_error(y,p),
-            "RMSE":np.sqrt(mean_squared_error(y,p)),"R2":r2_score(y,p)}
+    y=r['Actual'].to_numpy(float); p=r['Prediccion'].to_numpy(float)
+    return {'WAPE':100*np.abs(y-p).sum()/max(np.abs(y).sum(),1),'MAE':mean_absolute_error(y,p),
+            'RMSE':np.sqrt(mean_squared_error(y,p)),'R2':r2_score(y,p)}
 
 
-def optimizar_rmse(df,arboles_busqueda):
-    train,held,X,y,medianas=preparar(df); resultados=[]; mejor=None
-    total=len(CANDIDATOS)*3; avance=st.progress(0); paso=0
-    for config in CANDIDATOS:
-        modelo=nuevo_modelo(config,arboles_busqueda); modelo.fit(X,np.log1p(y.clip(lower=0)))
-        for mezcla in [0.0,0.10,0.20]:
-            bt=evaluar(modelo,medianas,train,held,mezcla); m=metricas(bt)
-            fila={**config,"mezcla_mediana":mezcla,**m}; resultados.append(fila)
-            if mejor is None or m["RMSE"]<mejor[0]: mejor=(m["RMSE"],config.copy(),mezcla,bt)
-            paso+=1; avance.progress(paso/total)
-    avance.empty()
-    tabla=pd.DataFrame(resultados)
-    # Selección restringida: bajar RMSE sin deteriorar WAPE/MAE de forma material.
-    base=tabla.loc[(tabla["max_depth"]==20)&(tabla["min_samples_leaf"]==2)&
-                   (tabla["max_features"]==1.0)&(tabla["mezcla_mediana"]==0.0)]
-    if base.empty:
-        base=tabla.nsmallest(1,"WAPE")
-    wape_base=float(base.iloc[0]["WAPE"])
-    mae_base=float(base.iloc[0]["MAE"])
-    elegibles=tabla[(tabla["WAPE"]<=wape_base+1.0)&(tabla["MAE"]<=mae_base*1.05)]
-    fila_mejor=(elegibles if not elegibles.empty else tabla).sort_values("RMSE").iloc[0]
-    clave=(int(fila_mejor["max_depth"]),int(fila_mejor["min_samples_leaf"]),
-           float(fila_mejor["max_features"]),float(fila_mejor["mezcla_mediana"]))
-    config_sel={"max_depth":clave[0],"min_samples_leaf":clave[1],"max_features":clave[2]}
-    # Recupera el backtest seleccionado sin reentrenar una segunda vez si coincide con el mejor bruto.
-    if (mejor[1]==config_sel and abs(mejor[2]-clave[3])<1e-9):
-        mejor_restringido=mejor
-    else:
-        modelo=nuevo_modelo(config_sel,arboles_busqueda)
-        modelo.fit(X,np.log1p(y.clip(lower=0)))
-        bt_sel=evaluar(modelo,medianas,train,held,clave[3])
-        mejor_restringido=(float(fila_mejor["RMSE"]),config_sel,clave[3],bt_sel)
-    return tabla.sort_values("RMSE"),mejor_restringido,train,held
+def backtest(df,cfg):
+    """Entrena una vez y calibra automáticamente el peso raw para minimizar RMSE."""
+    tamanos=df.groupby('CODIGO').size()
+    codigos=tamanos[tamanos>=5].index
+    base=df[df['CODIGO'].isin(codigos)].copy()
+    held=base.groupby('CODIGO',group_keys=False).tail(2)
+    train=base.drop(index=held.index)
+    modelos,medianas=entrenar(train,cfg)
+    historicos={c:g for c,g in train.groupby('CODIGO',sort=False)}
 
+    candidatos=[]
+    # Incluye modelo log puro y mezclas que prestan más atención a alto volumen.
+    for peso_raw_cand in [0.00,0.10,0.20,0.30,0.40,0.50]:
+        for usar_limites in [False,True]:
+            cfg_cand=dict(cfg)
+            cfg_cand['peso_raw']=peso_raw_cand
+            cfg_cand['limites']=usar_limites
+            filas=[]
+            for codigo,real in held.groupby('CODIGO',sort=False):
+                if codigo not in historicos:
+                    continue
+                real=real.sort_values('Periodo')
+                ps,segmentos=predecir(
+                    modelos,medianas,historicos[codigo],
+                    real['Periodo'].astype(int).tolist(),cfg_cand
+                )
+                for ((_,r),pred,segmento) in zip(real.iterrows(),ps,segmentos):
+                    filas.append({
+                        'CODIGO':codigo,'DESCRIPCION':r.get('DESCRIPCION',''),
+                        'CATEGORIA':r.get('CATEGORIA',''),'Periodo':int(r['Periodo']),
+                        'Actual':float(r['VENTA']),'Prediccion':pred,'Segmento':segmento
+                    })
+            resultado=pd.DataFrame(filas)
+            if resultado.empty:
+                continue
+            m=metricas(resultado)
+            candidatos.append({
+                'peso_raw':peso_raw_cand,'limites':usar_limites,
+                'WAPE':m['WAPE'],'MAE':m['MAE'],'RMSE':m['RMSE'],'R2':m['R2'],
+                'resultado':resultado
+            })
 
-archivos=st.file_uploader("Sube ventas 2024, 2025 y 2026",type=["xlsx","xlsm"],accept_multiple_files=True)
-with st.sidebar.form("opciones"):
-    arboles_busqueda=st.select_slider("Arboles durante optimizacion",[50,75,100,125],value=75)
-    arboles_final=st.select_slider("Arboles del modelo final",[100,150,200,250,300],value=180 if 180 in [100,150,200,250,300] else 200)
-    st.form_submit_button("Aplicar")
+    if not candidatos:
+        return pd.DataFrame(),pd.DataFrame(),cfg
+
+    comparacion=pd.DataFrame([{k:v for k,v in c.items() if k!='resultado'} for c in candidatos])
+    base_log=min(candidatos,key=lambda x:abs(x['peso_raw'])+(1 if x['limites'] else 0))
+    # Solo acepta menor RMSE si WAPE no aumenta más de 1 punto y MAE no sube más de 5%.
+    elegibles=[c for c in candidatos
+               if c['WAPE']<=base_log['WAPE']+1.0
+               and c['MAE']<=base_log['MAE']*1.05]
+    mejor=min(elegibles or candidatos,key=lambda x:x['RMSE'])
+    cfg_opt=dict(cfg)
+    cfg_opt['peso_raw']=mejor['peso_raw']
+    cfg_opt['limites']=mejor['limites']
+    return mejor['resultado'],comparacion.sort_values('RMSE'),cfg_opt
+
+archivos=st.file_uploader('Sube ventas 2024, 2025 y 2026',type=['xlsx','xlsm'],accept_multiple_files=True)
+with st.sidebar.form('config'):
+    arboles=st.select_slider('Árboles por modelo',[75,100,125,150,200],value=150,help='Se entrenan dos modelos; 150 equivale a 300 árboles totales.')
+    profundidad=st.selectbox('Profundidad',[10,12,14,16,20,None],index=2,format_func=lambda x:'Sin límite' if x is None else str(x))
+    hoja=st.select_slider('Mínimo por hoja',[2,3,4,5,8],value=4)
+    variables=st.select_slider('Variables por árbol',[0.6,0.7,0.8,0.9,1.0],value=0.8)
+    peso=st.slider('Peso Nov-Dic 2024/2025',1.0,3.0,1.5,0.25)
+    peso_raw=st.slider('Peso modelo raw para reducir RMSE',0.0,0.5,0.30,0.05)
+    limites=st.checkbox('Suavizar y limitar errores extremos',value=True)
+    st.form_submit_button('Aplicar')
 
 if archivos:
     try:
-        total,omitidas=cargar(archivos)
-        categorias=sorted(total["CATEGORIA"].dropna().astype(str).unique())
-        categoria=st.selectbox("CATEGORIA para optimizar y entrenar",["Todas"]+categorias)
-        df=total.copy() if categoria=="Todas" else total[total["CATEGORIA"].astype(str)==categoria].copy()
-        firma=(tuple((a.name,a.size) for a in archivos),categoria,arboles_busqueda,arboles_final,len(df))
-        st.success(f"Categoria: {categoria} | {df['CODIGO'].nunique():,} productos | {len(df):,} registros")
-        if omitidas:
-            with st.expander("Hojas omitidas"): [st.warning(x) for x in omitidas]
-        for k,v in [("v7_resultados",None),("v7_mejor",None),("v7_firma",None),("v7_modelo",None),("v7_firma_modelo",None)]:
+        total,problemas=cargar(archivos)
+        # Esta línea ya es segura porque cargar() garantiza CODIGO.
+        st.success(f"{total['CODIGO'].nunique():,} productos y {len(total):,} observaciones normalizadas")
+        if problemas:
+            with st.expander('Hojas omitidas o con estructura diferente'):
+                for p in problemas: st.warning(p)
+
+        categorias=sorted(total['CATEGORIA'].dropna().astype(str).unique())
+        categoria=st.selectbox('CATEGORIA para métricas y entrenamiento',['Todas']+categorias)
+        df=total.copy() if categoria=='Todas' else total[total['CATEGORIA'].astype(str)==categoria].copy()
+        cfg={'arboles':arboles,'profundidad':profundidad,'hoja':hoja,'variables':variables,'peso':peso,'peso_raw':peso_raw,'limites':limites}
+        firma=(tuple((a.name,a.size) for a in archivos),categoria,tuple(cfg.items()),len(df),int(df['Periodo'].max()))
+        for k,v in [('modelo_cat',None),('firma_modelo_cat',None),('bt_cat',None),('firma_bt_cat',None),('comparacion_rmse',None),('cfg_opt',None)]:
             if k not in st.session_state: st.session_state[k]=v
 
-        if st.button("Optimizar automaticamente RMSE",type="primary"):
-            with st.spinner("Probando 12 combinaciones rapidas..."):
-                resultados,mejor,_,_=optimizar_rmse(df,arboles_busqueda)
-                st.session_state.v7_resultados=resultados; st.session_state.v7_mejor=mejor; st.session_state.v7_firma=firma
+        c1,c2=st.columns(2)
+        with c1:
+            if st.button('Calcular métricas de la categoría',type='primary'):
+                with st.spinner('Calculando métricas...'):
+                    st.session_state.bt_cat,st.session_state.comparacion_rmse,st.session_state.cfg_opt=backtest(df,cfg)
+                    st.session_state.firma_bt_cat=firma
+        with c2:
+            if st.button('Entrenar modelo de la categoría'):
+                with st.spinner('Entrenando modelo...'):
+                    cfg_entrenar=st.session_state.cfg_opt if st.session_state.cfg_opt is not None else cfg
+                    st.session_state.modelo_cat=entrenar(df,cfg_entrenar); st.session_state.firma_modelo_cat=firma
 
-        if st.session_state.v7_resultados is not None and st.session_state.v7_firma==firma:
-            resultados=st.session_state.v7_resultados; mejor=st.session_state.v7_mejor
-            st.subheader("Resultados de optimizacion")
-            st.dataframe(resultados.style.format({"WAPE":"{:.2f}%","MAE":"${:,.2f}","RMSE":"${:,.2f}","R2":"{:.3f}"}),use_container_width=True,hide_index=True)
-            bt=mejor[3].copy(); m=metricas(bt); a,b,c,d=st.columns(4)
-            a.metric("WAPE",f"{m['WAPE']:.2f}%"); b.metric("MAE",f"${m['MAE']:,.2f}"); c.metric("RMSE",f"${m['RMSE']:,.2f}"); d.metric("R²",f"{m['R2']:.3f}")
-            st.info(f"Mejor configuracion restringida: profundidad={mejor[1]['max_depth']}, hoja={mejor[1]['min_samples_leaf']}, variables={mejor[1]['max_features']}, mezcla mediana={mejor[2]:.0%}")
-            bt["Error_Abs"]=(bt.Actual-bt.Prediccion).abs()
-            bt["Error_Signado"]=bt.Prediccion-bt.Actual
-            bt["TIPO_ERROR"]=np.where(bt.Error_Signado>0,"Sobreestimacion","Subestimacion")
+        if st.session_state.bt_cat is not None and st.session_state.firma_bt_cat==firma and not st.session_state.bt_cat.empty:
+            bt=st.session_state.bt_cat.copy(); m=metricas(bt); a,b,c,d=st.columns(4)
+            a.metric('WAPE',f"{m['WAPE']:.2f}%"); b.metric('MAE',f"${m['MAE']:,.2f}"); c.metric('RMSE',f"${m['RMSE']:,.2f}"); d.metric('R²',f"{m['R2']:.3f}")
+            bt['Error_Abs']=(bt['Actual']-bt['Prediccion']).abs(); bt['Aporte_WAPE_pp']=100*bt['Error_Abs']/max(bt['Actual'].abs().sum(),1)
+            st.caption(f"Relación RMSE/MAE: {m['RMSE']/max(m['MAE'],1):.2f}x. El objetivo es reducirla sin elevar WAPE más de 1 punto.")
+            if st.session_state.cfg_opt is not None:
+                opt=st.session_state.cfg_opt
+                st.success(f"Configuración automática seleccionada: peso raw {opt['peso_raw']:.2f}, límites {'activados' if opt['limites'] else 'desactivados'}.")
+            if st.session_state.comparacion_rmse is not None:
+                st.markdown('#### Comparación automática de configuraciones')
+                st.dataframe(st.session_state.comparacion_rmse.style.format({'peso_raw':'{:.2f}','WAPE':'{:.2f}%','MAE':'${:,.2f}','RMSE':'${:,.2f}','R2':'{:.3f}'}),use_container_width=True,hide_index=True)
+            st.markdown('## Diagnóstico visual del modelo')
+            bt['Error_Signo']=bt['Prediccion']-bt['Actual']
+            bt['Error_Cuadrado']=bt['Error_Signo']**2
+            bt['Error_Porcentual']=np.where(bt['Actual']>0,100*bt['Error_Signo']/bt['Actual'],np.nan)
+            bt['Situacion']=np.where(bt['Error_Signo']>0,'Sobreestimación','Subestimación')
+            if 'Segmento' not in bt.columns:
+                bt['Segmento']='Sin segmento'
 
-            st.subheader("SKU que generan errores extremos")
-            umbral=max(float(bt.Error_Abs.quantile(.95)),2*m["MAE"])
-            extremos=bt[bt.Error_Abs>=umbral].copy()
-            aporte=100*extremos.Error_Abs.sum()/max(bt.Error_Abs.sum(),1)
-            e1,e2,e3,e4=st.columns(4)
-            e1.metric("Umbral extremo",f"${umbral:,.2f}")
-            e2.metric("Observaciones",f"{len(extremos):,}")
-            e3.metric("SKU",f"{extremos.CODIGO.nunique():,}")
-            e4.metric("Aporte al error",f"{aporte:.1f}%")
-            if not extremos.empty:
-                ranking=extremos.groupby(["CODIGO","DESCRIPCION","CATEGORIA"],dropna=False).agg(
-                    Veces_Extremo=("Error_Abs","size"),Error_Total=("Error_Abs","sum"),
-                    Error_Maximo=("Error_Abs","max"),Venta_Real=("Actual","sum"),
-                    Prediccion=("Prediccion","sum"),Sesgo=("Error_Signado","sum")
-                ).reset_index().sort_values("Error_Total",ascending=False)
-                ranking["WAPE_SKU"]=100*ranking.Error_Total/ranking.Venta_Real.abs().replace(0,np.nan)
-                ranking["Aporte_Error_%"]=100*ranking.Error_Total/max(bt.Error_Abs.sum(),1)
-                ranking["Diagnostico"]=np.select(
-                    [ranking.Sesgo>0.2*ranking.Error_Total,ranking.Sesgo<-0.2*ranking.Error_Total],
-                    ["Sobreestimacion recurrente: revisar bajas, ceros o descontinuacion",
-                     "Subestimacion recurrente: revisar promocion, inventario o estacionalidad"],
-                    default="Error mixto: revisar precio, promocion e inventario"
+            # 1. Real versus predicción con línea perfecta.
+            st.markdown('### 1. Venta real vs. predicción')
+            maximo=float(max(bt['Actual'].max(),bt['Prediccion'].max(),1))
+            puntos=alt.Chart(bt).mark_circle(opacity=0.65).encode(
+                x=alt.X('Actual:Q',title='Venta real',axis=alt.Axis(format='$,.0f')),
+                y=alt.Y('Prediccion:Q',title='Venta predicha',axis=alt.Axis(format='$,.0f')),
+                color=alt.Color('Segmento:N',title='Segmento'),
+                size=alt.Size('Error_Abs:Q',title='Error absoluto',scale=alt.Scale(range=[25,500])),
+                tooltip=['CODIGO:N','DESCRIPCION:N','CATEGORIA:N','Periodo:O','Segmento:N',
+                         alt.Tooltip('Actual:Q',format='$,.2f'),alt.Tooltip('Prediccion:Q',format='$,.2f'),
+                         alt.Tooltip('Error_Abs:Q',format='$,.2f')]
+            )
+            diagonal=alt.Chart(pd.DataFrame({'Actual':[0,maximo],'Prediccion':[0,maximo]})).mark_line(
+                color='#d62728',strokeDash=[6,4]
+            ).encode(x='Actual:Q',y='Prediccion:Q')
+            st.altair_chart((puntos+diagonal).properties(height=430),use_container_width=True)
+
+            col_g1,col_g2=st.columns(2)
+            with col_g1:
+                # 2. Productos que más elevan RMSE.
+                top_rmse=(bt.groupby(['CODIGO','DESCRIPCION'],dropna=False,as_index=False)
+                            .agg(Error_Absoluto=('Error_Abs','sum'),Error_Cuadrado=('Error_Cuadrado','sum'),
+                                 Venta_Real=('Actual','sum'),Prediccion=('Prediccion','sum'))
+                            .nlargest(15,'Error_Cuadrado'))
+                top_rmse['Producto']=top_rmse['CODIGO'].astype(str)+' - '+top_rmse['DESCRIPCION'].fillna('').astype(str)
+                chart_rmse=alt.Chart(top_rmse).mark_bar().encode(
+                    x=alt.X('Error_Cuadrado:Q',title='Error cuadrático acumulado'),
+                    y=alt.Y('Producto:N',sort='-x',title=None),
+                    color=alt.Color('Error_Absoluto:Q',scale=alt.Scale(scheme='yelloworangered'),title='Error absoluto'),
+                    tooltip=['Producto:N',alt.Tooltip('Venta_Real:Q',format='$,.2f'),
+                             alt.Tooltip('Prediccion:Q',format='$,.2f'),alt.Tooltip('Error_Absoluto:Q',format='$,.2f')]
+                ).properties(height=470,title='Productos que más elevan el RMSE')
+                st.altair_chart(chart_rmse,use_container_width=True)
+
+            with col_g2:
+                # 3. Sesgo de los SKU con mayor error.
+                sesgo=(bt.groupby(['CODIGO','DESCRIPCION'],dropna=False,as_index=False)
+                         .agg(Error_Signo=('Error_Signo','sum'),Error_Abs=('Error_Abs','sum'))
+                         .nlargest(15,'Error_Abs'))
+                sesgo['Producto']=sesgo['CODIGO'].astype(str)+' - '+sesgo['DESCRIPCION'].fillna('').astype(str)
+                sesgo['Situacion']=np.where(sesgo['Error_Signo']>0,'Sobreestimación','Subestimación')
+                chart_sesgo=alt.Chart(sesgo).mark_bar().encode(
+                    x=alt.X('Error_Signo:Q',title='Predicción menos venta real',axis=alt.Axis(format='$,.0f')),
+                    y=alt.Y('Producto:N',sort='-x',title=None),
+                    color=alt.Color('Situacion:N',scale=alt.Scale(
+                        domain=['Sobreestimación','Subestimación'],range=['#d62728','#1f77b4'])),
+                    tooltip=['Producto:N','Situacion:N',alt.Tooltip('Error_Signo:Q',format='$,.2f')]
+                ).properties(height=470,title='Sobreestimación y subestimación')
+                st.altair_chart(chart_sesgo,use_container_width=True)
+
+            col_g3,col_g4=st.columns(2)
+            with col_g3:
+                # 4. Distribución de error, acotada solo en la vista.
+                hist_error=bt[bt['Error_Porcentual'].between(-200,200)].copy()
+                chart_hist=alt.Chart(hist_error).mark_bar(color='#4c78a8').encode(
+                    x=alt.X('Error_Porcentual:Q',bin=alt.Bin(maxbins=40),title='Error porcentual'),
+                    y=alt.Y('count():Q',title='Número de predicciones'),
+                    tooltip=[alt.Tooltip('count():Q',title='Predicciones')]
+                ).properties(height=340,title='Distribución del error porcentual (-200% a 200%)')
+                st.altair_chart(chart_hist,use_container_width=True)
+
+            with col_g4:
+                # 5. Pareto del error absoluto.
+                pareto=(bt.groupby(['CODIGO','DESCRIPCION'],dropna=False,as_index=False)
+                          .agg(Error_Abs=('Error_Abs','sum')).sort_values('Error_Abs',ascending=False))
+                pareto['Producto']=pareto['CODIGO'].astype(str)+' - '+pareto['DESCRIPCION'].fillna('').astype(str)
+                pareto['Porcentaje_Error']=100*pareto['Error_Abs']/max(pareto['Error_Abs'].sum(),1)
+                pareto['Porcentaje_Acumulado']=pareto['Porcentaje_Error'].cumsum()
+                pareto['Orden']=np.arange(1,len(pareto)+1)
+                p30=pareto.head(30)
+                barras=alt.Chart(p30).mark_bar(color='#4c78a8').encode(
+                    x=alt.X('Orden:O',title='Productos ordenados por error'),
+                    y=alt.Y('Error_Abs:Q',title='Error absoluto',axis=alt.Axis(format='$,.0f')),
+                    tooltip=['Producto:N',alt.Tooltip('Error_Abs:Q',format='$,.2f'),
+                             alt.Tooltip('Porcentaje_Acumulado:Q',format='.1f')]
                 )
-                st.dataframe(ranking.head(25),use_container_width=True,hide_index=True)
-                st.download_button("Descargar analisis de SKU extremos",ranking.to_csv(index=False).encode("utf-8-sig"),"sku_extremos_v8.csv","text/csv")
-            else:
-                st.info("No se detectaron errores extremos con percentil 95 y 2 veces el MAE.")
+                linea=alt.Chart(p30).mark_line(color='#e45756',point=True).encode(
+                    x='Orden:O',y=alt.Y('Porcentaje_Acumulado:Q',title='% acumulado',scale=alt.Scale(domain=[0,100]))
+                )
+                st.altair_chart(alt.layer(barras,linea).resolve_scale(y='independent').properties(
+                    height=340,title='Pareto del error de predicción'),use_container_width=True)
 
-            st.dataframe(bt.nlargest(15,"Error_Abs"),use_container_width=True,hide_index=True)
+            # 6. Tabla de los casos extremos debajo de las gráficas.
+            st.markdown('### Casos con mayor error absoluto')
+            st.dataframe(bt.nlargest(15,'Error_Abs'),use_container_width=True,hide_index=True)
 
-            if st.button("Entrenar modelo final con la mejor configuracion"):
-                with st.spinner("Entrenando modelo final una sola vez..."):
-                    f=crear_features(df).dropna(subset=["lag1","lag2","VENTA"]).copy(); med=f[FEATURES].median().fillna(0)
-                    modelo=nuevo_modelo(mejor[1],arboles_final); modelo.fit(f[FEATURES].fillna(med).astype("float32"),np.log1p(f.VENTA.clip(lower=0)))
-                    st.session_state.v7_modelo=(modelo,med,mejor[2]); st.session_state.v7_firma_modelo=firma
-
-        if st.session_state.v7_modelo is not None and st.session_state.v7_firma_modelo==firma:
-            modelo,med,mezcla=st.session_state.v7_modelo
-            historicos={c:g.sort_values("Periodo") for c,g in df.groupby("CODIGO",sort=False)}
-            ultimo=int(df.Periodo.max()); fecha=pd.Timestamp(ultimo//100,ultimo%100,1)
+        if st.session_state.modelo_cat is not None and st.session_state.firma_modelo_cat==firma:
+            modelo,medianas=st.session_state.modelo_cat
+            cfg_pred=st.session_state.cfg_opt if st.session_state.cfg_opt is not None else cfg
+            historicos={codigo:g.sort_values('Periodo') for codigo,g in df.groupby('CODIGO',sort=False)}
+            ultimos=df.sort_values('Periodo').groupby('CODIGO').tail(1)
+            opciones={r['CODIGO']:f"{r['CODIGO']} - {r.get('DESCRIPCION','')}" for _,r in ultimos.iterrows()}
+            codigo=st.selectbox('Producto',list(opciones),format_func=lambda x:opciones[x])
+            ultimo=int(df['Periodo'].max()); fecha=pd.Timestamp(ultimo//100,ultimo%100,1)
             periodos=[(fecha+pd.DateOffset(months=i)).year*100+(fecha+pd.DateOffset(months=i)).month for i in [1,2]]
-            if st.button("Generar proyeccion masiva"):
-                filas=[]
-                with st.spinner("Prediciendo sin reentrenar..."):
-                    for code,h in historicos.items():
-                        ps=predecir(modelo,med,h,periodos,mezcla); r=h.iloc[-1]
-                        filas.append({"CODIGO":code,"DESCRIPCION":r.get("DESCRIPCION",""),"CATEGORIA":r.get("CATEGORIA",""),
-                                      f"Pred_{periodos[0]}":ps[0],f"Pred_{periodos[1]}":ps[1]})
-                salida=pd.DataFrame(filas); st.dataframe(salida,use_container_width=True,hide_index=True)
-                nombre="todas" if categoria=="Todas" else re.sub(r"[^A-Za-z0-9]+","_",categoria)
-                st.download_button("Descargar proyeccion",salida.to_csv(index=False).encode("utf-8-sig"),f"prediccion_v8_{nombre}.csv","text/csv")
-        elif st.session_state.v7_modelo is not None:
-            st.warning("La categoria o configuracion cambio. Optimiza y entrena nuevamente.")
+            ps,segmentos=predecir(modelo,medianas,historicos[codigo],periodos,cfg_pred)
+            st.write(f"**{periodos[0]}:** ${ps[0]:,.2f} | **{periodos[1]}:** ${ps[1]:,.2f}")
+            hist_graf=historicos[codigo][['Periodo','VENTA']].copy()
+            hist_graf['Media 6 meses']=hist_graf['VENTA'].rolling(6,min_periods=2).mean()
+            hist_graf['Mediana 6 meses']=hist_graf['VENTA'].rolling(6,min_periods=2).median()
+            real_largo=hist_graf.melt(id_vars='Periodo',value_vars=['VENTA','Media 6 meses','Mediana 6 meses'],var_name='Tipo',value_name='Valor')
+            futuro=pd.DataFrame({'Periodo':periodos,'Valor':ps,'Tipo':'Proyectado'})
+            graf=pd.concat([real_largo,futuro],ignore_index=True)
+            chart_producto=alt.Chart(graf).mark_line(point=True).encode(
+                x=alt.X('Periodo:O',title='Periodo'),y=alt.Y('Valor:Q',title='Venta',axis=alt.Axis(format='$,.0f')),
+                color=alt.Color('Tipo:N'),tooltip=['Periodo:O','Tipo:N',alt.Tooltip('Valor:Q',format='$,.2f')]
+            ).properties(height=390,title='Historial, tendencia móvil y proyección')
+            st.altair_chart(chart_producto,use_container_width=True)
     except Exception as e:
+        st.error(str(e))
         st.exception(e)
