@@ -7,7 +7,7 @@ from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 st.set_page_config(page_title="Prediccion V7 RMSE", page_icon="📦", layout="wide")
-st.title("📦 Prediccion V7: optimizacion automatica de RMSE")
+st.title("📦 Prediccion V8: RMSE controlado y analisis de SKU extremos")
 st.caption("Busqueda rapida de hiperparametros, segmentador de categoria, cache y entrenamiento bajo demanda.")
 
 MESES={"ENERO":1,"FEBRERO":2,"MARZO":3,"ABRIL":4,"MAYO":5,"JUNIO":6,
@@ -16,7 +16,7 @@ LAGS=[1,2,3,4,6,12]
 VENTANAS=[3,6,12]
 FEATURES=([f"lag{x}" for x in LAGS]+[f"mean{x}" for x in VENTANAS]
           +[f"median{x}" for x in VENTANAS]+[f"std{x}" for x in VENTANAS]
-          +["sin_mes","cos_mes","ceros6","cv6"])
+          +["sin_mes","cos_mes","ceros6","cv6","es_promocion"])
 
 # Cuatro candidatos pequenos para que la seleccion automatica no tarde demasiado.
 CANDIDATOS=[
@@ -95,7 +95,14 @@ def cargar(archivos):
         x["MES_NUM"]=x.index.month; x["AÑO"]=x.index.year; x["Periodo"]=x.index.year*100+x.index.month
         for c in meta: x[c]=x[c].ffill().bfill()
         salida.append(x.reset_index(drop=True))
-    return pd.concat(salida,ignore_index=True).sort_values(["CODIGO","Periodo"]).reset_index(drop=True),omitidas
+    resultado=pd.concat(salida,ignore_index=True).sort_values(["CODIGO","Periodo"]).reset_index(drop=True)
+    texto=(resultado.get("DESCRIPCION",pd.Series("",index=resultado.index)).fillna("").astype(str)+" "+
+           resultado.get("TIPO",pd.Series("",index=resultado.index)).fillna("").astype(str)).str.upper()
+    resultado["ES_PROMOCION"]=texto.str.contains(
+        r"PACK|TRIPACK|COMBO|PROMO|GRATIS|BONUS|\+|IN ?& ?OUT|IN ?OUT",
+        regex=True,na=False
+    ).astype("int8")
+    return resultado,omitidas
 
 
 @st.cache_data(show_spinner=False)
@@ -109,6 +116,7 @@ def crear_features(df):
     z["sin_mes"]=np.sin(2*np.pi*z["MES_NUM"]/12); z["cos_mes"]=np.cos(2*np.pi*z["MES_NUM"]/12)
     z["ceros6"]=grp.transform(lambda s:s.shift(1).rolling(6,min_periods=2).apply(lambda a:(a==0).mean(),raw=True))
     z["cv6"]=(z["std6"]/z["mean6"].replace(0,np.nan)).clip(0,10)
+    z["es_promocion"]=z["ES_PROMOCION"].fillna(0).astype(float)
     return z
 
 
@@ -138,6 +146,7 @@ def vector(hist,mes,medianas):
     a6=v[-6:]; d["ceros6"]=np.mean(a6==0) if len(a6)>=2 else 0
     media=a6.mean() if len(a6) else 0; desv=a6.std(ddof=1) if len(a6)>=2 else 0
     d["cv6"]=min(desv/media,10) if media>0 else np.nan
+    d["es_promocion"]=float(hist.sort_values("Periodo").iloc[-1].get("ES_PROMOCION",0))
     return pd.DataFrame([d],columns=FEATURES).fillna(medianas).astype("float32")
 
 
@@ -180,7 +189,28 @@ def optimizar_rmse(df,arboles_busqueda):
             if mejor is None or m["RMSE"]<mejor[0]: mejor=(m["RMSE"],config.copy(),mezcla,bt)
             paso+=1; avance.progress(paso/total)
     avance.empty()
-    return pd.DataFrame(resultados).sort_values("RMSE"),mejor,train,held
+    tabla=pd.DataFrame(resultados)
+    # Selección restringida: bajar RMSE sin deteriorar WAPE/MAE de forma material.
+    base=tabla.loc[(tabla["max_depth"]==20)&(tabla["min_samples_leaf"]==2)&
+                   (tabla["max_features"]==1.0)&(tabla["mezcla_mediana"]==0.0)]
+    if base.empty:
+        base=tabla.nsmallest(1,"WAPE")
+    wape_base=float(base.iloc[0]["WAPE"])
+    mae_base=float(base.iloc[0]["MAE"])
+    elegibles=tabla[(tabla["WAPE"]<=wape_base+1.0)&(tabla["MAE"]<=mae_base*1.05)]
+    fila_mejor=(elegibles if not elegibles.empty else tabla).sort_values("RMSE").iloc[0]
+    clave=(int(fila_mejor["max_depth"]),int(fila_mejor["min_samples_leaf"]),
+           float(fila_mejor["max_features"]),float(fila_mejor["mezcla_mediana"]))
+    config_sel={"max_depth":clave[0],"min_samples_leaf":clave[1],"max_features":clave[2]}
+    # Recupera el backtest seleccionado sin reentrenar una segunda vez si coincide con el mejor bruto.
+    if (mejor[1]==config_sel and abs(mejor[2]-clave[3])<1e-9):
+        mejor_restringido=mejor
+    else:
+        modelo=nuevo_modelo(config_sel,arboles_busqueda)
+        modelo.fit(X,np.log1p(y.clip(lower=0)))
+        bt_sel=evaluar(modelo,medianas,train,held,clave[3])
+        mejor_restringido=(float(fila_mejor["RMSE"]),config_sel,clave[3],bt_sel)
+    return tabla.sort_values("RMSE"),mejor_restringido,train,held
 
 
 archivos=st.file_uploader("Sube ventas 2024, 2025 y 2026",type=["xlsx","xlsm"],accept_multiple_files=True)
@@ -213,8 +243,40 @@ if archivos:
             st.dataframe(resultados.style.format({"WAPE":"{:.2f}%","MAE":"${:,.2f}","RMSE":"${:,.2f}","R2":"{:.3f}"}),use_container_width=True,hide_index=True)
             bt=mejor[3].copy(); m=metricas(bt); a,b,c,d=st.columns(4)
             a.metric("WAPE",f"{m['WAPE']:.2f}%"); b.metric("MAE",f"${m['MAE']:,.2f}"); c.metric("RMSE",f"${m['RMSE']:,.2f}"); d.metric("R²",f"{m['R2']:.3f}")
-            st.info(f"Mejor configuracion RMSE: profundidad={mejor[1]['max_depth']}, hoja={mejor[1]['min_samples_leaf']}, variables={mejor[1]['max_features']}, mezcla mediana={mejor[2]:.0%}")
-            bt["Error_Abs"]=(bt.Actual-bt.Prediccion).abs(); st.dataframe(bt.nlargest(15,"Error_Abs"),use_container_width=True,hide_index=True)
+            st.info(f"Mejor configuracion restringida: profundidad={mejor[1]['max_depth']}, hoja={mejor[1]['min_samples_leaf']}, variables={mejor[1]['max_features']}, mezcla mediana={mejor[2]:.0%}")
+            bt["Error_Abs"]=(bt.Actual-bt.Prediccion).abs()
+            bt["Error_Signado"]=bt.Prediccion-bt.Actual
+            bt["TIPO_ERROR"]=np.where(bt.Error_Signado>0,"Sobreestimacion","Subestimacion")
+
+            st.subheader("SKU que generan errores extremos")
+            umbral=max(float(bt.Error_Abs.quantile(.95)),2*m["MAE"])
+            extremos=bt[bt.Error_Abs>=umbral].copy()
+            aporte=100*extremos.Error_Abs.sum()/max(bt.Error_Abs.sum(),1)
+            e1,e2,e3,e4=st.columns(4)
+            e1.metric("Umbral extremo",f"${umbral:,.2f}")
+            e2.metric("Observaciones",f"{len(extremos):,}")
+            e3.metric("SKU",f"{extremos.CODIGO.nunique():,}")
+            e4.metric("Aporte al error",f"{aporte:.1f}%")
+            if not extremos.empty:
+                ranking=extremos.groupby(["CODIGO","DESCRIPCION","CATEGORIA"],dropna=False).agg(
+                    Veces_Extremo=("Error_Abs","size"),Error_Total=("Error_Abs","sum"),
+                    Error_Maximo=("Error_Abs","max"),Venta_Real=("Actual","sum"),
+                    Prediccion=("Prediccion","sum"),Sesgo=("Error_Signado","sum")
+                ).reset_index().sort_values("Error_Total",ascending=False)
+                ranking["WAPE_SKU"]=100*ranking.Error_Total/ranking.Venta_Real.abs().replace(0,np.nan)
+                ranking["Aporte_Error_%"]=100*ranking.Error_Total/max(bt.Error_Abs.sum(),1)
+                ranking["Diagnostico"]=np.select(
+                    [ranking.Sesgo>0.2*ranking.Error_Total,ranking.Sesgo<-0.2*ranking.Error_Total],
+                    ["Sobreestimacion recurrente: revisar bajas, ceros o descontinuacion",
+                     "Subestimacion recurrente: revisar promocion, inventario o estacionalidad"],
+                    default="Error mixto: revisar precio, promocion e inventario"
+                )
+                st.dataframe(ranking.head(25),use_container_width=True,hide_index=True)
+                st.download_button("Descargar analisis de SKU extremos",ranking.to_csv(index=False).encode("utf-8-sig"),"sku_extremos_v8.csv","text/csv")
+            else:
+                st.info("No se detectaron errores extremos con percentil 95 y 2 veces el MAE.")
+
+            st.dataframe(bt.nlargest(15,"Error_Abs"),use_container_width=True,hide_index=True)
 
             if st.button("Entrenar modelo final con la mejor configuracion"):
                 with st.spinner("Entrenando modelo final una sola vez..."):
@@ -236,11 +298,8 @@ if archivos:
                                       f"Pred_{periodos[0]}":ps[0],f"Pred_{periodos[1]}":ps[1]})
                 salida=pd.DataFrame(filas); st.dataframe(salida,use_container_width=True,hide_index=True)
                 nombre="todas" if categoria=="Todas" else re.sub(r"[^A-Za-z0-9]+","_",categoria)
-                st.download_button("Descargar proyeccion",salida.to_csv(index=False).encode("utf-8-sig"),f"prediccion_v7_{nombre}.csv","text/csv")
+                st.download_button("Descargar proyeccion",salida.to_csv(index=False).encode("utf-8-sig"),f"prediccion_v8_{nombre}.csv","text/csv")
         elif st.session_state.v7_modelo is not None:
             st.warning("La categoria o configuracion cambio. Optimiza y entrena nuevamente.")
     except Exception as e:
         st.exception(e)
-
-
-
