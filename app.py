@@ -13,7 +13,7 @@ st.set_page_config(
     page_icon="📦",
     layout="wide",
 )
-st.title("📦 Simulador predictivo mensual optimizado, consulta acumulable por categoria, combo y descripcion")
+st.title("📦 Simulador predictivo V4.1 con estacionalidad consistente")
 st.caption(
     "Modelo global Extra Trees sobre log(venta), estacionalidad, rezagos "
     "y promedios moviles. Las graficas, segmentadores y segmentaciones son diagnosticas "
@@ -293,7 +293,7 @@ def ajustar_lista_estacional_avanzada(pred_base, historial, periodos, cfg_estaci
 
 
 @st.cache_data(show_spinner="Leyendo y normalizando archivos...", max_entries=3)
-def cargar(archivos, version_cache="v2-rapida-1"):
+def cargar(archivos, version_cache="v4-estacional-corregido-1"):
     partes = []
     columnas_utiles = {
         "CODIGO", "VENTA", "MES", "AÑO",
@@ -491,6 +491,34 @@ def crear_tabla_segmentacion(df):
     resumen["SEGMENTO"] = resumen["SEGMENTO"].astype(orden)
     resumen = resumen.sort_values("SEGMENTO").reset_index(drop=True)
     return detalle, resumen
+
+
+def normalizar_columnas_ajuste(bt):
+    """Compatibilidad entre nombres del ajuste estacional de versiones anteriores."""
+    bt = bt.copy()
+    equivalencias = {
+        "Ajuste_Estacional_Aplicado": "Ajuste_Aplicado",
+        "Indice_Nov_Dic": "Indice_Mes",
+    }
+    for anterior, actual in equivalencias.items():
+        if actual not in bt.columns and anterior in bt.columns:
+            bt[actual] = bt[anterior]
+
+    valores_default = {
+        "Prediccion_Base": bt["Prediccion"] if "Prediccion" in bt.columns else np.nan,
+        "Ajuste_Aplicado": False,
+        "Indice_Mes": 1.0,
+        "Venta_Mismo_Mes_Anterior": np.nan,
+        "Clase_Estacional": "NO_ESTACIONAL",
+        "Peso_V2_Aplicado": 1.0,
+        "Motivo_Ajuste": "Sin ajuste",
+    }
+    for columna, valor in valores_default.items():
+        if columna not in bt.columns:
+            bt[columna] = valor
+
+    bt["Ajuste_Aplicado"] = bt["Ajuste_Aplicado"].fillna(False).astype(bool)
+    return bt
 
 
 def preparar_diagnostico_backtest(bt, segmentos):
@@ -1118,6 +1146,7 @@ if archivos:
                 cfg_estacional=cfg_estacional,
             )
 
+            bt = normalizar_columnas_ajuste(bt)
             if bt.empty:
                 raise ValueError(
                     "El backtest no genero resultados. Revisa el historial disponible."
@@ -1144,7 +1173,7 @@ if archivos:
             mae_base = mean_absolute_error(y,p_base_bt)
             rmse_base = mean_squared_error(y,p_base_bt)**0.5
             r2_base = r2_score(y,p_base_bt)
-            ajustes_n = int(bt["Ajuste_Estacional_Aplicado"].sum())
+            ajustes_n = int(bt["Ajuste_Aplicado"].sum())
             st.info(
                 f"Las metricas principales usan la prediccion ajustada. "
                 f"Ajuste aplicado en {ajustes_n:,} registros del backtest."
@@ -1171,13 +1200,21 @@ if archivos:
             columnas_error = [
                 "CODIGO", "DESCRIPCION", "CATEGORIA", "TIPO", "SEGMENTO",
                 "Periodo_Real", "Mes_Predecido", "Actual",
-                "Prediccion_Base", "Prediccion", "Ajuste_Estacional_Aplicado",
-                "Indice_Nov_Dic", "Venta_Mismo_Mes_Anterior",
+                "Prediccion_Base", "Prediccion", "Ajuste_Aplicado",
+                "Indice_Mes", "Venta_Mismo_Mes_Anterior",
                 "Error_Abs", "Variacion_%",
             ]
+            columnas_error_disponibles = [
+                columna for columna in columnas_error
+                if columna in bt_visual.columns
+            ]
+            tabla_errores = (
+                bt_visual.nlargest(15, "Error_Abs")[columnas_error_disponibles]
+                if not bt_visual.empty
+                else bt_visual
+            )
             st.dataframe(
-                bt_visual.nlargest(15, "Error_Abs")[columnas_error]
-                if not bt_visual.empty else bt_visual,
+                tabla_errores,
                 use_container_width=True,
                 hide_index=True,
             )
@@ -1199,6 +1236,7 @@ if archivos:
                 bt_est = backtest_nov_dic_2025(
                     df, usar_ajuste_estacional, cfg_estacional
                 )
+            bt_est = normalizar_columnas_ajuste(bt_est)
             if bt_est.empty:
                 st.warning("No hay registros suficientes para validar Nov-Dic 2025.")
             else:
@@ -1366,7 +1404,10 @@ if archivos:
             with st.expander("Ver detalle del backtest de la seleccion"):
                 columnas_bt = [
                     "CODIGO", "DESCRIPCION", "CATEGORIA", "TIPO", "COMBOS",
-                    "Periodo_Real", "Mes_Predecido", "Actual", "Prediccion",
+                    "Periodo_Real", "Mes_Predecido", "Actual",
+                    "Prediccion_Base", "Prediccion", "Ajuste_Aplicado",
+                    "Clase_Estacional", "Indice_Mes", "Peso_V2_Aplicado",
+                    "Venta_Mismo_Mes_Anterior", "Motivo_Ajuste",
                     "Error_Abs", "Variacion_%",
                 ]
                 columnas_bt = [c for c in columnas_bt if c in bt_consulta.columns]
@@ -1575,6 +1616,7 @@ if archivos:
 
     except Exception as e:
         st.exception(e)
+
 
 
 
