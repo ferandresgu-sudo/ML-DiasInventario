@@ -13,11 +13,11 @@ st.set_page_config(
     page_icon="📦",
     layout="wide",
 )
-st.title("📦 Simulador predictivo mensual optimizado, consulta acumulable y ajuste estacional Nov-Dic")
+st.title("📦 Simulador predictivo mensual optimizado, consulta acumulable por categoria, combo y descripcion")
 st.caption(
     "Modelo global Extra Trees sobre log(venta), estacionalidad, rezagos "
     "y promedios moviles. Las graficas, segmentadores y segmentaciones son diagnosticas "
-    "y el ajuste estacional conserva la prediccion V2 como referencia base."
+    "y no modifican las predicciones."
 )
 
 MESES = {
@@ -176,86 +176,120 @@ def predecir_recursivo(modelo, medianas, historico, periodos):
     return preds
 
 
-def calcular_indice_estacional_nov_dic(historial, anio_limite=None):
-    """Calcula estacionalidad Nov-Dic usando solo años anteriores al objetivo."""
+def calcular_indices_estacionales_por_anio(historial, mes_objetivo, anio_limite=None):
+    """Indice del mes objetivo frente al promedio de los otros meses, por ano."""
     h = historial.sort_values("Periodo").copy()
     if anio_limite is not None:
         h = h[h["AÑO"] < anio_limite].copy()
 
-    temporada = h[h["MES_NUM"].isin([11, 12])]["VENTA"].astype(float)
-    resto = h[~h["MES_NUM"].isin([11, 12])]["VENTA"].astype(float)
+    indices = {}
+    for anio, datos in h.groupby("AÑO"):
+        datos = datos.sort_values("MES_NUM")
+        venta_mes = datos.loc[datos["MES_NUM"] == mes_objetivo, "VENTA"]
+        resto = datos.loc[datos["MES_NUM"] != mes_objetivo, "VENTA"]
+        if len(venta_mes) >= 1 and len(resto) >= 6:
+            base = float(resto.mean())
+            if base > 0:
+                indices[int(anio)] = float(venta_mes.mean() / base)
+    return indices
 
-    if len(temporada) < 2 or len(resto) < 6:
-        return 1.0
-    promedio_resto = float(resto.mean())
-    if promedio_resto <= 0:
-        return 1.0
-    return float(temporada.mean() / promedio_resto)
+
+def clasificar_estacionalidad(historial, periodo_objetivo, umbral_nov=1.30, umbral_dic=1.50):
+    """Clasifica NO_ESTACIONAL, POSIBLE o CONFIRMADA sin usar datos futuros."""
+    mes = int(periodo_objetivo % 100)
+    anio = int(periodo_objetivo // 100)
+    if mes not in [11, 12]:
+        return "NO_ESTACIONAL", 1.0, {}, 0
+
+    umbral = umbral_nov if mes == 11 else umbral_dic
+    indices = calcular_indices_estacionales_por_anio(
+        historial, mes_objetivo=mes, anio_limite=anio
+    )
+    cumple = sum(indice >= umbral for indice in indices.values())
+    indice_promedio = float(np.mean(list(indices.values()))) if indices else 1.0
+
+    if cumple >= 2:
+        clase = "CONFIRMADA"
+    elif cumple == 1:
+        clase = "POSIBLE"
+    else:
+        clase = "NO_ESTACIONAL"
+    return clase, indice_promedio, indices, cumple
 
 
-def ajustar_prediccion_estacional(
-    prediccion_modelo,
+def ajustar_prediccion_estacional_avanzada(
+    pred_base,
     historial,
-    periodo_objetivo,
-    peso_modelo=0.60,
-    umbral_estacional=1.40,
+    periodo,
+    peso_confirmada=0.70,
+    peso_posible=0.85,
+    peso_combo=0.85,
+    umbral_nov=1.30,
+    umbral_dic=1.50,
+    min_meses_combo_recurrente=8,
 ):
-    """
-    Combina V2 con el mismo mes del año anterior solo para SKU estacionales
-    y objetivos de noviembre/diciembre. No altera la predicción base.
-    """
+    """Ajuste selectivo por mes, consistencia anual y naturaleza de combo."""
     h = historial.sort_values("Periodo").copy()
-    mes_objetivo = int(periodo_objetivo % 100)
-    anio_objetivo = int(periodo_objetivo // 100)
-
-    if mes_objetivo not in [11, 12]:
-        return float(prediccion_modelo), 1.0, np.nan, False
-
-    indice = calcular_indice_estacional_nov_dic(
-        h, anio_limite=anio_objetivo
+    mes = int(periodo % 100)
+    anio = int(periodo // 100)
+    clase, indice, indices_anuales, anios_cumple = clasificar_estacionalidad(
+        h, periodo, umbral_nov, umbral_dic
     )
-    es_estacional = indice >= umbral_estacional
-    if not es_estacional:
-        return float(prediccion_modelo), indice, np.nan, False
 
-    mismo_mes = h[
-        (h["MES_NUM"] == mes_objetivo)
-        & (h["AÑO"] < anio_objetivo)
-    ].sort_values("AÑO")
+    diagnostico = {
+        "Clase_Estacional": clase,
+        "Indice_Mes": indice,
+        "Indices_Anuales": str(indices_anuales),
+        "Anios_Cumple": anios_cumple,
+        "Venta_Mismo_Mes_Anterior": np.nan,
+        "Peso_V2_Aplicado": 1.0,
+        "Ajuste_Aplicado": False,
+        "Motivo_Ajuste": "Sin ajuste",
+    }
+    if mes not in [11, 12] or clase == "NO_ESTACIONAL":
+        return float(pred_base), diagnostico
 
-    if mismo_mes.empty:
-        return float(prediccion_modelo), indice, np.nan, False
+    referencia = h[(h["MES_NUM"] == mes) & (h["AÑO"] < anio)].sort_values("AÑO")
+    if referencia.empty:
+        diagnostico["Motivo_Ajuste"] = "Sin referencia anual"
+        return float(pred_base), diagnostico
 
-    venta_anio_anterior = float(mismo_mes.iloc[-1]["VENTA"])
-    pred_ajustada = (
-        peso_modelo * float(prediccion_modelo)
-        + (1.0 - peso_modelo) * venta_anio_anterior
-    )
-    return max(0.0, pred_ajustada), indice, venta_anio_anterior, True
+    venta_anterior = float(referencia.iloc[-1]["VENTA"])
+    es_combo = int(h.iloc[-1].get("COMBOS", 0)) == 1
+    activos_12 = int((h.tail(12)["VENTA"].astype(float) > 0).sum())
+
+    if es_combo:
+        if activos_12 < min_meses_combo_recurrente:
+            diagnostico["Motivo_Ajuste"] = "Combo eventual: conserva V2"
+            return float(pred_base), diagnostico
+        peso = peso_combo
+        motivo = "Combo recurrente estacional"
+    elif clase == "CONFIRMADA":
+        peso = peso_confirmada
+        motivo = "Estacionalidad confirmada"
+    else:
+        peso = peso_posible
+        motivo = "Estacionalidad posible"
+
+    final = peso * float(pred_base) + (1.0 - peso) * venta_anterior
+    diagnostico.update({
+        "Venta_Mismo_Mes_Anterior": venta_anterior,
+        "Peso_V2_Aplicado": peso,
+        "Ajuste_Aplicado": True,
+        "Motivo_Ajuste": motivo,
+    })
+    return max(0.0, final), diagnostico
 
 
-def ajustar_lista_estacional(
-    predicciones_base,
-    historial,
-    periodos,
-    peso_modelo=0.60,
-    umbral_estacional=1.40,
-):
-    ajustadas, diagnostico = [], []
-    for pred_base, periodo in zip(predicciones_base, periodos):
-        pred_aj, indice, referencia, aplicado = ajustar_prediccion_estacional(
-            pred_base, historial, periodo, peso_modelo, umbral_estacional
+def ajustar_lista_estacional_avanzada(pred_base, historial, periodos, cfg_estacional):
+    finales, diagnosticos = [], []
+    for pred, periodo in zip(pred_base, periodos):
+        final, diag = ajustar_prediccion_estacional_avanzada(
+            pred, historial, periodo, **cfg_estacional
         )
-        ajustadas.append(pred_aj)
-        diagnostico.append({
-            "Periodo": periodo,
-            "Pred_Base": float(pred_base),
-            "Pred_Ajustada": float(pred_aj),
-            "Indice_Nov_Dic": float(indice),
-            "Venta_Mismo_Mes_Anterior": referencia,
-            "Ajuste_Aplicado": aplicado,
-        })
-    return ajustadas, diagnostico
+        finales.append(final)
+        diagnosticos.append(diag)
+    return finales, diagnosticos
 
 
 @st.cache_data(show_spinner="Leyendo y normalizando archivos...", max_entries=3)
@@ -338,43 +372,64 @@ def cargar(archivos, version_cache="v2-rapida-1"):
 
 
 @st.cache_data(show_spinner=False)
-def backtest(df, n_holdout=2):
+def backtest(df, n_holdout=2, usar_ajuste=True, cfg_estacional=None):
+    cfg_estacional = cfg_estacional or {}
     tamanos = df.groupby("CODIGO").size()
     codigos = tamanos[tamanos >= n_holdout + 3].index
     base = df[df.CODIGO.isin(codigos)].copy()
-
     held = base.groupby("CODIGO", group_keys=False).tail(n_holdout)
     train = base.drop(index=held.index)
-    modelo, medianas = entrenar(train)
+    return ejecutar_backtest_sobre_corte(train, held, usar_ajuste, cfg_estacional)
 
+
+def ejecutar_backtest_sobre_corte(train, held, usar_ajuste, cfg_estacional):
+    modelo, medianas = entrenar(train)
     filas = []
     for codigo, real in held.groupby("CODIGO"):
         real = real.sort_values("Periodo")
         hist = train[train.CODIGO == codigo].sort_values("Periodo")
-        pred = predecir_recursivo(
-            modelo,
-            medianas,
-            hist,
-            real.Periodo.astype(int).tolist(),
-        )
+        if hist.empty:
+            continue
+        periodos = real.Periodo.astype(int).tolist()
+        pred_base = predecir_recursivo(modelo, medianas, hist, periodos)
+        if usar_ajuste:
+            pred_final, diag = ajustar_lista_estacional_avanzada(
+                pred_base, hist, periodos, cfg_estacional
+            )
+        else:
+            pred_final = list(pred_base)
+            diag = [{
+                "Clase_Estacional": "DESACTIVADO", "Indice_Mes": 1.0,
+                "Indices_Anuales": "{}", "Anios_Cumple": 0,
+                "Venta_Mismo_Mes_Anterior": np.nan, "Peso_V2_Aplicado": 1.0,
+                "Ajuste_Aplicado": False, "Motivo_Ajuste": "Ajuste desactivado",
+            } for _ in periodos]
 
-        for paso, ((_, r), p) in enumerate(
-            zip(real.iterrows(), pred),
-            1,
+        for paso, ((_, r), pb, pf, d) in enumerate(
+            zip(real.iterrows(), pred_base, pred_final, diag), 1
         ):
             filas.append({
-                "CODIGO": codigo,
-                "DESCRIPCION": r.get("DESCRIPCION", ""),
-                "CATEGORIA": r.get("CATEGORIA", ""),
-                "TIPO": r.get("TIPO", ""),
-                "COMBOS": int(r.get("COMBOS", 0)),
-                "Periodo_Real": int(r.Periodo),
-                "Mes_Predecido": paso,
-                "Prediccion": p,
-                "Actual": float(r.VENTA),
+                "CODIGO": codigo, "DESCRIPCION": r.get("DESCRIPCION", ""),
+                "CATEGORIA": r.get("CATEGORIA", ""), "TIPO": r.get("TIPO", ""),
+                "COMBOS": int(r.get("COMBOS", 0)), "Periodo_Real": int(r.Periodo),
+                "Mes_Predecido": paso, "Prediccion_Base": float(pb),
+                "Prediccion": float(pf), "Actual": float(r.VENTA),
+                **d,
             })
-
     return pd.DataFrame(filas)
+
+
+@st.cache_data(show_spinner=False)
+def backtest_nov_dic_2025(df, usar_ajuste=True, cfg_estacional=None):
+    """Validacion correcta de temporada: entrena hasta 202510 y evalua 202511-202512."""
+    cfg_estacional = cfg_estacional or {}
+    train = df[df["Periodo"] <= 202510].copy()
+    held = df[df["Periodo"].isin([202511, 202512])].copy()
+    codigos_validos = train.groupby("CODIGO").size()
+    codigos_validos = codigos_validos[codigos_validos >= 5].index
+    train = train[train["CODIGO"].isin(codigos_validos)]
+    held = held[held["CODIGO"].isin(codigos_validos)]
+    return ejecutar_backtest_sobre_corte(train, held, usar_ajuste, cfg_estacional)
 
 # =========================================================
 # FUNCIONES DIAGNOSTICAS, NO INTERVIENEN EN EL MODELO
@@ -987,29 +1042,26 @@ archivos = st.file_uploader(
 )
 
 with st.sidebar:
-    st.header("Ajuste estacional")
-    usar_ajuste_estacional = st.checkbox(
-        "Activar ajuste Nov-Dic", value=True
-    )
-    peso_modelo_estacional = st.slider(
-        "Peso de la prediccion V2",
-        min_value=0.50,
-        max_value=0.90,
-        value=0.60,
-        step=0.05,
-        help="El resto del peso se asigna a la venta del mismo mes del año anterior.",
-    )
-    umbral_estacional = st.slider(
-        "Umbral indice Nov-Dic",
-        min_value=1.10,
-        max_value=2.50,
-        value=1.40,
-        step=0.05,
-    )
+    st.header("Ajuste estacional avanzado")
+    usar_ajuste_estacional = st.checkbox("Activar ajuste", value=True)
+    peso_confirmada = st.slider("Peso V2: estacional confirmada", 0.50, 0.90, 0.70, 0.05)
+    peso_posible = st.slider("Peso V2: estacional posible", 0.70, 0.95, 0.85, 0.05)
+    peso_combo = st.slider("Peso V2: combo recurrente", 0.70, 0.95, 0.85, 0.05)
+    umbral_nov = st.slider("Umbral noviembre", 1.10, 2.50, 1.30, 0.05)
+    umbral_dic = st.slider("Umbral diciembre", 1.10, 3.00, 1.50, 0.05)
+    min_meses_combo = st.slider("Meses activos para combo recurrente", 4, 12, 8)
 
 if archivos:
     try:
         df = cargar(archivos)
+        cfg_estacional = {
+            "peso_confirmada": peso_confirmada,
+            "peso_posible": peso_posible,
+            "peso_combo": peso_combo,
+            "umbral_nov": umbral_nov,
+            "umbral_dic": umbral_dic,
+            "min_meses_combo_recurrente": min_meses_combo,
+        }
         st.success(
             f"{len(df):,} observaciones mensuales normalizadas | "
             f"{df.CODIGO.nunique():,} productos"
@@ -1060,7 +1112,11 @@ if archivos:
         holdout = st.slider("Meses de backtest", 1, 4, 2)
 
         with st.spinner("Entrenando y validando..."):
-            bt = backtest(df, holdout)
+            bt = backtest(
+                df, holdout,
+                usar_ajuste=usar_ajuste_estacional,
+                cfg_estacional=cfg_estacional,
+            )
 
             if bt.empty:
                 raise ValueError(
@@ -1083,6 +1139,25 @@ if archivos:
             )
             c4.metric("R²", f"{r2_score(y, p):.3f}")
 
+            p_base_bt = bt["Prediccion_Base"].to_numpy(float)
+            wape_base = 100 * np.abs(y-p_base_bt).sum() / max(np.abs(y).sum(),1)
+            mae_base = mean_absolute_error(y,p_base_bt)
+            rmse_base = mean_squared_error(y,p_base_bt)**0.5
+            r2_base = r2_score(y,p_base_bt)
+            ajustes_n = int(bt["Ajuste_Estacional_Aplicado"].sum())
+            st.info(
+                f"Las metricas principales usan la prediccion ajustada. "
+                f"Ajuste aplicado en {ajustes_n:,} registros del backtest."
+            )
+            with st.expander("Comparar metricas ajustadas vs V2 base"):
+                comp = pd.DataFrame({
+                    "Metrica":["WAPE","MAE","RMSE","R2"],
+                    "V2 Base":[wape_base,mae_base,rmse_base,r2_base],
+                    "Ajustada":[wape,mean_absolute_error(y,p),mean_squared_error(y,p)**0.5,r2_score(y,p)],
+                })
+                comp["Cambio"] = comp["Ajustada"]-comp["V2 Base"]
+                st.dataframe(comp,use_container_width=True,hide_index=True)
+
             bt_diag = preparar_diagnostico_backtest(
                 bt,
                 segmentos_detalle,
@@ -1095,7 +1170,9 @@ if archivos:
             st.subheader("Predicciones con mayor error absoluto")
             columnas_error = [
                 "CODIGO", "DESCRIPCION", "CATEGORIA", "TIPO", "SEGMENTO",
-                "Periodo_Real", "Mes_Predecido", "Actual", "Prediccion",
+                "Periodo_Real", "Mes_Predecido", "Actual",
+                "Prediccion_Base", "Prediccion", "Ajuste_Estacional_Aplicado",
+                "Indice_Nov_Dic", "Venta_Mismo_Mes_Anterior",
                 "Error_Abs", "Variacion_%",
             ]
             st.dataframe(
@@ -1111,6 +1188,49 @@ if archivos:
                 "backtest_v2_con_diagnostico.csv",
                 "text/csv",
             )
+
+        st.subheader("Validacion especifica Noviembre-Diciembre 2025")
+        st.caption(
+            "Entrena solo con datos hasta octubre de 2025 y evalua noviembre y diciembre "
+            "de 2025. Esta es la validacion correcta para decidir pesos y umbrales estacionales."
+        )
+        if st.button("Ejecutar validacion estacional 2025", type="primary"):
+            with st.spinner("Validando temporada 2025..."):
+                bt_est = backtest_nov_dic_2025(
+                    df, usar_ajuste_estacional, cfg_estacional
+                )
+            if bt_est.empty:
+                st.warning("No hay registros suficientes para validar Nov-Dic 2025.")
+            else:
+                y_est = bt_est["Actual"].to_numpy(float)
+                p_est = bt_est["Prediccion"].to_numpy(float)
+                pb_est = bt_est["Prediccion_Base"].to_numpy(float)
+                def resumen_metricas(yv, pv):
+                    return {
+                        "WAPE": 100*np.abs(yv-pv).sum()/max(np.abs(yv).sum(),1),
+                        "MAE": mean_absolute_error(yv,pv),
+                        "RMSE": mean_squared_error(yv,pv)**0.5,
+                        "R2": r2_score(yv,pv),
+                    }
+                mb = resumen_metricas(y_est, pb_est)
+                ma = resumen_metricas(y_est, p_est)
+                comp = pd.DataFrame([
+                    {"Modelo":"V2 Base", **mb},
+                    {"Modelo":"Ajuste estacional avanzado", **ma},
+                ])
+                st.dataframe(comp.style.format({
+                    "WAPE":"{:.2f}%", "MAE":"${:,.2f}",
+                    "RMSE":"${:,.2f}", "R2":"{:.3f}",
+                }), use_container_width=True, hide_index=True)
+                st.info(
+                    f"Ajustes aplicados: {int(bt_est['Ajuste_Aplicado'].sum()):,} "
+                    f"de {len(bt_est):,} registros."
+                )
+                st.download_button(
+                    "Descargar validacion Nov-Dic 2025",
+                    bt_est.to_csv(index=False).encode("utf-8-sig"),
+                    "backtest_nov_dic_2025.csv", "text/csv",
+                )
 
         # Entrenamiento final original, sin cambios.
         modelo, medianas = entrenar(df)
@@ -1283,30 +1403,16 @@ if archivos:
         predicciones_sku = []
         for codigo in codigos_seleccionados:
             hist_producto = historicos_por_codigo[codigo]
-            pred_producto = predecir_recursivo(
-                modelo,
-                medianas,
-                hist_producto,
-                periodos,
+            pred_producto_base = predecir_recursivo(
+                modelo, medianas, hist_producto, periodos
             )
             if usar_ajuste_estacional:
-                pred_ajustada, diag_est = ajustar_lista_estacional(
-                    pred_producto,
-                    hist_producto,
-                    periodos,
-                    peso_modelo=peso_modelo_estacional,
-                    umbral_estacional=umbral_estacional,
+                pred_producto, diag_est = ajustar_lista_estacional_avanzada(
+                    pred_producto_base, hist_producto, periodos, cfg_estacional
                 )
             else:
-                pred_ajustada = list(pred_producto)
-                diag_est = [
-                    {
-                        "Indice_Nov_Dic": calcular_indice_estacional_nov_dic(hist_producto),
-                        "Venta_Mismo_Mes_Anterior": np.nan,
-                        "Ajuste_Aplicado": False,
-                    }
-                    for _ in periodos
-                ]
+                pred_producto = list(pred_producto_base)
+                diag_est = [{"Indice_Mes": 1.0, "Ajuste_Aplicado": False} for _ in periodos]
             meta_producto = seleccion_sku[
                 seleccion_sku["CODIGO"] == codigo
             ].iloc[0]
@@ -1315,39 +1421,29 @@ if archivos:
                 "DESCRIPCION": meta_producto.get("DESCRIPCION", ""),
                 "CATEGORIA": meta_producto.get("CATEGORIA", ""),
                 "COMBOS": int(meta_producto.get("COMBOS", 0)),
-                f"Pred Base {periodos[0]}": pred_producto[0],
-                f"Pred Ajustada {periodos[0]}": pred_ajustada[0],
-                f"Pred Base {periodos[1]}": pred_producto[1],
-                f"Pred Ajustada {periodos[1]}": pred_ajustada[1],
-                "Indice_Nov_Dic": diag_est[0]["Indice_Nov_Dic"],
-                f"Referencia {periodos[0]}": diag_est[0]["Venta_Mismo_Mes_Anterior"],
-                f"Referencia {periodos[1]}": diag_est[1]["Venta_Mismo_Mes_Anterior"],
+                f"Pred Base {periodos[0]}": pred_producto_base[0],
+                f"Pred {periodos[0]}": pred_producto[0],
+                f"Pred Base {periodos[1]}": pred_producto_base[1],
+                f"Pred {periodos[1]}": pred_producto[1],
+                "Indice_Mes": diag_est[0]["Indice_Mes"],
                 "Ajuste_Estacional": any(d["Ajuste_Aplicado"] for d in diag_est),
             })
 
         detalle_pred = pd.DataFrame(predicciones_sku)
-        pred_base_acum = [
-            float(detalle_pred[f"Pred Base {periodos[0]}"].sum()),
-            float(detalle_pred[f"Pred Base {periodos[1]}"].sum()),
-        ]
         pred_acum = [
-            float(detalle_pred[f"Pred Ajustada {periodos[0]}"].sum()),
-            float(detalle_pred[f"Pred Ajustada {periodos[1]}"].sum()),
+            float(detalle_pred[f"Pred {periodos[0]}"].sum()),
+            float(detalle_pred[f"Pred {periodos[1]}"].sum()),
         ]
 
         pc1, pc2, pc3 = st.columns(3)
         pc1.metric("SKU acumulados", f"{len(codigos_seleccionados):,}")
         pc2.metric(
-            f"Prediccion ajustada {periodos[0]}",
+            f"Prediccion acumulada {periodos[0]}",
             f"${pred_acum[0]:,.2f}",
-            delta=f"Base V2: ${pred_base_acum[0]:,.2f}",
-            delta_color="off",
         )
         pc3.metric(
-            f"Prediccion ajustada {periodos[1]}",
+            f"Prediccion acumulada {periodos[1]}",
             f"${pred_acum[1]:,.2f}",
-            delta=f"Base V2: ${pred_base_acum[1]:,.2f}",
-            delta_color="off",
         )
 
         real_graf = hist_acumulado.rename(columns={"VENTA": "Valor"})
@@ -1403,22 +1499,22 @@ if archivos:
 
         # Participacion de cada SKU en la proyeccion acumulada.
         detalle_pred[f"Participacion {periodos[0]} %"] = (
-            100 * detalle_pred[f"Pred Ajustada {periodos[0]}"]
+            100 * detalle_pred[f"Pred {periodos[0]}"]
             / max(pred_acum[0], 1)
         )
         detalle_pred[f"Participacion {periodos[1]} %"] = (
-            100 * detalle_pred[f"Pred Ajustada {periodos[1]}"]
+            100 * detalle_pred[f"Pred {periodos[1]}"]
             / max(pred_acum[1], 1)
         )
         detalle_pred = detalle_pred.sort_values(
-            f"Pred Ajustada {periodos[0]}", ascending=False
+            f"Pred {periodos[0]}", ascending=False
         )
 
         with st.expander("Ver aportacion de cada SKU al acumulado"):
             st.dataframe(
                 detalle_pred.style.format({
-                    f"Pred Ajustada {periodos[0]}": "${:,.2f}",
-                    f"Pred Ajustada {periodos[1]}": "${:,.2f}",
+                    f"Pred {periodos[0]}": "${:,.2f}",
+                    f"Pred {periodos[1]}": "${:,.2f}",
                     f"Participacion {periodos[0]} %": "{:.2f}%",
                     f"Participacion {periodos[1]} %": "{:.2f}%",
                 }),
@@ -1430,25 +1526,14 @@ if archivos:
         filas = []
         for _, r in ult.iterrows():
             h = historicos_por_codigo[r.CODIGO]
-            pr = predecir_recursivo(
-                modelo,
-                medianas,
-                h,
-                periodos,
-            )
+            pr_base = predecir_recursivo(modelo, medianas, h, periodos)
             if usar_ajuste_estacional:
-                pr_ajustada, diag_pr = ajustar_lista_estacional(
-                    pr, h, periodos,
-                    peso_modelo=peso_modelo_estacional,
-                    umbral_estacional=umbral_estacional,
+                pr, diag_pr = ajustar_lista_estacional_avanzada(
+                    pr_base, h, periodos, cfg_estacional
                 )
             else:
-                pr_ajustada = list(pr)
-                diag_pr = [
-                    {"Indice_Nov_Dic": calcular_indice_estacional_nov_dic(h),
-                     "Ajuste_Aplicado": False}
-                    for _ in periodos
-                ]
+                pr = list(pr_base)
+                diag_pr = [{"Indice_Mes": 1.0, "Ajuste_Aplicado": False} for _ in periodos]
             segmento = segmentos_detalle.loc[
                 segmentos_detalle["CODIGO"] == r.CODIGO,
                 "SEGMENTO",
@@ -1466,11 +1551,11 @@ if archivos:
                 "TIPO": r.get("TIPO", ""),
                 "COMBOS": int(r.get("COMBOS", 0)),
                 "SEGMENTO_DIAGNOSTICO": segmento,
-                f"Pred Base {periodos[0]}": pr[0],
-                f"Pred Ajustada {periodos[0]}": pr_ajustada[0],
-                f"Pred Base {periodos[1]}": pr[1],
-                f"Pred Ajustada {periodos[1]}": pr_ajustada[1],
-                "INDICE_NOV_DIC": diag_pr[0]["Indice_Nov_Dic"],
+                f"Pred Base {periodos[0]}": pr_base[0],
+                f"Pred {periodos[0]}": pr[0],
+                f"Pred Base {periodos[1]}": pr_base[1],
+                f"Pred {periodos[1]}": pr[1],
+                "INDICE_MES": diag_pr[0]["Indice_Mes"],
                 "AJUSTE_ESTACIONAL": any(d["Ajuste_Aplicado"] for d in diag_pr),
             })
 
@@ -1490,5 +1575,7 @@ if archivos:
 
     except Exception as e:
         st.exception(e)
+
+
 
 
