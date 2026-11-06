@@ -1350,17 +1350,23 @@ if archivos:
             delta_color="off",
         )
 
-        real_graf = hist_acumulado.rename(columns={"VENTA": "Valor"})
+        real_graf = hist_acumulado.rename(columns={"VENTA": "Valor"}).copy()
         real_graf["Serie"] = "Venta historica acumulada"
+
+        # Conexion visual: la proyeccion comienza en el ultimo punto historico.
+        # Este punto compartido solo afecta la apariencia de la grafica.
+        # No modifica las predicciones, metricas ni acumulados.
+        ultimo_real = real_graf.sort_values("Periodo").iloc[-1]
         futuro_graf = pd.DataFrame({
-            "Periodo": periodos,
-            "Valor": pred_acum,
+            "Periodo": [int(ultimo_real["Periodo"])] + periodos,
+            "Valor": [float(ultimo_real["Valor"])] + pred_acum,
             "Serie": "Proyeccion acumulada",
         })
+
         graf_consulta = pd.concat(
             [real_graf, futuro_graf],
             ignore_index=True,
-        )
+        ).sort_values(["Serie", "Periodo"])
 
         chart_consulta = (
             alt.Chart(graf_consulta)
@@ -1369,12 +1375,14 @@ if archivos:
                 x=alt.X(
                     "Periodo:O",
                     title="Periodo",
+                    sort="ascending",
                     axis=alt.Axis(labelAngle=-45),
                 ),
                 y=alt.Y(
                     "Valor:Q",
                     title="Venta acumulada",
                     axis=alt.Axis(format="$,.0f"),
+                    scale=alt.Scale(zero=False),
                 ),
                 color=alt.Color(
                     "Serie:N",
@@ -1387,6 +1395,8 @@ if archivos:
                         range=["#1f77b4", "#ff7f0e"],
                     ),
                 ),
+                detail="Serie:N",
+                order=alt.Order("Periodo:O", sort="ascending"),
                 tooltip=[
                     "Periodo:O",
                     "Serie:N",
@@ -1490,3 +1500,6 @@ if archivos:
 
     except Exception as e:
         st.exception(e)
+
+
+
