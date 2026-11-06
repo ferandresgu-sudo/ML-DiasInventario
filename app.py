@@ -15,7 +15,7 @@ st.set_page_config(
 st.title("📦 Consulta acumulable de ventas y proyecciones")
 st.caption(
     "Consulta acumulable por categoria, combo y descripcion, con interpretacion "
-    "del indice estacional y del peso aplicado a la prediccion V2."
+    "del indice estacional y del peso aplicado a los meses historicos."
 )
 
 MESES = {
@@ -989,14 +989,20 @@ with st.sidebar:
     usar_ajuste_estacional = st.checkbox(
         "Activar ajuste Nov-Dic", value=True
     )
-    peso_modelo_estacional = st.slider(
-        "Peso de la prediccion V2",
-        min_value=0.50,
-        max_value=0.90,
-        value=0.60,
+    peso_meses_historicos = st.slider(
+        "Peso de los meses historicos Nov-Dic",
+        min_value=0.00,
+        max_value=1.00,
+        value=0.40,
         step=0.05,
-        help="El resto del peso se asigna a la venta del mismo mes del año anterior.",
+        help=(
+            "Define cuanto pesa la venta del mismo mes del año anterior. "
+            "Ejemplo: 0.70 significa 70% mes historico y 30% prediccion V2."
+        ),
     )
+    # La funcion existente recibe el peso de V2. Se calcula como complemento
+    # para conservar exactamente la misma formula del ajuste estacional.
+    peso_modelo_estacional = 1.00 - peso_meses_historicos
     umbral_estacional = st.slider(
         "Umbral indice Nov-Dic",
         min_value=1.10,
@@ -1307,16 +1313,18 @@ if archivos:
         porcentaje_anterior = 100 - porcentaje_v2
         incremento_umbral = int(round((umbral_estacional - 1.0) * 100))
 
-        if peso_modelo_estacional >= 0.90:
-            interpretacion_peso = "Ajuste muy ligero"
-        elif peso_modelo_estacional >= 0.80:
+        if peso_meses_historicos <= 0.10:
+            interpretacion_peso = "Ajuste muy ligero: predomina V2"
+        elif peso_meses_historicos <= 0.20:
             interpretacion_peso = "Ajuste conservador"
-        elif peso_modelo_estacional >= 0.70:
+        elif peso_meses_historicos <= 0.30:
             interpretacion_peso = "Ajuste moderado"
-        elif peso_modelo_estacional >= 0.60:
+        elif peso_meses_historicos <= 0.50:
             interpretacion_peso = "Ajuste estacional fuerte"
+        elif peso_meses_historicos < 1.00:
+            interpretacion_peso = "Alta dependencia del mes historico"
         else:
-            interpretacion_peso = "Alta dependencia del año anterior"
+            interpretacion_peso = "Usa solamente el mismo mes del año anterior"
 
         if umbral_estacional < 1.20:
             interpretacion_umbral = "Detecta estacionalidad ligera"
@@ -1330,9 +1338,9 @@ if archivos:
         i1, i2 = st.columns(2)
         with i1:
             st.metric(
-                "Peso actual de la prediccion V2",
-                f"{peso_modelo_estacional:.2f}",
-                help="Porcentaje de confianza asignado al modelo Extra Trees V2.",
+                "Peso actual de los meses historicos",
+                f"{peso_meses_historicos:.2f}",
+                help="Porcentaje asignado a la venta del mismo mes del año anterior.",
             )
             st.write(
                 f"**{porcentaje_v2}%** proviene de la prediccion V2 y "
@@ -1374,36 +1382,39 @@ if archivos:
                 f"{umbral_estacional:.2f} o superior para recibir el ajuste."
             )
 
-        with st.expander("Ver como interpretar el peso V2", expanded=False):
+        with st.expander("Ver como interpretar el peso de los meses historicos", expanded=False):
             tabla_pesos = pd.DataFrame({
-                "Peso V2": [0.90, 0.80, 0.70, 0.60, 0.50],
-                "V2": ["90%", "80%", "70%", "60%", "50%"],
-                "Año anterior": ["10%", "20%", "30%", "40%", "50%"],
+                "Peso meses historicos": [0.10, 0.20, 0.30, 0.40, 0.50, 0.70, 1.00],
+                "Mes historico": ["10%", "20%", "30%", "40%", "50%", "70%", "100%"],
+                "V2": ["90%", "80%", "70%", "60%", "50%", "30%", "0%"],
                 "Interpretacion": [
                     "Ajuste muy ligero",
                     "Ajuste conservador",
                     "Ajuste moderado",
                     "Ajuste estacional fuerte",
-                    "Alta dependencia del año anterior",
+                    "Mitad historico y mitad V2",
+                    "Alta dependencia del mes historico",
+                    "Usa solamente el mismo mes anterior",
                 ],
             })
             st.dataframe(
-                tabla_pesos.style.format({"Peso V2": "{:.2f}"}),
+                tabla_pesos.style.format({"Peso meses historicos": "{:.2f}"}),
                 use_container_width=True,
                 hide_index=True,
             )
             st.info(
-                f"Configuracion actual: {porcentaje_v2}% V2 + "
-                f"{porcentaje_anterior}% mismo mes del año anterior."
+                f"Configuracion actual: {porcentaje_anterior}% mes historico + "
+                f"{porcentaje_v2}% V2."
             )
 
         st.caption(
             "La formula aplicada es: Prediccion ajustada = "
-            "(Peso V2 x Prediccion V2) + "
-            "((1 - Peso V2) x Venta del mismo mes del año anterior)."
+            "((1 - Peso historico) x Prediccion V2) + "
+            "(Peso historico x Venta del mismo mes del año anterior)."
         )
 
 
 
     except Exception as e:
         st.exception(e)
+
