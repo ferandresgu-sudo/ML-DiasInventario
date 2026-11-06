@@ -1120,111 +1120,6 @@ if archivos:
         )
 
         # -----------------------------------------------------
-        # INTERPRETACION DEL AJUSTE ESTACIONAL
-        # -----------------------------------------------------
-        st.markdown("### Interpretacion del ajuste estacional")
-
-        porcentaje_v2 = int(round(peso_modelo_estacional * 100))
-        porcentaje_anterior = 100 - porcentaje_v2
-        incremento_umbral = int(round((umbral_estacional - 1.0) * 100))
-
-        if peso_modelo_estacional >= 0.90:
-            interpretacion_peso = "Ajuste muy ligero"
-        elif peso_modelo_estacional >= 0.80:
-            interpretacion_peso = "Ajuste conservador"
-        elif peso_modelo_estacional >= 0.70:
-            interpretacion_peso = "Ajuste moderado"
-        elif peso_modelo_estacional >= 0.60:
-            interpretacion_peso = "Ajuste estacional fuerte"
-        else:
-            interpretacion_peso = "Alta dependencia del año anterior"
-
-        if umbral_estacional < 1.20:
-            interpretacion_umbral = "Detecta estacionalidad ligera"
-        elif umbral_estacional < 1.40:
-            interpretacion_umbral = "Detecta estacionalidad moderada"
-        elif umbral_estacional < 2.00:
-            interpretacion_umbral = "Exige estacionalidad clara"
-        else:
-            interpretacion_umbral = "Solo detecta estacionalidad muy fuerte"
-
-        i1, i2 = st.columns(2)
-        with i1:
-            st.metric(
-                "Peso actual de la prediccion V2",
-                f"{peso_modelo_estacional:.2f}",
-                help="Porcentaje de confianza asignado al modelo Extra Trees V2.",
-            )
-            st.write(
-                f"**{porcentaje_v2}%** proviene de la prediccion V2 y "
-                f"**{porcentaje_anterior}%** de la venta del mismo mes del año anterior."
-            )
-            st.caption(interpretacion_peso)
-
-        with i2:
-            st.metric(
-                "Umbral actual del indice Nov-Dic",
-                f"{umbral_estacional:.2f}",
-                help="Nivel minimo de estacionalidad requerido para aplicar el ajuste.",
-            )
-            st.write(
-                f"El ajuste se aplica cuando Nov-Dic vende al menos "
-                f"**{incremento_umbral}% mas** que el resto del año."
-            )
-            st.caption(interpretacion_umbral)
-
-        with st.expander("Ver como interpretar el indice Nov-Dic", expanded=False):
-            tabla_indice = pd.DataFrame({
-                "Indice": [1.00, 1.20, 1.40, 1.80, 2.00, 3.00],
-                "Significado": [
-                    "Nov-Dic vende igual que el resto del año",
-                    "Nov-Dic vende 20% mas",
-                    "Nov-Dic vende 40% mas",
-                    "Nov-Dic vende 80% mas",
-                    "Nov-Dic vende el doble",
-                    "Nov-Dic vende tres veces mas",
-                ],
-            })
-            st.dataframe(
-                tabla_indice.style.format({"Indice": "{:.2f}"}),
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.info(
-                f"Configuracion actual: el producto debe alcanzar un indice de "
-                f"{umbral_estacional:.2f} o superior para recibir el ajuste."
-            )
-
-        with st.expander("Ver como interpretar el peso V2", expanded=False):
-            tabla_pesos = pd.DataFrame({
-                "Peso V2": [0.90, 0.80, 0.70, 0.60, 0.50],
-                "V2": ["90%", "80%", "70%", "60%", "50%"],
-                "Año anterior": ["10%", "20%", "30%", "40%", "50%"],
-                "Interpretacion": [
-                    "Ajuste muy ligero",
-                    "Ajuste conservador",
-                    "Ajuste moderado",
-                    "Ajuste estacional fuerte",
-                    "Alta dependencia del año anterior",
-                ],
-            })
-            st.dataframe(
-                tabla_pesos.style.format({"Peso V2": "{:.2f}"}),
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.info(
-                f"Configuracion actual: {porcentaje_v2}% V2 + "
-                f"{porcentaje_anterior}% mismo mes del año anterior."
-            )
-
-        st.caption(
-            "La formula aplicada es: Prediccion ajustada = "
-            "(Peso V2 x Prediccion V2) + "
-            "((1 - Peso V2) x Venta del mismo mes del año anterior)."
-        )
-
-        # -----------------------------------------------------
         # VENTA HISTORICA Y PREDICCION ACUMULADAS
         # -----------------------------------------------------
         ultimo = int(df["Periodo"].max())
@@ -1376,6 +1271,112 @@ if archivos:
             .interactive()
         )
         st.altair_chart(chart_consulta, use_container_width=True)
+
+        # -----------------------------------------------------
+        # INTERPRETACION DEL AJUSTE ESTACIONAL
+        # -----------------------------------------------------
+        st.markdown("### Interpretacion del ajuste estacional")
+
+        porcentaje_v2 = int(round(peso_modelo_estacional * 100))
+        porcentaje_anterior = 100 - porcentaje_v2
+        incremento_umbral = int(round((umbral_estacional - 1.0) * 100))
+
+        if peso_modelo_estacional >= 0.90:
+            interpretacion_peso = "Ajuste muy ligero"
+        elif peso_modelo_estacional >= 0.80:
+            interpretacion_peso = "Ajuste conservador"
+        elif peso_modelo_estacional >= 0.70:
+            interpretacion_peso = "Ajuste moderado"
+        elif peso_modelo_estacional >= 0.60:
+            interpretacion_peso = "Ajuste estacional fuerte"
+        else:
+            interpretacion_peso = "Alta dependencia del año anterior"
+
+        if umbral_estacional < 1.20:
+            interpretacion_umbral = "Detecta estacionalidad ligera"
+        elif umbral_estacional < 1.40:
+            interpretacion_umbral = "Detecta estacionalidad moderada"
+        elif umbral_estacional < 2.00:
+            interpretacion_umbral = "Exige estacionalidad clara"
+        else:
+            interpretacion_umbral = "Solo detecta estacionalidad muy fuerte"
+
+        i1, i2 = st.columns(2)
+        with i1:
+            st.metric(
+                "Peso actual de la prediccion V2",
+                f"{peso_modelo_estacional:.2f}",
+                help="Porcentaje de confianza asignado al modelo Extra Trees V2.",
+            )
+            st.write(
+                f"**{porcentaje_v2}%** proviene de la prediccion V2 y "
+                f"**{porcentaje_anterior}%** de la venta del mismo mes del año anterior."
+            )
+            st.caption(interpretacion_peso)
+
+        with i2:
+            st.metric(
+                "Umbral actual del indice Nov-Dic",
+                f"{umbral_estacional:.2f}",
+                help="Nivel minimo de estacionalidad requerido para aplicar el ajuste.",
+            )
+            st.write(
+                f"El ajuste se aplica cuando Nov-Dic vende al menos "
+                f"**{incremento_umbral}% mas** que el resto del año."
+            )
+            st.caption(interpretacion_umbral)
+
+        with st.expander("Ver como interpretar el indice Nov-Dic", expanded=False):
+            tabla_indice = pd.DataFrame({
+                "Indice": [1.00, 1.20, 1.40, 1.80, 2.00, 3.00],
+                "Significado": [
+                    "Nov-Dic vende igual que el resto del año",
+                    "Nov-Dic vende 20% mas",
+                    "Nov-Dic vende 40% mas",
+                    "Nov-Dic vende 80% mas",
+                    "Nov-Dic vende el doble",
+                    "Nov-Dic vende tres veces mas",
+                ],
+            })
+            st.dataframe(
+                tabla_indice.style.format({"Indice": "{:.2f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.info(
+                f"Configuracion actual: el producto debe alcanzar un indice de "
+                f"{umbral_estacional:.2f} o superior para recibir el ajuste."
+            )
+
+        with st.expander("Ver como interpretar el peso V2", expanded=False):
+            tabla_pesos = pd.DataFrame({
+                "Peso V2": [0.90, 0.80, 0.70, 0.60, 0.50],
+                "V2": ["90%", "80%", "70%", "60%", "50%"],
+                "Año anterior": ["10%", "20%", "30%", "40%", "50%"],
+                "Interpretacion": [
+                    "Ajuste muy ligero",
+                    "Ajuste conservador",
+                    "Ajuste moderado",
+                    "Ajuste estacional fuerte",
+                    "Alta dependencia del año anterior",
+                ],
+            })
+            st.dataframe(
+                tabla_pesos.style.format({"Peso V2": "{:.2f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.info(
+                f"Configuracion actual: {porcentaje_v2}% V2 + "
+                f"{porcentaje_anterior}% mismo mes del año anterior."
+            )
+
+        st.caption(
+            "La formula aplicada es: Prediccion ajustada = "
+            "(Peso V2 x Prediccion V2) + "
+            "((1 - Peso V2) x Venta del mismo mes del año anterior)."
+        )
+
 
         # Participacion de cada SKU en la proyeccion acumulada.
         detalle_pred[f"Participacion {periodos[0]} %"] = (
