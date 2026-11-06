@@ -380,18 +380,29 @@ def aplicar_segmentadores_diagnostico(bt_diag):
     """Filtra tablas y graficas sin reentrenar ni modificar predicciones."""
     st.subheader("Segmentadores del diagnostico")
     st.caption(
-        "Los filtros de CATEGORIA, TIPO y PRODUCTO solo cambian las metricas, "
+        "Los filtros de CATEGORIA, COMBO y PRODUCTO solo cambian las metricas, "
         "tablas y graficas mostradas. El modelo V2 y sus predicciones permanecen iguales."
     )
 
     datos = bt_diag.copy()
-    for col in ["CATEGORIA", "TIPO", "DESCRIPCION"]:
+
+    for col in ["CATEGORIA", "DESCRIPCION"]:
         if col not in datos.columns:
             datos[col] = "Sin dato"
         datos[col] = datos[col].fillna("Sin dato").astype(str).str.strip()
         datos.loc[datos[col].eq(""), col] = "Sin dato"
 
+    if "COMBOS" not in datos.columns:
+        datos["COMBOS"] = 0
+    datos["COMBOS"] = (
+        pd.to_numeric(datos["COMBOS"], errors="coerce")
+        .fillna(0)
+        .clip(0, 1)
+        .astype(int)
+    )
+
     f1, f2, f3 = st.columns(3)
+
     with f1:
         categorias = sorted(datos["CATEGORIA"].unique().tolist())
         categorias_sel = st.multiselect(
@@ -405,28 +416,32 @@ def aplicar_segmentadores_diagnostico(bt_diag):
         datos = datos[datos["CATEGORIA"].isin(categorias_sel)].copy()
 
     with f2:
-        tipos = sorted(datos["TIPO"].unique().tolist())
-        tipos_sel = st.multiselect(
-            "TIPO",
-            options=tipos,
-            default=[],
-            placeholder="Todos los tipos",
-            key="seg_tipo_bt",
+        combos_sel = st.selectbox(
+            "COMBO",
+            options=["Todos", "No combo (0)", "Combo (1)"],
+            index=0,
+            key="seg_combo_bt",
         )
-    if tipos_sel:
-        datos = datos[datos["TIPO"].isin(tipos_sel)].copy()
+    if combos_sel == "No combo (0)":
+        datos = datos[datos["COMBOS"] == 0].copy()
+    elif combos_sel == "Combo (1)":
+        datos = datos[datos["COMBOS"] == 1].copy()
 
     opciones_producto = (
         datos[["CODIGO", "DESCRIPCION"]]
         .drop_duplicates()
         .assign(
-            Producto=lambda x: x["CODIGO"].astype(str)
-            + " - "
-            + x["DESCRIPCION"].astype(str)
+            Producto=lambda x: (
+                x["CODIGO"].astype(str)
+                + " - "
+                + x["DESCRIPCION"].astype(str)
+            )
         )
         .sort_values("Producto")
     )
-    mapa_producto = dict(zip(opciones_producto["Producto"], opciones_producto["CODIGO"]))
+    mapa_producto = dict(
+        zip(opciones_producto["Producto"], opciones_producto["CODIGO"])
+    )
 
     with f3:
         productos_sel = st.multiselect(
@@ -1323,4 +1338,5 @@ if archivos:
 
     except Exception as e:
         st.exception(e)
+
 
