@@ -13,11 +13,10 @@ st.set_page_config(
     page_icon="📦",
     layout="wide",
 )
-st.title("📦 Simulador predictivo mensual optimizado, consulta acumulable y ajuste estacional Nov-Dic")
+st.title("📦 Consulta acumulable de ventas y proyecciones")
 st.caption(
-    "Modelo global Extra Trees sobre log(venta), estacionalidad, rezagos "
-    "y promedios moviles. Las graficas, segmentadores y segmentaciones son diagnosticas "
-    "y el ajuste estacional conserva la prediccion V2 como referencia base."
+    "Consulta acumulable por categoria, combo y descripcion, con metricas de backtest "
+    "y proyeccion estacional para noviembre y diciembre."
 )
 
 MESES = {
@@ -1015,102 +1014,19 @@ if archivos:
             f"{df.CODIGO.nunique():,} productos"
         )
         st.caption(
-            "La primera lectura de los Excel puede tardar. Mientras los archivos no cambien, "
-            "la lectura, el backtest, el entrenamiento y la segmentacion se reutilizan desde cache."
+            "La primera lectura y el entrenamiento pueden tardar. Mientras los archivos "
+            "no cambien, Streamlit reutiliza la informacion almacenada en cache."
         )
 
-        # Indices reutilizados por selector individual y proyeccion masiva.
+        # Preparacion requerida para las metricas y filtros de la consulta.
         historicos_por_codigo, ult = crear_indices_rapidos(df)
-
-        # Tabla diagnostica de productos por segmento.
-        segmentos_detalle, tabla_segmentos = crear_tabla_segmentacion(df)
-        st.subheader("Cantidad de productos por comportamiento de venta")
-        st.caption(
-            "Esta segmentacion es solo diagnostica y no modifica el modelo: "
-            "Intermitente = 3 o mas ceros en los ultimos 6 meses; "
-            "Volatil = coeficiente de variacion de 6 meses mayor o igual a 1; "
-            "Estable = resto de productos."
-        )
-        st.dataframe(
-            tabla_segmentos,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        graf_segmentos = (
-            alt.Chart(tabla_segmentos)
-            .mark_bar()
-            .encode(
-                x=alt.X("SEGMENTO:N", title=None),
-                y=alt.Y("Productos:Q", title="Cantidad de productos"),
-                color=alt.Color(
-                    "SEGMENTO:N",
-                    scale=alt.Scale(
-                        domain=["Estable", "Intermitente", "Volatil"],
-                        range=["#2ca02c", "#ffbf00", "#d62728"],
-                    ),
-                    legend=None,
-                ),
-                tooltip=["SEGMENTO:N", "Productos:Q"],
+        segmentos_detalle, _ = crear_tabla_segmentacion(df)
+        bt = backtest(df, 2)
+        if bt.empty:
+            raise ValueError(
+                "El backtest no genero resultados. Revisa el historial disponible."
             )
-            .properties(height=300)
-        )
-        st.altair_chart(graf_segmentos, use_container_width=True)
-
-        holdout = st.slider("Meses de backtest", 1, 4, 2)
-
-        with st.spinner("Entrenando y validando..."):
-            bt = backtest(df, holdout)
-
-            if bt.empty:
-                raise ValueError(
-                    "El backtest no genero resultados. Revisa el historial disponible."
-                )
-
-            y = bt.Actual.to_numpy()
-            p = bt.Prediccion.to_numpy()
-            wape = (
-                100 * np.abs(y - p).sum()
-                / max(np.abs(y).sum(), 1)
-            )
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("WAPE", f"{wape:.2f}%")
-            c2.metric("MAE", f"${mean_absolute_error(y, p):,.2f}")
-            c3.metric(
-                "RMSE",
-                f"${mean_squared_error(y, p) ** 0.5:,.2f}",
-            )
-            c4.metric("R²", f"{r2_score(y, p):.3f}")
-
-            bt_diag = preparar_diagnostico_backtest(
-                bt,
-                segmentos_detalle,
-            )
-
-            bt_visual = aplicar_segmentadores_diagnostico(bt_diag)
-            if not bt_visual.empty:
-                mostrar_graficas_backtest(bt_visual)
-
-            st.subheader("Predicciones con mayor error absoluto")
-            columnas_error = [
-                "CODIGO", "DESCRIPCION", "CATEGORIA", "TIPO", "SEGMENTO",
-                "Periodo_Real", "Mes_Predecido", "Actual", "Prediccion",
-                "Error_Abs", "Variacion_%",
-            ]
-            st.dataframe(
-                bt_visual.nlargest(15, "Error_Abs")[columnas_error]
-                if not bt_visual.empty else bt_visual,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.download_button(
-                "Descargar detalle del backtest",
-                bt_diag.to_csv(index=False).encode("utf-8-sig"),
-                "backtest_v2_con_diagnostico.csv",
-                "text/csv",
-            )
+        bt_diag = preparar_diagnostico_backtest(bt, segmentos_detalle)
 
         # Entrenamiento final original, sin cambios.
         modelo, medianas = entrenar(df)
@@ -1350,17 +1266,23 @@ if archivos:
             delta_color="off",
         )
 
-        real_graf = hist_acumulado.rename(columns={"VENTA": "Valor"})
+        real_graf = hist_acumulado.rename(columns={"VENTA": "Valor"}).copy()
         real_graf["Serie"] = "Venta historica acumulada"
+
+        # Conexion visual: la proyeccion comienza en el ultimo punto historico.
+        # Este punto compartido solo afecta la apariencia de la grafica.
+        # No modifica las predicciones, metricas ni acumulados.
+        ultimo_real = real_graf.sort_values("Periodo").iloc[-1]
         futuro_graf = pd.DataFrame({
-            "Periodo": periodos,
-            "Valor": pred_acum,
+            "Periodo": [int(ultimo_real["Periodo"])] + periodos,
+            "Valor": [float(ultimo_real["Valor"])] + pred_acum,
             "Serie": "Proyeccion acumulada",
         })
+
         graf_consulta = pd.concat(
             [real_graf, futuro_graf],
             ignore_index=True,
-        )
+        ).sort_values(["Serie", "Periodo"])
 
         chart_consulta = (
             alt.Chart(graf_consulta)
@@ -1369,12 +1291,14 @@ if archivos:
                 x=alt.X(
                     "Periodo:O",
                     title="Periodo",
+                    sort="ascending",
                     axis=alt.Axis(labelAngle=-45),
                 ),
                 y=alt.Y(
                     "Valor:Q",
                     title="Venta acumulada",
                     axis=alt.Axis(format="$,.0f"),
+                    scale=alt.Scale(zero=False),
                 ),
                 color=alt.Color(
                     "Serie:N",
@@ -1387,6 +1311,8 @@ if archivos:
                         range=["#1f77b4", "#ff7f0e"],
                     ),
                 ),
+                detail="Serie:N",
+                order=alt.Order("Periodo:O", sort="ascending"),
                 tooltip=[
                     "Periodo:O",
                     "Serie:N",
@@ -1425,68 +1351,6 @@ if archivos:
                 use_container_width=True,
                 hide_index=True,
             )
-
-        # Proyeccion masiva original, sin cambios en la prediccion.
-        filas = []
-        for _, r in ult.iterrows():
-            h = historicos_por_codigo[r.CODIGO]
-            pr = predecir_recursivo(
-                modelo,
-                medianas,
-                h,
-                periodos,
-            )
-            if usar_ajuste_estacional:
-                pr_ajustada, diag_pr = ajustar_lista_estacional(
-                    pr, h, periodos,
-                    peso_modelo=peso_modelo_estacional,
-                    umbral_estacional=umbral_estacional,
-                )
-            else:
-                pr_ajustada = list(pr)
-                diag_pr = [
-                    {"Indice_Nov_Dic": calcular_indice_estacional_nov_dic(h),
-                     "Ajuste_Aplicado": False}
-                    for _ in periodos
-                ]
-            segmento = segmentos_detalle.loc[
-                segmentos_detalle["CODIGO"] == r.CODIGO,
-                "SEGMENTO",
-            ]
-            segmento = (
-                segmento.iloc[0]
-                if not segmento.empty
-                else "Sin clasificar"
-            )
-
-            filas.append({
-                "CODIGO": r.CODIGO,
-                "DESCRIPCION": r.get("DESCRIPCION", ""),
-                "CATEGORIA": r.get("CATEGORIA", ""),
-                "TIPO": r.get("TIPO", ""),
-                "COMBOS": int(r.get("COMBOS", 0)),
-                "SEGMENTO_DIAGNOSTICO": segmento,
-                f"Pred Base {periodos[0]}": pr[0],
-                f"Pred Ajustada {periodos[0]}": pr_ajustada[0],
-                f"Pred Base {periodos[1]}": pr[1],
-                f"Pred Ajustada {periodos[1]}": pr_ajustada[1],
-                "INDICE_NOV_DIC": diag_pr[0]["Indice_Nov_Dic"],
-                "AJUSTE_ESTACIONAL": any(d["Ajuste_Aplicado"] for d in diag_pr),
-            })
-
-        resultado = pd.DataFrame(filas)
-        st.subheader("Proyeccion masiva")
-        st.dataframe(
-            resultado,
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.download_button(
-            "Descargar proyeccion CSV",
-            resultado.to_csv(index=False).encode("utf-8-sig"),
-            "proyeccion_ventas.csv",
-            "text/csv",
-        )
 
     except Exception as e:
         st.exception(e)
