@@ -1272,6 +1272,32 @@ if archivos:
         )
         st.altair_chart(chart_consulta, use_container_width=True)
 
+        # Participacion de cada SKU en la proyeccion acumulada.
+        detalle_pred[f"Participacion {periodos[0]} %"] = (
+            100 * detalle_pred[f"Pred Ajustada {periodos[0]}"]
+            / max(pred_acum[0], 1)
+        )
+        detalle_pred[f"Participacion {periodos[1]} %"] = (
+            100 * detalle_pred[f"Pred Ajustada {periodos[1]}"]
+            / max(pred_acum[1], 1)
+        )
+        detalle_pred = detalle_pred.sort_values(
+            f"Pred Ajustada {periodos[0]}", ascending=False
+        )
+
+        with st.expander("Ver aportacion de cada SKU al acumulado"):
+            st.dataframe(
+                detalle_pred.style.format({
+                    f"Pred Ajustada {periodos[0]}": "${:,.2f}",
+                    f"Pred Ajustada {periodos[1]}": "${:,.2f}",
+                    f"Participacion {periodos[0]} %": "{:.2f}%",
+                    f"Participacion {periodos[1]} %": "{:.2f}%",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
         # -----------------------------------------------------
         # INTERPRETACION DEL AJUSTE ESTACIONAL
         # -----------------------------------------------------
@@ -1378,30 +1404,6 @@ if archivos:
         )
 
 
-        # Participacion de cada SKU en la proyeccion acumulada.
-        detalle_pred[f"Participacion {periodos[0]} %"] = (
-            100 * detalle_pred[f"Pred Ajustada {periodos[0]}"]
-            / max(pred_acum[0], 1)
-        )
-        detalle_pred[f"Participacion {periodos[1]} %"] = (
-            100 * detalle_pred[f"Pred Ajustada {periodos[1]}"]
-            / max(pred_acum[1], 1)
-        )
-        detalle_pred = detalle_pred.sort_values(
-            f"Pred Ajustada {periodos[0]}", ascending=False
-        )
-
-        with st.expander("Ver aportacion de cada SKU al acumulado"):
-            st.dataframe(
-                detalle_pred.style.format({
-                    f"Pred Ajustada {periodos[0]}": "${:,.2f}",
-                    f"Pred Ajustada {periodos[1]}": "${:,.2f}",
-                    f"Participacion {periodos[0]} %": "{:.2f}%",
-                    f"Participacion {periodos[1]} %": "{:.2f}%",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
 
     except Exception as e:
         st.exception(e)
