@@ -13,7 +13,7 @@ st.set_page_config(
     page_icon="📦",
     layout="wide",
 )
-st.title("📦 Simulador predictivo mensual optimizado, consulta acumulable")
+st.title("📦 Simulador predictivo mensual optimizado, consulta acumulable por categoria, combo y descripcion")
 st.caption(
     "Modelo global Extra Trees sobre log(venta), estacionalidad, rezagos "
     "y promedios moviles. Las graficas, segmentadores y segmentaciones son diagnosticas "
@@ -47,7 +47,7 @@ FEATURES = [
 def completar_calendario(g):
     salida = []
     meta = [
-        c for c in ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO"]
+        c for c in ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO", "COMBOS"]
         if c in g.columns
     ]
 
@@ -181,7 +181,7 @@ def cargar(archivos, version_cache="v2-rapida-1"):
     partes = []
     columnas_utiles = {
         "CODIGO", "VENTA", "MES", "AÑO",
-        "DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO",
+        "DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO", "COMBOS",
     }
 
     for archivo in archivos:
@@ -214,6 +214,14 @@ def cargar(archivos, version_cache="v2-rapida-1"):
     )
     df["AÑO"] = pd.to_numeric(df["AÑO"], errors="coerce")
     df["VENTA"] = pd.to_numeric(df["VENTA"], errors="coerce")
+    if "COMBOS" not in df.columns:
+        df["COMBOS"] = 0
+    df["COMBOS"] = (
+        pd.to_numeric(df["COMBOS"], errors="coerce")
+        .fillna(0)
+        .clip(0, 1)
+        .astype(int)
+    )
 
     # Mantener CODIGO como texto evita perdida de precision/notacion cientifica.
     df["CODIGO"] = (
@@ -228,7 +236,7 @@ def cargar(archivos, version_cache="v2-rapida-1"):
 
     meta = {
         c: "first"
-        for c in ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO"]
+        for c in ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO", "COMBOS"]
         if c in df.columns
     }
 
@@ -277,6 +285,7 @@ def backtest(df, n_holdout=2):
                 "DESCRIPCION": r.get("DESCRIPCION", ""),
                 "CATEGORIA": r.get("CATEGORIA", ""),
                 "TIPO": r.get("TIPO", ""),
+                "COMBOS": int(r.get("COMBOS", 0)),
                 "Periodo_Real": int(r.Periodo),
                 "Mes_Predecido": paso,
                 "Prediccion": p,
@@ -989,118 +998,163 @@ if archivos:
         modelo, medianas = entrenar(df)
 
         # =====================================================
-        # CONSULTA ACUMULABLE CON SEGMENTADORES
+        # CONSULTA ACUMULABLE: CATEGORIA, COMBO Y DESCRIPCION
         # =====================================================
-        st.subheader("Consulta acumulable con segmentadores")
+        st.subheader("Consulta acumulable por categoria, combo y descripcion")
         st.caption(
-            "Selecciona una CATEGORIA y un TIPO. En PRODUCTO puedes elegir uno, "
-            "varios o Todos los productos disponibles. La venta historica y las "
-            "predicciones se suman por periodo. Este apartado no modifica el modelo."
+            "Los filtros acumulan la venta historica y las predicciones de los SKU "
+            "seleccionados. Las metricas se calculan con las observaciones del backtest "
+            "correspondientes a esos mismos SKU. El modelo V2 no se reentrena ni cambia."
         )
 
-        ult_filtro = ult.copy()
-        for col in ["CATEGORIA", "TIPO", "DESCRIPCION"]:
-            if col not in ult_filtro.columns:
-                ult_filtro[col] = "Sin dato"
-            ult_filtro[col] = (
-                ult_filtro[col]
+        ult_consulta = ult.copy()
+        for col in ["CATEGORIA", "DESCRIPCION"]:
+            if col not in ult_consulta.columns:
+                ult_consulta[col] = "Sin dato"
+            ult_consulta[col] = (
+                ult_consulta[col]
                 .fillna("Sin dato")
                 .astype(str)
                 .str.strip()
             )
-            ult_filtro.loc[ult_filtro[col].eq(""), col] = "Sin dato"
+            ult_consulta.loc[ult_consulta[col].eq(""), col] = "Sin dato"
 
-        sf1, sf2 = st.columns(2)
-        with sf1:
-            categoria_ind = st.selectbox(
+        if "COMBOS" not in ult_consulta.columns:
+            ult_consulta["COMBOS"] = 0
+        ult_consulta["COMBOS"] = (
+            pd.to_numeric(ult_consulta["COMBOS"], errors="coerce")
+            .fillna(0)
+            .clip(0, 1)
+            .astype(int)
+        )
+
+        # Filtros encadenados.
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            categoria_consulta = st.selectbox(
                 "CATEGORIA",
-                ["Todas"] + sorted(ult_filtro["CATEGORIA"].unique().tolist()),
-                key="categoria_individual",
+                ["Todas"] + sorted(ult_consulta["CATEGORIA"].unique().tolist()),
+                key="consulta_categoria",
             )
-        if categoria_ind != "Todas":
-            ult_filtro = ult_filtro[
-                ult_filtro["CATEGORIA"] == categoria_ind
+        if categoria_consulta != "Todas":
+            ult_consulta = ult_consulta[
+                ult_consulta["CATEGORIA"] == categoria_consulta
             ].copy()
 
-        with sf2:
-            tipo_ind = st.selectbox(
-                "TIPO",
-                ["Todos"] + sorted(ult_filtro["TIPO"].unique().tolist()),
-                key="tipo_individual",
+        with fc2:
+            combo_consulta = st.selectbox(
+                "COMBO",
+                ["Todos", "No combo (0)", "Combo (1)"],
+                key="consulta_combo",
             )
-        if tipo_ind != "Todos":
-            ult_filtro = ult_filtro[
-                ult_filtro["TIPO"] == tipo_ind
-            ].copy()
+        if combo_consulta == "No combo (0)":
+            ult_consulta = ult_consulta[ult_consulta["COMBOS"] == 0].copy()
+        elif combo_consulta == "Combo (1)":
+            ult_consulta = ult_consulta[ult_consulta["COMBOS"] == 1].copy()
 
-        opciones_df = (
-            ult_filtro[["CODIGO", "DESCRIPCION"]]
-            .drop_duplicates()
-            .assign(
-                ETIQUETA=lambda x: (
-                    x["CODIGO"].astype(str)
-                    + " - "
-                    + x["DESCRIPCION"].fillna("").astype(str)
-                )
-            )
-            .sort_values(["DESCRIPCION", "CODIGO"])
+        descripciones_disponibles = sorted(
+            ult_consulta["DESCRIPCION"].dropna().unique().tolist()
         )
-        mapa_productos = dict(
-            zip(opciones_df["ETIQUETA"], opciones_df["CODIGO"])
+        modo_descripcion = st.radio(
+            "Seleccion de DESCRIPCION",
+            ["Todas las descripciones disponibles", "Seleccion manual"],
+            horizontal=True,
+            key="consulta_modo_descripcion",
         )
 
-        if not mapa_productos:
-            st.warning("No hay productos para la combinacion seleccionada.")
+        if modo_descripcion == "Todas las descripciones disponibles":
+            descripciones_sel = descripciones_disponibles
+        else:
+            descripciones_sel = st.multiselect(
+                "DESCRIPCION",
+                options=descripciones_disponibles,
+                default=[],
+                placeholder="Selecciona una o varias descripciones",
+                key="consulta_descripciones",
+            )
+
+        if not descripciones_sel:
+            st.warning(
+                "No hay descripciones seleccionadas. Elige al menos una o selecciona "
+                "'Todas las descripciones disponibles'."
+            )
             st.stop()
 
-        etiquetas_disponibles = list(mapa_productos.keys())
-        producto_modo = st.radio(
-            "Seleccion de productos",
-            ["Todos los productos disponibles", "Seleccion manual"],
-            horizontal=True,
-            key="modo_productos_acumulado",
-        )
-
-        if producto_modo == "Todos los productos disponibles":
-            etiquetas_seleccionadas = etiquetas_disponibles
-            st.info(
-                f"Se acumularan {len(etiquetas_seleccionadas):,} productos "
-                "de la categoria y tipo seleccionados."
-            )
-        else:
-            etiquetas_seleccionadas = st.multiselect(
-                "PRODUCTO",
-                options=etiquetas_disponibles,
-                default=[],
-                placeholder="Selecciona uno o varios productos",
-                key="productos_individuales_acumulables",
-            )
-
-        codigos_seleccionados = [
-            mapa_productos[e] for e in etiquetas_seleccionadas
-        ]
+        seleccion_sku = ult_consulta[
+            ult_consulta["DESCRIPCION"].isin(descripciones_sel)
+        ].copy()
+        codigos_seleccionados = seleccion_sku["CODIGO"].drop_duplicates().tolist()
 
         if not codigos_seleccionados:
-            st.warning(
-                "Selecciona al menos un producto o elige "
-                "'Todos los productos disponibles'."
-            )
+            st.warning("No hay productos para la combinacion de filtros seleccionada.")
             st.stop()
 
-        ultimo = int(df.Periodo.max())
+        st.info(
+            f"Consulta formada por {len(codigos_seleccionados):,} SKU y "
+            f"{len(descripciones_sel):,} descripciones."
+        )
+
+        # -----------------------------------------------------
+        # METRICAS DEL BACKTEST PARA LA SELECCION
+        # -----------------------------------------------------
+        bt_consulta = bt_diag[
+            bt_diag["CODIGO"].isin(codigos_seleccionados)
+        ].copy()
+
+        st.markdown("### Metricas de la seleccion")
+        if bt_consulta.empty:
+            st.warning(
+                "Los SKU seleccionados no tienen observaciones suficientes en el "
+                "backtest actual. Las predicciones futuras sí se muestran."
+            )
+        else:
+            y_sel = bt_consulta["Actual"].to_numpy(float)
+            p_sel = bt_consulta["Prediccion"].to_numpy(float)
+            wape_sel = (
+                100 * np.abs(y_sel - p_sel).sum()
+                / max(np.abs(y_sel).sum(), 1)
+            )
+            mae_sel = mean_absolute_error(y_sel, p_sel)
+            rmse_sel = mean_squared_error(y_sel, p_sel) ** 0.5
+            r2_sel = r2_score(y_sel, p_sel) if len(bt_consulta) >= 2 else np.nan
+
+            ms1, ms2, ms3, ms4, ms5 = st.columns(5)
+            ms1.metric("Registros de backtest", f"{len(bt_consulta):,}")
+            ms2.metric("WAPE", f"{wape_sel:.2f}%")
+            ms3.metric("MAE", f"${mae_sel:,.2f}")
+            ms4.metric("RMSE", f"${rmse_sel:,.2f}")
+            ms5.metric("R²", f"{r2_sel:.3f}" if pd.notna(r2_sel) else "N/D")
+
+            with st.expander("Ver detalle del backtest de la seleccion"):
+                columnas_bt = [
+                    "CODIGO", "DESCRIPCION", "CATEGORIA", "TIPO", "COMBOS",
+                    "Periodo_Real", "Mes_Predecido", "Actual", "Prediccion",
+                    "Error_Abs", "Variacion_%",
+                ]
+                columnas_bt = [c for c in columnas_bt if c in bt_consulta.columns]
+                st.dataframe(
+                    bt_consulta[columnas_bt].sort_values(
+                        "Error_Abs", ascending=False
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        # -----------------------------------------------------
+        # VENTA HISTORICA Y PREDICCION ACUMULADAS
+        # -----------------------------------------------------
+        ultimo = int(df["Periodo"].max())
         fecha = pd.Timestamp(ultimo // 100, ultimo % 100, 1)
         periodos = []
         for i in [1, 2]:
             f = fecha + pd.DateOffset(months=i)
             periodos.append(f.year * 100 + f.month)
 
-        # Suma historica por periodo y prediccion de cada SKU por separado.
         historicos_seleccionados = [
             historicos_por_codigo[codigo]
             for codigo in codigos_seleccionados
             if codigo in historicos_por_codigo
         ]
-
         hist_acumulado = (
             pd.concat(historicos_seleccionados, ignore_index=True)
             .groupby("Periodo", as_index=False)
@@ -1108,7 +1162,7 @@ if archivos:
             .sort_values("Periodo")
         )
 
-        predicciones_productos = []
+        predicciones_sku = []
         for codigo in codigos_seleccionados:
             hist_producto = historicos_por_codigo[codigo]
             pred_producto = predecir_recursivo(
@@ -1117,46 +1171,49 @@ if archivos:
                 hist_producto,
                 periodos,
             )
-            predicciones_productos.append({
+            meta_producto = seleccion_sku[
+                seleccion_sku["CODIGO"] == codigo
+            ].iloc[0]
+            predicciones_sku.append({
                 "CODIGO": codigo,
+                "DESCRIPCION": meta_producto.get("DESCRIPCION", ""),
+                "CATEGORIA": meta_producto.get("CATEGORIA", ""),
+                "COMBOS": int(meta_producto.get("COMBOS", 0)),
                 f"Pred {periodos[0]}": pred_producto[0],
                 f"Pred {periodos[1]}": pred_producto[1],
             })
 
-        detalle_pred_acumulada = pd.DataFrame(predicciones_productos)
-        pred_acumulada = [
-            float(detalle_pred_acumulada[f"Pred {periodos[0]}"].sum()),
-            float(detalle_pred_acumulada[f"Pred {periodos[1]}"].sum()),
+        detalle_pred = pd.DataFrame(predicciones_sku)
+        pred_acum = [
+            float(detalle_pred[f"Pred {periodos[0]}"].sum()),
+            float(detalle_pred[f"Pred {periodos[1]}"].sum()),
         ]
 
-        k1, k2, k3 = st.columns(3)
-        k1.metric("Productos acumulados", f"{len(codigos_seleccionados):,}")
-        k2.metric(
+        pc1, pc2, pc3 = st.columns(3)
+        pc1.metric("SKU acumulados", f"{len(codigos_seleccionados):,}")
+        pc2.metric(
             f"Prediccion acumulada {periodos[0]}",
-            f"${pred_acumulada[0]:,.2f}",
+            f"${pred_acum[0]:,.2f}",
         )
-        k3.metric(
+        pc3.metric(
             f"Prediccion acumulada {periodos[1]}",
-            f"${pred_acumulada[1]:,.2f}",
+            f"${pred_acum[1]:,.2f}",
         )
 
-        # Grafica acumulada: unicamente venta historica y proyeccion.
-        real_graf = hist_acumulado.rename(columns={"VENTA": "Valor"}).copy()
+        real_graf = hist_acumulado.rename(columns={"VENTA": "Valor"})
         real_graf["Serie"] = "Venta historica acumulada"
-
         futuro_graf = pd.DataFrame({
             "Periodo": periodos,
-            "Valor": pred_acumulada,
+            "Valor": pred_acum,
             "Serie": "Proyeccion acumulada",
         })
-
-        graf_acumulada = pd.concat(
+        graf_consulta = pd.concat(
             [real_graf, futuro_graf],
             ignore_index=True,
         )
 
-        ch = (
-            alt.Chart(graf_acumulada)
+        chart_consulta = (
+            alt.Chart(graf_consulta)
             .mark_line(point=True, strokeWidth=3)
             .encode(
                 x=alt.X(
@@ -1188,48 +1245,31 @@ if archivos:
             )
             .properties(
                 height=420,
-                title=(
-                    "Venta historica y proyeccion acumuladas de los "
-                    "productos seleccionados"
-                ),
+                title="Venta historica y proyeccion acumuladas",
             )
             .interactive()
         )
-        st.altair_chart(ch, use_container_width=True)
+        st.altair_chart(chart_consulta, use_container_width=True)
 
-        # Tabla de aportacion por producto a la prediccion acumulada.
-        detalle_pred_acumulada = detalle_pred_acumulada.merge(
-            opciones_df[["CODIGO", "DESCRIPCION"]],
-            on="CODIGO",
-            how="left",
+        # Participacion de cada SKU en la proyeccion acumulada.
+        detalle_pred[f"Participacion {periodos[0]} %"] = (
+            100 * detalle_pred[f"Pred {periodos[0]}"]
+            / max(pred_acum[0], 1)
         )
-        total_h1 = max(pred_acumulada[0], 1)
-        total_h2 = max(pred_acumulada[1], 1)
-        detalle_pred_acumulada[f"Participacion {periodos[0]} %"] = (
-            100
-            * detalle_pred_acumulada[f"Pred {periodos[0]}"]
-            / total_h1
+        detalle_pred[f"Participacion {periodos[1]} %"] = (
+            100 * detalle_pred[f"Pred {periodos[1]}"]
+            / max(pred_acum[1], 1)
         )
-        detalle_pred_acumulada[f"Participacion {periodos[1]} %"] = (
-            100
-            * detalle_pred_acumulada[f"Pred {periodos[1]}"]
-            / total_h2
+        detalle_pred = detalle_pred.sort_values(
+            f"Pred {periodos[0]}", ascending=False
         )
-        detalle_pred_acumulada = detalle_pred_acumulada[[
-            "CODIGO",
-            "DESCRIPCION",
-            f"Pred {periodos[0]}",
-            f"Participacion {periodos[0]} %",
-            f"Pred {periodos[1]}",
-            f"Participacion {periodos[1]} %",
-        ]].sort_values(f"Pred {periodos[0]}", ascending=False)
 
-        with st.expander("Ver aportacion de cada producto al acumulado"):
+        with st.expander("Ver aportacion de cada SKU al acumulado"):
             st.dataframe(
-                detalle_pred_acumulada.style.format({
+                detalle_pred.style.format({
                     f"Pred {periodos[0]}": "${:,.2f}",
-                    f"Participacion {periodos[0]} %": "{:.2f}%",
                     f"Pred {periodos[1]}": "${:,.2f}",
+                    f"Participacion {periodos[0]} %": "{:.2f}%",
                     f"Participacion {periodos[1]} %": "{:.2f}%",
                 }),
                 use_container_width=True,
@@ -1261,6 +1301,7 @@ if archivos:
                 "DESCRIPCION": r.get("DESCRIPCION", ""),
                 "CATEGORIA": r.get("CATEGORIA", ""),
                 "TIPO": r.get("TIPO", ""),
+                "COMBOS": int(r.get("COMBOS", 0)),
                 "SEGMENTO_DIAGNOSTICO": segmento,
                 f"Pred {periodos[0]}": pr[0],
                 f"Pred {periodos[1]}": pr[1],
@@ -1282,3 +1323,4 @@ if archivos:
 
     except Exception as e:
         st.exception(e)
+
