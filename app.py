@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import ExtraTreesRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import altair as alt
 
 # =========================================================
@@ -15,8 +14,8 @@ st.set_page_config(
 )
 st.title("📦 Consulta acumulable de ventas y proyecciones")
 st.caption(
-    "Consulta acumulable por categoria, combo y descripcion, con metricas de backtest "
-    "y proyeccion estacional para noviembre y diciembre."
+    "Consulta acumulable por categoria, combo y descripcion, con interpretacion "
+    "del indice estacional y del peso aplicado a la prediccion V2."
 )
 
 MESES = {
@@ -1018,15 +1017,8 @@ if archivos:
             "no cambien, Streamlit reutiliza la informacion almacenada en cache."
         )
 
-        # Preparacion requerida para las metricas y filtros de la consulta.
+        # Preparacion requerida para la consulta acumulable.
         historicos_por_codigo, ult = crear_indices_rapidos(df)
-        segmentos_detalle, _ = crear_tabla_segmentacion(df)
-        bt = backtest(df, 2)
-        if bt.empty:
-            raise ValueError(
-                "El backtest no genero resultados. Revisa el historial disponible."
-            )
-        bt_diag = preparar_diagnostico_backtest(bt, segmentos_detalle)
 
         # Entrenamiento final original, sin cambios.
         modelo, medianas = entrenar(df)
@@ -1037,8 +1029,7 @@ if archivos:
         st.subheader("Consulta acumulable por categoria, combo y descripcion")
         st.caption(
             "Los filtros acumulan la venta historica y las predicciones de los SKU "
-            "seleccionados. Las metricas se calculan con las observaciones del backtest "
-            "correspondientes a esos mismos SKU. El modelo V2 no se reentrena ni cambia."
+            "seleccionados. El modelo V2 no se reentrena ni cambia."
         )
 
         ult_consulta = ult.copy()
@@ -1129,50 +1120,109 @@ if archivos:
         )
 
         # -----------------------------------------------------
-        # METRICAS DEL BACKTEST PARA LA SELECCION
+        # INTERPRETACION DEL AJUSTE ESTACIONAL
         # -----------------------------------------------------
-        bt_consulta = bt_diag[
-            bt_diag["CODIGO"].isin(codigos_seleccionados)
-        ].copy()
+        st.markdown("### Interpretacion del ajuste estacional")
 
-        st.markdown("### Metricas de la seleccion")
-        if bt_consulta.empty:
-            st.warning(
-                "Los SKU seleccionados no tienen observaciones suficientes en el "
-                "backtest actual. Las predicciones futuras sí se muestran."
-            )
+        porcentaje_v2 = int(round(peso_modelo_estacional * 100))
+        porcentaje_anterior = 100 - porcentaje_v2
+        incremento_umbral = int(round((umbral_estacional - 1.0) * 100))
+
+        if peso_modelo_estacional >= 0.90:
+            interpretacion_peso = "Ajuste muy ligero"
+        elif peso_modelo_estacional >= 0.80:
+            interpretacion_peso = "Ajuste conservador"
+        elif peso_modelo_estacional >= 0.70:
+            interpretacion_peso = "Ajuste moderado"
+        elif peso_modelo_estacional >= 0.60:
+            interpretacion_peso = "Ajuste estacional fuerte"
         else:
-            y_sel = bt_consulta["Actual"].to_numpy(float)
-            p_sel = bt_consulta["Prediccion"].to_numpy(float)
-            wape_sel = (
-                100 * np.abs(y_sel - p_sel).sum()
-                / max(np.abs(y_sel).sum(), 1)
+            interpretacion_peso = "Alta dependencia del año anterior"
+
+        if umbral_estacional < 1.20:
+            interpretacion_umbral = "Detecta estacionalidad ligera"
+        elif umbral_estacional < 1.40:
+            interpretacion_umbral = "Detecta estacionalidad moderada"
+        elif umbral_estacional < 2.00:
+            interpretacion_umbral = "Exige estacionalidad clara"
+        else:
+            interpretacion_umbral = "Solo detecta estacionalidad muy fuerte"
+
+        i1, i2 = st.columns(2)
+        with i1:
+            st.metric(
+                "Peso actual de la prediccion V2",
+                f"{peso_modelo_estacional:.2f}",
+                help="Porcentaje de confianza asignado al modelo Extra Trees V2.",
             )
-            mae_sel = mean_absolute_error(y_sel, p_sel)
-            rmse_sel = mean_squared_error(y_sel, p_sel) ** 0.5
-            r2_sel = r2_score(y_sel, p_sel) if len(bt_consulta) >= 2 else np.nan
+            st.write(
+                f"**{porcentaje_v2}%** proviene de la prediccion V2 y "
+                f"**{porcentaje_anterior}%** de la venta del mismo mes del año anterior."
+            )
+            st.caption(interpretacion_peso)
 
-            ms1, ms2, ms3, ms4, ms5 = st.columns(5)
-            ms1.metric("Registros de backtest", f"{len(bt_consulta):,}")
-            ms2.metric("WAPE", f"{wape_sel:.2f}%")
-            ms3.metric("MAE", f"${mae_sel:,.2f}")
-            ms4.metric("RMSE", f"${rmse_sel:,.2f}")
-            ms5.metric("R²", f"{r2_sel:.3f}" if pd.notna(r2_sel) else "N/D")
+        with i2:
+            st.metric(
+                "Umbral actual del indice Nov-Dic",
+                f"{umbral_estacional:.2f}",
+                help="Nivel minimo de estacionalidad requerido para aplicar el ajuste.",
+            )
+            st.write(
+                f"El ajuste se aplica cuando Nov-Dic vende al menos "
+                f"**{incremento_umbral}% mas** que el resto del año."
+            )
+            st.caption(interpretacion_umbral)
 
-            with st.expander("Ver detalle del backtest de la seleccion"):
-                columnas_bt = [
-                    "CODIGO", "DESCRIPCION", "CATEGORIA", "TIPO", "COMBOS",
-                    "Periodo_Real", "Mes_Predecido", "Actual", "Prediccion",
-                    "Error_Abs", "Variacion_%",
-                ]
-                columnas_bt = [c for c in columnas_bt if c in bt_consulta.columns]
-                st.dataframe(
-                    bt_consulta[columnas_bt].sort_values(
-                        "Error_Abs", ascending=False
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+        with st.expander("Ver como interpretar el indice Nov-Dic", expanded=False):
+            tabla_indice = pd.DataFrame({
+                "Indice": [1.00, 1.20, 1.40, 1.80, 2.00, 3.00],
+                "Significado": [
+                    "Nov-Dic vende igual que el resto del año",
+                    "Nov-Dic vende 20% mas",
+                    "Nov-Dic vende 40% mas",
+                    "Nov-Dic vende 80% mas",
+                    "Nov-Dic vende el doble",
+                    "Nov-Dic vende tres veces mas",
+                ],
+            })
+            st.dataframe(
+                tabla_indice.style.format({"Indice": "{:.2f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.info(
+                f"Configuracion actual: el producto debe alcanzar un indice de "
+                f"{umbral_estacional:.2f} o superior para recibir el ajuste."
+            )
+
+        with st.expander("Ver como interpretar el peso V2", expanded=False):
+            tabla_pesos = pd.DataFrame({
+                "Peso V2": [0.90, 0.80, 0.70, 0.60, 0.50],
+                "V2": ["90%", "80%", "70%", "60%", "50%"],
+                "Año anterior": ["10%", "20%", "30%", "40%", "50%"],
+                "Interpretacion": [
+                    "Ajuste muy ligero",
+                    "Ajuste conservador",
+                    "Ajuste moderado",
+                    "Ajuste estacional fuerte",
+                    "Alta dependencia del año anterior",
+                ],
+            })
+            st.dataframe(
+                tabla_pesos.style.format({"Peso V2": "{:.2f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.info(
+                f"Configuracion actual: {porcentaje_v2}% V2 + "
+                f"{porcentaje_anterior}% mismo mes del año anterior."
+            )
+
+        st.caption(
+            "La formula aplicada es: Prediccion ajustada = "
+            "(Peso V2 x Prediccion V2) + "
+            "((1 - Peso V2) x Venta del mismo mes del año anterior)."
+        )
 
         # -----------------------------------------------------
         # VENTA HISTORICA Y PREDICCION ACUMULADAS
