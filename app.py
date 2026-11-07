@@ -12,10 +12,10 @@ st.set_page_config(
     page_icon="📦",
     layout="wide",
 )
-st.title("📦 Consulta acumulable de ventas y proyecciones")
+st.title("📦 Consulta acumulable con ajuste estacional y reconciliacion")
 st.caption(
     "Consulta acumulable por categoria, combo y descripcion, con interpretacion "
-    "del indice estacional y del peso aplicado a los meses historicos."
+    "por mes, recurrencia de SKU y crecimiento objetivo de la seleccion."
 )
 
 MESES = {
@@ -174,21 +174,20 @@ def predecir_recursivo(modelo, medianas, historico, periodos):
     return preds
 
 
-def calcular_indice_estacional_nov_dic(historial, anio_limite=None):
-    """Calcula estacionalidad Nov-Dic usando solo años anteriores al objetivo."""
+def calcular_indice_estacional_mes(historial, mes_objetivo, anio_limite=None):
+    """Indice del mes objetivo contra el promedio Ene-Oct de años anteriores."""
     h = historial.sort_values("Periodo").copy()
     if anio_limite is not None:
         h = h[h["AÑO"] < anio_limite].copy()
 
-    temporada = h[h["MES_NUM"].isin([11, 12])]["VENTA"].astype(float)
-    resto = h[~h["MES_NUM"].isin([11, 12])]["VENTA"].astype(float)
-
-    if len(temporada) < 2 or len(resto) < 6:
+    ventas_mes = h[h["MES_NUM"] == mes_objetivo]["VENTA"].astype(float)
+    base_regular = h[h["MES_NUM"].between(1, 10)]["VENTA"].astype(float)
+    if len(ventas_mes) < 1 or len(base_regular) < 6:
         return 1.0
-    promedio_resto = float(resto.mean())
-    if promedio_resto <= 0:
+    promedio_base = float(base_regular.mean())
+    if promedio_base <= 0:
         return 1.0
-    return float(temporada.mean() / promedio_resto)
+    return float(ventas_mes.mean() / promedio_base)
 
 
 def ajustar_prediccion_estacional(
@@ -196,40 +195,56 @@ def ajustar_prediccion_estacional(
     historial,
     periodo_objetivo,
     peso_modelo=0.60,
-    umbral_estacional=1.40,
+    umbral_noviembre=1.20,
+    umbral_diciembre=1.30,
+    indice_maximo=3.00,
+    meses_activos_minimos=8,
 ):
-    """
-    Combina V2 con el mismo mes del año anterior solo para SKU estacionales
-    y objetivos de noviembre/diciembre. No altera la predicción base.
-    """
+    """Ajusta Nov-Dic por mes, con control de recurrencia e índices extremos."""
     h = historial.sort_values("Periodo").copy()
     mes_objetivo = int(periodo_objetivo % 100)
     anio_objetivo = int(periodo_objetivo // 100)
 
     if mes_objetivo not in [11, 12]:
-        return float(prediccion_modelo), 1.0, np.nan, False
+        return float(prediccion_modelo), 1.0, 1.0, np.nan, False, "Mes no estacional"
 
-    indice = calcular_indice_estacional_nov_dic(
-        h, anio_limite=anio_objetivo
+    indice_original = calcular_indice_estacional_mes(
+        h, mes_objetivo, anio_limite=anio_objetivo
     )
-    es_estacional = indice >= umbral_estacional
-    if not es_estacional:
-        return float(prediccion_modelo), indice, np.nan, False
+    indice_utilizado = float(np.clip(indice_original, 0.50, indice_maximo))
+    umbral = umbral_noviembre if mes_objetivo == 11 else umbral_diciembre
+    meses_activos_12 = int((h.tail(12)["VENTA"].astype(float) > 0).sum())
+
+    if indice_utilizado < umbral:
+        return (
+            float(prediccion_modelo), indice_original, indice_utilizado,
+            np.nan, False, "Indice inferior al umbral"
+        )
+    if meses_activos_12 < meses_activos_minimos:
+        return (
+            float(prediccion_modelo), indice_original, indice_utilizado,
+            np.nan, False, "Actividad reciente insuficiente"
+        )
 
     mismo_mes = h[
         (h["MES_NUM"] == mes_objetivo)
         & (h["AÑO"] < anio_objetivo)
     ].sort_values("AÑO")
-
     if mismo_mes.empty:
-        return float(prediccion_modelo), indice, np.nan, False
+        return (
+            float(prediccion_modelo), indice_original, indice_utilizado,
+            np.nan, False, "Sin referencia del año anterior"
+        )
 
     venta_anio_anterior = float(mismo_mes.iloc[-1]["VENTA"])
     pred_ajustada = (
         peso_modelo * float(prediccion_modelo)
         + (1.0 - peso_modelo) * venta_anio_anterior
     )
-    return max(0.0, pred_ajustada), indice, venta_anio_anterior, True
+    return (
+        max(0.0, pred_ajustada), indice_original, indice_utilizado,
+        venta_anio_anterior, True, "Ajuste estacional aplicado"
+    )
 
 
 def ajustar_lista_estacional(
@@ -237,23 +252,57 @@ def ajustar_lista_estacional(
     historial,
     periodos,
     peso_modelo=0.60,
-    umbral_estacional=1.40,
+    umbral_noviembre=1.20,
+    umbral_diciembre=1.30,
+    indice_maximo=3.00,
+    meses_activos_minimos=8,
 ):
     ajustadas, diagnostico = [], []
     for pred_base, periodo in zip(predicciones_base, periodos):
-        pred_aj, indice, referencia, aplicado = ajustar_prediccion_estacional(
-            pred_base, historial, periodo, peso_modelo, umbral_estacional
+        resultado = ajustar_prediccion_estacional(
+            pred_base, historial, periodo, peso_modelo,
+            umbral_noviembre, umbral_diciembre,
+            indice_maximo, meses_activos_minimos,
         )
+        pred_aj, indice, indice_usado, referencia, aplicado, motivo = resultado
         ajustadas.append(pred_aj)
         diagnostico.append({
             "Periodo": periodo,
             "Pred_Base": float(pred_base),
             "Pred_Ajustada": float(pred_aj),
-            "Indice_Nov_Dic": float(indice),
+            "Indice_Original": float(indice),
+            "Indice_Utilizado": float(indice_usado),
             "Venta_Mismo_Mes_Anterior": referencia,
             "Ajuste_Aplicado": aplicado,
+            "Motivo": motivo,
         })
     return ajustadas, diagnostico
+
+
+def calcular_crecimiento_ytd(hist_acumulado, anio_actual, mes_corte):
+    """Crecimiento Ene-mes_corte del año actual contra el año anterior."""
+    actual = hist_acumulado[
+        (hist_acumulado["Periodo"] // 100 == anio_actual)
+        & (hist_acumulado["Periodo"] % 100 <= mes_corte)
+    ]["VENTA"].sum()
+    anterior = hist_acumulado[
+        (hist_acumulado["Periodo"] // 100 == anio_actual - 1)
+        & (hist_acumulado["Periodo"] % 100 <= mes_corte)
+    ]["VENTA"].sum()
+    if anterior <= 0:
+        return np.nan
+    return float(actual / anterior - 1.0)
+
+
+def reconciliar_proyeccion(predicciones, referencias, crecimiento_objetivo, limite):
+    """Alinea el total proyectado con el mismo mes anterior más crecimiento objetivo."""
+    suma_pred = float(np.sum(predicciones))
+    suma_ref = float(np.nansum(referencias))
+    if suma_pred <= 0 or suma_ref <= 0:
+        return list(predicciones), 1.0, np.nan
+    objetivo = suma_ref * (1.0 + crecimiento_objetivo)
+    factor = float(np.clip(objetivo / suma_pred, 1.0 - limite, 1.0 + limite))
+    return [float(x) * factor for x in predicciones], factor, objetivo
 
 
 @st.cache_data(show_spinner="Leyendo y normalizando archivos...", max_entries=3)
@@ -986,29 +1035,43 @@ archivos = st.file_uploader(
 
 with st.sidebar:
     st.header("Ajuste estacional")
-    usar_ajuste_estacional = st.checkbox(
-        "Activar ajuste Nov-Dic", value=True
-    )
+    usar_ajuste_estacional = st.checkbox("Activar ajuste Nov-Dic", value=True)
+
     peso_meses_historicos = st.slider(
-        "Peso de los meses historicos Nov-Dic",
-        min_value=0.00,
-        max_value=1.00,
-        value=0.40,
-        step=0.05,
-        help=(
-            "Define cuanto pesa la venta del mismo mes del año anterior. "
-            "Ejemplo: 0.70 significa 70% mes historico y 30% prediccion V2."
-        ),
+        "Peso de los meses historicos",
+        min_value=0.00, max_value=1.00, value=0.40, step=0.05,
+        help="0.40 equivale a 40% mismo mes anterior y 60% modelo V2.",
     )
-    # La funcion existente recibe el peso de V2. Se calcula como complemento
-    # para conservar exactamente la misma formula del ajuste estacional.
     peso_modelo_estacional = 1.00 - peso_meses_historicos
-    umbral_estacional = st.slider(
-        "Umbral indice Nov-Dic",
-        min_value=1.10,
-        max_value=2.50,
-        value=1.40,
-        step=0.05,
+
+    umbral_noviembre = st.slider(
+        "Umbral noviembre", 1.00, 2.50, 1.20, 0.05
+    )
+    umbral_diciembre = st.slider(
+        "Umbral diciembre", 1.00, 3.00, 1.30, 0.05
+    )
+    indice_maximo = st.slider(
+        "Indice maximo utilizado", 1.50, 5.00, 3.00, 0.25,
+        help="Evita que bases cercanas a cero produzcan índices extremos.",
+    )
+    meses_activos_minimos = st.slider(
+        "Meses activos minimos (ultimos 12)", 1, 12, 8,
+        help="El ajuste SKU solo se aplica a productos con actividad recurrente.",
+    )
+
+    st.divider()
+    st.header("Reconciliacion del total")
+    usar_reconciliacion = st.checkbox(
+        "Alinear con crecimiento objetivo", value=True
+    )
+    crecimiento_objetivo_pct = st.slider(
+        "Crecimiento objetivo vs mismo mes anterior (%)",
+        min_value=-10.0, max_value=15.0, value=5.0, step=0.5,
+    )
+    limite_reconciliacion_pct = st.slider(
+        "Limite de reconciliacion (+/- %)",
+        min_value=0.0, max_value=25.0, value=15.0, step=1.0,
+        help="Limita el ajuste adicional aplicado al total seleccionado.",
     )
 
 if archivos:
@@ -1162,15 +1225,20 @@ if archivos:
                     hist_producto,
                     periodos,
                     peso_modelo=peso_modelo_estacional,
-                    umbral_estacional=umbral_estacional,
+                    umbral_noviembre=umbral_noviembre,
+                    umbral_diciembre=umbral_diciembre,
+                    indice_maximo=indice_maximo,
+                    meses_activos_minimos=meses_activos_minimos,
                 )
             else:
                 pred_ajustada = list(pred_producto)
                 diag_est = [
                     {
-                        "Indice_Nov_Dic": calcular_indice_estacional_nov_dic(hist_producto),
+                        "Indice_Original": 1.0,
+                        "Indice_Utilizado": 1.0,
                         "Venta_Mismo_Mes_Anterior": np.nan,
                         "Ajuste_Aplicado": False,
+                        "Motivo": "Ajuste desactivado",
                     }
                     for _ in periodos
                 ]
@@ -1186,13 +1254,39 @@ if archivos:
                 f"Pred Ajustada {periodos[0]}": pred_ajustada[0],
                 f"Pred Base {periodos[1]}": pred_producto[1],
                 f"Pred Ajustada {periodos[1]}": pred_ajustada[1],
-                "Indice_Nov_Dic": diag_est[0]["Indice_Nov_Dic"],
+                "Indice_Noviembre": diag_est[0]["Indice_Original"],
+                "Indice_Diciembre": diag_est[1]["Indice_Original"],
+                "Indice_Usado_Noviembre": diag_est[0]["Indice_Utilizado"],
+                "Indice_Usado_Diciembre": diag_est[1]["Indice_Utilizado"],
                 f"Referencia {periodos[0]}": diag_est[0]["Venta_Mismo_Mes_Anterior"],
                 f"Referencia {periodos[1]}": diag_est[1]["Venta_Mismo_Mes_Anterior"],
                 "Ajuste_Estacional": any(d["Ajuste_Aplicado"] for d in diag_est),
+                "Motivo_Noviembre": diag_est[0]["Motivo"],
+                "Motivo_Diciembre": diag_est[1]["Motivo"],
             })
 
         detalle_pred = pd.DataFrame(predicciones_sku)
+
+        # Reconciliacion jerarquica de la seleccion contra el mismo mes anterior.
+        crecimiento_objetivo = crecimiento_objetivo_pct / 100.0
+        limite_reconciliacion = limite_reconciliacion_pct / 100.0
+        factores_reconciliacion = [1.0, 1.0]
+        objetivos_reconciliacion = [np.nan, np.nan]
+
+        if usar_reconciliacion:
+            for j, periodo in enumerate(periodos):
+                columna_pred = f"Pred Ajustada {periodo}"
+                columna_ref = f"Referencia {periodo}"
+                pred_reconciliada, factor, objetivo = reconciliar_proyeccion(
+                    detalle_pred[columna_pred].astype(float).tolist(),
+                    detalle_pred[columna_ref].astype(float).tolist(),
+                    crecimiento_objetivo,
+                    limite_reconciliacion,
+                )
+                detalle_pred[columna_pred] = pred_reconciliada
+                factores_reconciliacion[j] = factor
+                objetivos_reconciliacion[j] = objetivo
+
         pred_base_acum = [
             float(detalle_pred[f"Pred Base {periodos[0]}"].sum()),
             float(detalle_pred[f"Pred Base {periodos[1]}"].sum()),
@@ -1216,6 +1310,30 @@ if archivos:
             delta=f"Base V2: ${pred_base_acum[1]:,.2f}",
             delta_color="off",
         )
+
+        anio_actual = int(ultimo // 100)
+        mes_corte = int(ultimo % 100)
+        crecimiento_ytd = calcular_crecimiento_ytd(
+            hist_acumulado, anio_actual, mes_corte
+        )
+        r1, r2, r3 = st.columns(3)
+        r1.metric(
+            f"Crecimiento YTD {anio_actual} vs {anio_actual-1}",
+            f"{crecimiento_ytd*100:+.2f}%" if pd.notna(crecimiento_ytd) else "N/D",
+        )
+        r2.metric(
+            f"Factor reconciliacion {periodos[0]}",
+            f"{factores_reconciliacion[0]:.3f}x",
+        )
+        r3.metric(
+            f"Factor reconciliacion {periodos[1]}",
+            f"{factores_reconciliacion[1]:.3f}x",
+        )
+        if usar_reconciliacion:
+            st.caption(
+                f"Objetivo seleccionado: {crecimiento_objetivo_pct:+.1f}% frente al "
+                f"mismo mes anterior, con limite de ajuste +/-{limite_reconciliacion_pct:.0f}%."
+            )
 
         real_graf = hist_acumulado.rename(columns={"VENTA": "Valor"}).copy()
         real_graf["Serie"] = "Venta historica acumulada"
@@ -1311,7 +1429,8 @@ if archivos:
 
         porcentaje_v2 = int(round(peso_modelo_estacional * 100))
         porcentaje_anterior = 100 - porcentaje_v2
-        incremento_umbral = int(round((umbral_estacional - 1.0) * 100))
+        incremento_umbral_nov = int(round((umbral_noviembre - 1.0) * 100))
+        incremento_umbral_dic = int(round((umbral_diciembre - 1.0) * 100))
 
         if peso_meses_historicos <= 0.10:
             interpretacion_peso = "Ajuste muy ligero: predomina V2"
@@ -1326,14 +1445,10 @@ if archivos:
         else:
             interpretacion_peso = "Usa solamente el mismo mes del año anterior"
 
-        if umbral_estacional < 1.20:
-            interpretacion_umbral = "Detecta estacionalidad ligera"
-        elif umbral_estacional < 1.40:
-            interpretacion_umbral = "Detecta estacionalidad moderada"
-        elif umbral_estacional < 2.00:
-            interpretacion_umbral = "Exige estacionalidad clara"
-        else:
-            interpretacion_umbral = "Solo detecta estacionalidad muy fuerte"
+        interpretacion_umbral = (
+            f"Noviembre requiere +{incremento_umbral_nov}% y "
+            f"diciembre +{incremento_umbral_dic}% frente a meses regulares"
+        )
 
         i1, i2 = st.columns(2)
         with i1:
@@ -1350,13 +1465,13 @@ if archivos:
 
         with i2:
             st.metric(
-                "Umbral actual del indice Nov-Dic",
-                f"{umbral_estacional:.2f}",
+                "Umbrales actuales Nov / Dic",
+                f"{umbral_noviembre:.2f} / {umbral_diciembre:.2f}",
                 help="Nivel minimo de estacionalidad requerido para aplicar el ajuste.",
             )
             st.write(
-                f"El ajuste se aplica cuando Nov-Dic vende al menos "
-                f"**{incremento_umbral}% mas** que el resto del año."
+                f"Noviembre debe vender al menos **{incremento_umbral_nov}% mas** y "
+                f"diciembre **{incremento_umbral_dic}% mas** que Ene-Oct."
             )
             st.caption(interpretacion_umbral)
 
@@ -1378,8 +1493,9 @@ if archivos:
                 hide_index=True,
             )
             st.info(
-                f"Configuracion actual: el producto debe alcanzar un indice de "
-                f"{umbral_estacional:.2f} o superior para recibir el ajuste."
+                f"Configuracion actual: noviembre requiere {umbral_noviembre:.2f}; "
+                f"diciembre requiere {umbral_diciembre:.2f}. El indice usado se limita "
+                f"a un maximo de {indice_maximo:.2f}."
             )
 
         with st.expander("Ver como interpretar el peso de los meses historicos", expanded=False):
@@ -1417,4 +1533,3 @@ if archivos:
 
     except Exception as e:
         st.exception(e)
-
