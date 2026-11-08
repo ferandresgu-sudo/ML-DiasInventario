@@ -30,21 +30,45 @@ def _texto_codigo(s):
 @st.cache_data(show_spinner=False)
 def cargar_archivos(contenidos, nombres):
     partes = []
-    requeridas = {"CODIGO", "VENTA", "UNIDADES", "MES", "AÑO"}
-    utiles = requeridas | {"PRECIO PROMEDIO", "DESCRIPCION", "CATEGORIA",
-                           "FAMILIA", "TIPO", "COMBOS"}
+    diagnostico = []
+    base_requerida = {"CODIGO", "VENTA", "MES", "AÑO"}
+    utiles = base_requerida | {"UNIDADES", "PRECIO PROMEDIO", "DESCRIPCION",
+                              "CATEGORIA", "FAMILIA", "TIPO", "COMBOS"}
     for contenido, nombre in zip(contenidos, nombres):
         hojas = pd.read_excel(io.BytesIO(contenido), sheet_name=None, engine="openpyxl")
+        hojas_aceptadas = 0
+        filas_archivo = 0
+        anos_archivo = set()
         for hoja, h in hojas.items():
             if h is None or h.empty:
                 continue
             h = h.copy()
             h.columns = [str(c).strip().upper() for c in h.columns]
-            if not requeridas.issubset(h.columns):
+
+            # Acepta el nombre nuevo y, por seguridad, corrige archivos antiguos.
+            candidatos_unidades = [c for c in h.columns if c == "UNIDADES" or c.startswith("UNIDADES ")]
+            if "UNIDADES" not in h.columns and candidatos_unidades:
+                h = h.rename(columns={candidatos_unidades[0]: "UNIDADES"})
+
+            faltantes = sorted(base_requerida - set(h.columns))
+            if faltantes or "UNIDADES" not in h.columns:
+                diagnostico.append({"Archivo": nombre, "Hoja": hoja, "Estado": "Omitida",
+                    "Detalle": "Faltan: " + ", ".join(faltantes + ([] if "UNIDADES" in h.columns else ["UNIDADES"]))})
                 continue
-            partes.append(h[[c for c in h.columns if c in utiles]])
+
+            temp = h[[c for c in h.columns if c in utiles]].copy()
+            temp["ARCHIVO_ORIGEN"] = nombre
+            temp["HOJA_ORIGEN"] = hoja
+            partes.append(temp)
+            hojas_aceptadas += 1
+            filas_archivo += len(temp)
+            anos_archivo.update(pd.to_numeric(temp["AÑO"], errors="coerce").dropna().astype(int).unique())
+
+        diagnostico.append({"Archivo": nombre, "Hoja": "TOTAL", "Estado": "Cargado" if hojas_aceptadas else "Sin datos",
+                            "Detalle": f"{hojas_aceptadas} hojas, {filas_archivo:,} filas, años {sorted(anos_archivo)}"})
+
     if not partes:
-        raise ValueError("No se encontraron hojas con CODIGO, VENTA, UNIDADES, MES y AÑO.")
+        raise ValueError("No se encontraron hojas válidas con CODIGO, VENTA, UNIDADES, MES y AÑO.")
 
     df = pd.concat(partes, ignore_index=True)
     df["CODIGO"] = _texto_codigo(df["CODIGO"])
@@ -55,7 +79,9 @@ def cargar_archivos(contenidos, nombres):
             df[c] = pd.to_numeric(df[c], errors="coerce")
     df["VENTA"] = df["VENTA"].fillna(0).clip(lower=0)
     df["UNIDADES"] = df["UNIDADES"].fillna(0).clip(lower=0)
-    df["COMBOS"] = pd.to_numeric(df.get("COMBOS", 0), errors="coerce").fillna(0).clip(0, 1).astype(int)
+    if "COMBOS" not in df.columns:
+        df["COMBOS"] = 0
+    df["COMBOS"] = pd.to_numeric(df["COMBOS"], errors="coerce").fillna(0).clip(0, 1).astype(int)
     df = df.dropna(subset=["CODIGO", "MES_NUM", "AÑO"])
     df["AÑO"] = df["AÑO"].astype(int)
     df["Periodo"] = df["AÑO"] * 100 + df["MES_NUM"].astype(int)
@@ -63,14 +89,12 @@ def cargar_archivos(contenidos, nombres):
     meta_cols = [c for c in ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO", "COMBOS"] if c in df]
     agg = {"VENTA": "sum", "UNIDADES": "sum", **{c: "first" for c in meta_cols}}
     g = df.groupby(["CODIGO", "Periodo", "MES_NUM", "AÑO"], as_index=False).agg(agg)
-
-    # El precio se recalcula de forma ponderada. Nunca se suma ni se promedia sin ponderar.
     g["PRECIO_PROMEDIO"] = np.where(g["UNIDADES"] > 0, g["VENTA"] / g["UNIDADES"], np.nan)
     for c in ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO"]:
         if c not in g:
             g[c] = "SIN_DATO"
         g[c] = g[c].fillna("SIN_DATO").astype(str)
-    return completar_calendario(g)
+    return completar_calendario(g), pd.DataFrame(diagnostico)
 
 
 def completar_calendario(df):
@@ -214,8 +238,16 @@ st.sidebar.caption(f"Venta final = {peso_directo:.0%} venta directa + {1-peso_di
 
 if archivos:
     try:
-        df = cargar_archivos([a.getvalue() for a in archivos], [a.name for a in archivos])
-        st.success(f"{len(df):,} registros mensuales | {df.CODIGO.nunique():,} productos")
+        df, diagnostico_carga = cargar_archivos([a.getvalue() for a in archivos], [a.name for a in archivos])
+        anos = sorted(df["AÑO"].dropna().astype(int).unique().tolist())
+        conteo_por_ano = df.groupby("AÑO")["CODIGO"].nunique().to_dict()
+        st.success(f"{len(df):,} registros mensuales | {df.CODIGO.nunique():,} productos únicos | años {anos}")
+        st.write("Productos por año:", {int(k): int(v) for k, v in conteo_por_ano.items()})
+        with st.expander("Diagnóstico de archivos y hojas"):
+            st.dataframe(diagnostico_carga, use_container_width=True, hide_index=True)
+        faltan_anios = sorted({2024, 2025, 2026} - set(anos))
+        if faltan_anios:
+            st.error(f"Faltan archivos o datos de los años: {faltan_anios}. Carga los tres Excel antes del backtest.")
         inconsist = df[(df.UNIDADES == 0) & (df.VENTA > 0)]
         if len(inconsist):
             st.warning(f"Hay {len(inconsist):,} producto-mes con venta positiva y cero unidades. Revisa esos casos.")
@@ -224,6 +256,11 @@ if archivos:
         prueba = st.selectbox("Periodo", ["Nov-Dic 2025", "Sep-Oct 2026"])
         periodos_bt = [202511, 202512] if prueba == "Nov-Dic 2025" else [202609, 202610]
         if st.button("Ejecutar backtest", type="primary"):
+            periodos_disponibles = set(df["Periodo"].astype(int))
+            faltantes_bt = [p for p in periodos_bt if p not in periodos_disponibles]
+            if faltantes_bt:
+                st.error(f"No se puede ejecutar: faltan periodos reales {faltantes_bt}. Revisa que VENTAS 2025 y VENTAS 2026 estén cargados.")
+                st.stop()
             with st.spinner("Entrenando tres modelos y evaluando..."):
                 bt = backtest(df, periodos_bt, peso_directo)
             if bt.empty:
@@ -259,5 +296,4 @@ if archivos:
         st.exception(e)
 else:
     st.info("Carga los tres archivos para comenzar.")
-
 
