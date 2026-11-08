@@ -16,10 +16,10 @@ st.set_page_config(
     page_icon="📦",
     layout="wide",
 )
-st.title("📦 Consulta acumulable de ventas y proyecciones")
+st.title("📦 Validación y optimización del forecast estacional")
 st.caption(
-    "Consulta acumulable por categoria, combo y descripcion, con interpretacion "
-    "del indice estacional y del peso aplicado a la forecast CatBoost."
+    "Backtesting temporal de CatBoost y selección objetiva del ajuste estacional "
+    "para noviembre y diciembre."
 )
 
 MESES = {
@@ -1099,6 +1099,115 @@ def crear_indices_rapidos(df):
     return historicos, ultimos
 
 
+
+@st.cache_data(show_spinner=False)
+def optimizar_ajuste_estacional(df, periodos_objetivo=(202511, 202512)):
+    """Busca peso y umbral sin reentrenar CatBoost para cada combinación.
+
+    CatBoost se entrena una sola vez con datos anteriores al corte. Después se
+    recalcula únicamente el ajuste estacional, por lo que todas las métricas
+    corresponden a la predicción final ajustada.
+    """
+    periodos_objetivo = sorted(int(x) for x in periodos_objetivo)
+    corte = periodos_objetivo[0]
+    train = df[df["Periodo"] < corte].copy()
+    real = df[df["Periodo"].isin(periodos_objetivo)].copy()
+    if train.empty or real.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    modelo_bt, medianas_bt = entrenar(train)
+    bases = []
+    codigos = sorted(set(train["CODIGO"]).intersection(real["CODIGO"]))
+    for codigo in codigos:
+        hist = train[train["CODIGO"] == codigo].sort_values("Periodo")
+        real_sku = real[real["CODIGO"] == codigo].sort_values("Periodo")
+        periodos = real_sku["Periodo"].astype(int).tolist()
+        if hist.empty or not periodos:
+            continue
+        pred_base = predecir_recursivo(modelo_bt, medianas_bt, hist, periodos)
+        for (_, r), pb in zip(real_sku.iterrows(), pred_base):
+            bases.append({
+                "CODIGO": codigo,
+                "Periodo_Real": int(r["Periodo"]),
+                "Actual": float(r["VENTA"]),
+                "Pred_Base": float(pb),
+                "Historial": hist,
+            })
+
+    pesos = np.round(np.arange(0.40, 0.91, 0.05), 2)
+    umbrales = np.round(np.arange(1.00, 1.41, 0.05), 2)
+    filas_metricas, filas_pred = [], []
+    for peso in pesos:
+        for umbral in umbrales:
+            detalle = []
+            for b in bases:
+                pred, indice, referencia, aplicado = ajustar_prediccion_estacional(
+                    b["Pred_Base"], b["Historial"], b["Periodo_Real"],
+                    peso_modelo=float(peso), umbral_estacional=float(umbral),
+                )
+                detalle.append({
+                    "CODIGO": b["CODIGO"], "Periodo_Real": b["Periodo_Real"],
+                    "Actual": b["Actual"], "Prediccion": float(pred),
+                    "Pred_Base": b["Pred_Base"], "Ajuste_Estacional": aplicado,
+                    "Peso_Modelo": float(peso), "Umbral": float(umbral),
+                })
+            d = pd.DataFrame(detalle)
+            m = calcular_metricas_forecast(d)
+            filas_metricas.append({
+                "Peso_Modelo": float(peso), "Umbral": float(umbral),
+                **m, "Ajustes_Aplicados": int(d["Ajuste_Estacional"].sum()),
+            })
+            filas_pred.extend(detalle)
+
+    tabla = pd.DataFrame(filas_metricas)
+    # Selección multiobjetivo mediante ranking. WAPE y sesgo tienen prioridad.
+    tabla["ABS_SESGO"] = tabla["SESGO_PCT"].abs()
+    tabla["Rank_WAPE"] = tabla["WAPE"].rank(method="min")
+    tabla["Rank_MAE"] = tabla["MAE"].rank(method="min")
+    tabla["Rank_RMSE"] = tabla["RMSE"].rank(method="min")
+    tabla["Rank_R2"] = (-tabla["R2"].fillna(-np.inf)).rank(method="min")
+    tabla["Rank_SESGO"] = tabla["ABS_SESGO"].rank(method="min")
+    tabla["Score"] = (
+        0.35 * tabla["Rank_WAPE"] + 0.15 * tabla["Rank_MAE"] +
+        0.20 * tabla["Rank_RMSE"] + 0.10 * tabla["Rank_R2"] +
+        0.20 * tabla["Rank_SESGO"]
+    )
+    tabla = tabla.sort_values(
+        ["Score", "WAPE", "ABS_SESGO", "RMSE"], ascending=True
+    ).reset_index(drop=True)
+    tabla["Configuracion"] = np.arange(1, len(tabla) + 1)
+    return tabla, pd.DataFrame(filas_pred)
+
+
+def mostrar_optimizacion(tabla):
+    if tabla.empty:
+        st.warning("No hay datos suficientes para optimizar Nov-Dic 2025.")
+        return
+    mejor = tabla.iloc[0]
+    st.success(
+        f"Configuración recomendada: peso CatBoost {mejor['Peso_Modelo']:.2f} y "
+        f"umbral estacional {mejor['Umbral']:.2f}."
+    )
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("WAPE ajustado", f"{mejor['WAPE']:.2f}%")
+    c2.metric("MAE ajustado", f"${mejor['MAE']:,.2f}")
+    c3.metric("RMSE ajustado", f"${mejor['RMSE']:,.2f}")
+    c4.metric("R² ajustado", f"{mejor['R2']:.3f}" if pd.notna(mejor['R2']) else "N/D")
+    c5.metric("Sesgo ajustado", f"{mejor['SESGO_PCT']:+.2f}%")
+    st.caption(
+        "La recomendación se determina con ranking ponderado: WAPE 35%, RMSE 20%, "
+        "sesgo absoluto 20%, MAE 15% y R² 10%. Todas las métricas se calculan "
+        "después de aplicar el ajuste estacional."
+    )
+    cols = ["Configuracion", "Peso_Modelo", "Umbral", "WAPE", "MAE", "RMSE", "R2", "SESGO_PCT", "Ajustes_Aplicados", "Score"]
+    st.dataframe(
+        tabla[cols].head(15).style.format({
+            "Peso_Modelo": "{:.2f}", "Umbral": "{:.2f}", "WAPE": "{:.2f}%",
+            "MAE": "${:,.2f}", "RMSE": "${:,.2f}", "R2": "{:.3f}",
+            "SESGO_PCT": "{:+.2f}%", "Score": "{:.2f}",
+        }), use_container_width=True, hide_index=True,
+    )
+
 # =========================================================
 # INTERFAZ
 # =========================================================
@@ -1180,386 +1289,21 @@ if archivos:
                 "- Prioriza WAPE y sesgo para el total; RMSE detecta errores extremos por SKU. R2 es complementario."
             )
 
-        # CONSULTA ACUMULABLE: CATEGORIA, COMBO Y DESCRIPCION
-        # =====================================================
-        st.subheader("Consulta acumulable por categoria, combo y descripcion")
-        st.caption(
-            "Los filtros acumulan la venta historica y las predicciones de los SKU "
-            "seleccionados. El modelo V2 no se reentrena ni cambia."
+        st.divider()
+        st.subheader("Optimización automática del ajuste estacional")
+        st.write(
+            "La búsqueda evalúa 99 combinaciones sobre Nov-Dic 2025: pesos CatBoost "
+            "de 0.40 a 0.90 y umbrales de 1.00 a 1.40. El modelo se entrena solo "
+            "con información disponible hasta octubre de 2025."
         )
-
-        ult_consulta = ult.copy()
-        for col in ["CATEGORIA", "DESCRIPCION"]:
-            if col not in ult_consulta.columns:
-                ult_consulta[col] = "Sin dato"
-            ult_consulta[col] = (
-                ult_consulta[col]
-                .fillna("Sin dato")
-                .astype(str)
-                .str.strip()
-            )
-            ult_consulta.loc[ult_consulta[col].eq(""), col] = "Sin dato"
-
-        if "COMBOS" not in ult_consulta.columns:
-            ult_consulta["COMBOS"] = 0
-        ult_consulta["COMBOS"] = (
-            pd.to_numeric(ult_consulta["COMBOS"], errors="coerce")
-            .fillna(0)
-            .clip(0, 1)
-            .astype(int)
-        )
-
-        # Filtros encadenados.
-        fc1, fc2 = st.columns(2)
-        with fc1:
-            categoria_consulta = st.selectbox(
-                "CATEGORIA",
-                ["Todas"] + sorted(ult_consulta["CATEGORIA"].unique().tolist()),
-                key="consulta_categoria",
-            )
-        if categoria_consulta != "Todas":
-            ult_consulta = ult_consulta[
-                ult_consulta["CATEGORIA"] == categoria_consulta
-            ].copy()
-
-        with fc2:
-            combo_consulta = st.selectbox(
-                "COMBO",
-                ["Todos", "No combo (0)", "Combo (1)"],
-                key="consulta_combo",
-            )
-        if combo_consulta == "No combo (0)":
-            ult_consulta = ult_consulta[ult_consulta["COMBOS"] == 0].copy()
-        elif combo_consulta == "Combo (1)":
-            ult_consulta = ult_consulta[ult_consulta["COMBOS"] == 1].copy()
-
-        descripciones_disponibles = sorted(
-            ult_consulta["DESCRIPCION"].dropna().unique().tolist()
-        )
-        modo_descripcion = st.radio(
-            "Seleccion de DESCRIPCION",
-            ["Todas las descripciones disponibles", "Seleccion manual"],
-            horizontal=True,
-            key="consulta_modo_descripcion",
-        )
-
-        if modo_descripcion == "Todas las descripciones disponibles":
-            descripciones_sel = descripciones_disponibles
-        else:
-            descripciones_sel = st.multiselect(
-                "DESCRIPCION",
-                options=descripciones_disponibles,
-                default=[],
-                placeholder="Selecciona una o varias descripciones",
-                key="consulta_descripciones",
-            )
-
-        if not descripciones_sel:
-            st.warning(
-                "No hay descripciones seleccionadas. Elige al menos una o selecciona "
-                "'Todas las descripciones disponibles'."
-            )
-            st.stop()
-
-        seleccion_sku = ult_consulta[
-            ult_consulta["DESCRIPCION"].isin(descripciones_sel)
-        ].copy()
-        codigos_seleccionados = seleccion_sku["CODIGO"].drop_duplicates().tolist()
-
-        if not codigos_seleccionados:
-            st.warning("No hay productos para la combinacion de filtros seleccionada.")
-            st.stop()
-
+        if st.button("Encontrar mejor configuración", type="primary", key="optimizar_ajuste"):
+            with st.spinner("Evaluando configuraciones sobre Nov-Dic 2025..."):
+                tabla_opt, _ = optimizar_ajuste_estacional(df, (202511, 202512))
+            mostrar_optimizacion(tabla_opt)
         st.info(
-            f"Consulta formada por {len(codigos_seleccionados):,} SKU y "
-            f"{len(descripciones_sel):,} descripciones."
+            "Usa la configuración recomendada como punto de partida final. Antes de "
+            "adoptarla, confirma que también mantenga resultados razonables en Sep-Oct "
+            "2026 y revisa que el sesgo de Nov-Dic 2025 permanezca cerca de cero."
         )
-
-        # -----------------------------------------------------
-        # VENTA HISTORICA Y PREDICCION ACUMULADAS
-        # -----------------------------------------------------
-        ultimo = int(df["Periodo"].max())
-        fecha = pd.Timestamp(ultimo // 100, ultimo % 100, 1)
-        periodos = []
-        for i in [1, 2]:
-            f = fecha + pd.DateOffset(months=i)
-            periodos.append(f.year * 100 + f.month)
-
-        historicos_seleccionados = [
-            historicos_por_codigo[codigo]
-            for codigo in codigos_seleccionados
-            if codigo in historicos_por_codigo
-        ]
-        hist_acumulado = (
-            pd.concat(historicos_seleccionados, ignore_index=True)
-            .groupby("Periodo", as_index=False)
-            .agg(VENTA=("VENTA", "sum"))
-            .sort_values("Periodo")
-        )
-
-        predicciones_sku = []
-        for codigo in codigos_seleccionados:
-            hist_producto = historicos_por_codigo[codigo]
-            pred_producto = predecir_recursivo(
-                modelo,
-                medianas,
-                hist_producto,
-                periodos,
-            )
-            if usar_ajuste_estacional:
-                pred_ajustada, diag_est = ajustar_lista_estacional(
-                    pred_producto,
-                    hist_producto,
-                    periodos,
-                    peso_modelo=peso_modelo_estacional,
-                    umbral_estacional=umbral_estacional,
-                )
-            else:
-                pred_ajustada = list(pred_producto)
-                diag_est = [
-                    {
-                        "Indice_Nov_Dic": calcular_indice_estacional_nov_dic(hist_producto),
-                        "Venta_Mismo_Mes_Anterior": np.nan,
-                        "Ajuste_Aplicado": False,
-                    }
-                    for _ in periodos
-                ]
-            meta_producto = seleccion_sku[
-                seleccion_sku["CODIGO"] == codigo
-            ].iloc[0]
-            predicciones_sku.append({
-                "CODIGO": codigo,
-                "DESCRIPCION": meta_producto.get("DESCRIPCION", ""),
-                "CATEGORIA": meta_producto.get("CATEGORIA", ""),
-                "COMBOS": int(meta_producto.get("COMBOS", 0)),
-                f"Pred Base {periodos[0]}": pred_producto[0],
-                f"Pred Ajustada {periodos[0]}": pred_ajustada[0],
-                f"Pred Base {periodos[1]}": pred_producto[1],
-                f"Pred Ajustada {periodos[1]}": pred_ajustada[1],
-                "Indice_Nov_Dic": diag_est[0]["Indice_Nov_Dic"],
-                f"Referencia {periodos[0]}": diag_est[0]["Venta_Mismo_Mes_Anterior"],
-                f"Referencia {periodos[1]}": diag_est[1]["Venta_Mismo_Mes_Anterior"],
-                "Ajuste_Estacional": any(d["Ajuste_Aplicado"] for d in diag_est),
-            })
-
-        detalle_pred = pd.DataFrame(predicciones_sku)
-        pred_base_acum = [
-            float(detalle_pred[f"Pred Base {periodos[0]}"].sum()),
-            float(detalle_pred[f"Pred Base {periodos[1]}"].sum()),
-        ]
-        pred_acum = [
-            float(detalle_pred[f"Pred Ajustada {periodos[0]}"].sum()),
-            float(detalle_pred[f"Pred Ajustada {periodos[1]}"].sum()),
-        ]
-
-        pc1, pc2, pc3 = st.columns(3)
-        pc1.metric("SKU acumulados", f"{len(codigos_seleccionados):,}")
-        pc2.metric(
-            f"Prediccion ajustada {periodos[0]}",
-            f"${pred_acum[0]:,.2f}",
-            delta=f"Base CatBoost: ${pred_base_acum[0]:,.2f}",
-            delta_color="off",
-        )
-        pc3.metric(
-            f"Prediccion ajustada {periodos[1]}",
-            f"${pred_acum[1]:,.2f}",
-            delta=f"Base CatBoost: ${pred_base_acum[1]:,.2f}",
-            delta_color="off",
-        )
-
-        real_graf = hist_acumulado.rename(columns={"VENTA": "Valor"}).copy()
-        real_graf["Serie"] = "Venta historica acumulada"
-
-        # Conexion visual: la proyeccion comienza en el ultimo punto historico.
-        # Este punto compartido solo afecta la apariencia de la grafica.
-        # No modifica las predicciones, metricas ni acumulados.
-        ultimo_real = real_graf.sort_values("Periodo").iloc[-1]
-        futuro_graf = pd.DataFrame({
-            "Periodo": [int(ultimo_real["Periodo"])] + periodos,
-            "Valor": [float(ultimo_real["Valor"])] + pred_acum,
-            "Serie": "Proyeccion acumulada",
-        })
-
-        graf_consulta = pd.concat(
-            [real_graf, futuro_graf],
-            ignore_index=True,
-        ).sort_values(["Serie", "Periodo"])
-
-        chart_consulta = (
-            alt.Chart(graf_consulta)
-            .mark_line(point=True, strokeWidth=3)
-            .encode(
-                x=alt.X(
-                    "Periodo:O",
-                    title="Periodo",
-                    sort="ascending",
-                    axis=alt.Axis(labelAngle=-45),
-                ),
-                y=alt.Y(
-                    "Valor:Q",
-                    title="Venta acumulada",
-                    axis=alt.Axis(format="$,.0f"),
-                    scale=alt.Scale(zero=False),
-                ),
-                color=alt.Color(
-                    "Serie:N",
-                    title="Serie",
-                    scale=alt.Scale(
-                        domain=[
-                            "Venta historica acumulada",
-                            "Proyeccion acumulada",
-                        ],
-                        range=["#1f77b4", "#ff7f0e"],
-                    ),
-                ),
-                detail="Serie:N",
-                order=alt.Order("Periodo:O", sort="ascending"),
-                tooltip=[
-                    "Periodo:O",
-                    "Serie:N",
-                    alt.Tooltip("Valor:Q", format="$,.2f"),
-                ],
-            )
-            .properties(
-                height=420,
-                title="Venta historica y proyeccion acumuladas",
-            )
-            .interactive()
-        )
-        st.altair_chart(chart_consulta, use_container_width=True)
-
-        # Participacion de cada SKU en la proyeccion acumulada.
-        detalle_pred[f"Participacion {periodos[0]} %"] = (
-            100 * detalle_pred[f"Pred Ajustada {periodos[0]}"]
-            / max(pred_acum[0], 1)
-        )
-        detalle_pred[f"Participacion {periodos[1]} %"] = (
-            100 * detalle_pred[f"Pred Ajustada {periodos[1]}"]
-            / max(pred_acum[1], 1)
-        )
-        detalle_pred = detalle_pred.sort_values(
-            f"Pred Ajustada {periodos[0]}", ascending=False
-        )
-
-        with st.expander("Ver aportacion de cada SKU al acumulado"):
-            st.dataframe(
-                detalle_pred.style.format({
-                    f"Pred Ajustada {periodos[0]}": "${:,.2f}",
-                    f"Pred Ajustada {periodos[1]}": "${:,.2f}",
-                    f"Participacion {periodos[0]} %": "{:.2f}%",
-                    f"Participacion {periodos[1]} %": "{:.2f}%",
-                }),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-
-        # -----------------------------------------------------
-        # INTERPRETACION DEL AJUSTE ESTACIONAL
-        # -----------------------------------------------------
-        st.markdown("### Interpretacion del ajuste estacional")
-
-        porcentaje_v2 = int(round(peso_modelo_estacional * 100))
-        porcentaje_anterior = 100 - porcentaje_v2
-        incremento_umbral = int(round((umbral_estacional - 1.0) * 100))
-
-        if peso_modelo_estacional >= 0.90:
-            interpretacion_peso = "Ajuste muy ligero"
-        elif peso_modelo_estacional >= 0.80:
-            interpretacion_peso = "Ajuste conservador"
-        elif peso_modelo_estacional >= 0.70:
-            interpretacion_peso = "Ajuste moderado"
-        elif peso_modelo_estacional >= 0.60:
-            interpretacion_peso = "Ajuste estacional fuerte"
-        else:
-            interpretacion_peso = "Alta dependencia del año anterior"
-
-        if umbral_estacional < 1.20:
-            interpretacion_umbral = "Detecta estacionalidad ligera"
-        elif umbral_estacional < 1.40:
-            interpretacion_umbral = "Detecta estacionalidad moderada"
-        elif umbral_estacional < 2.00:
-            interpretacion_umbral = "Exige estacionalidad clara"
-        else:
-            interpretacion_umbral = "Solo detecta estacionalidad muy fuerte"
-
-        i1, i2 = st.columns(2)
-        with i1:
-            st.metric(
-                "Peso actual de la forecast CatBoost",
-                f"{peso_modelo_estacional:.2f}",
-                help="Porcentaje de confianza asignado al modelo CatBoost estacional.",
-            )
-            st.write(
-                f"**{porcentaje_v2}%** proviene de la forecast CatBoost y "
-                f"**{porcentaje_anterior}%** de la venta del mismo mes del año anterior."
-            )
-            st.caption(interpretacion_peso)
-
-        with i2:
-            st.metric(
-                "Umbral actual del indice Nov-Dic",
-                f"{umbral_estacional:.2f}",
-                help="Nivel minimo de estacionalidad requerido para aplicar el ajuste.",
-            )
-            st.write(
-                f"El ajuste se aplica cuando Nov-Dic vende al menos "
-                f"**{incremento_umbral}% mas** que el resto del año."
-            )
-            st.caption(interpretacion_umbral)
-
-        with st.expander("Ver como interpretar el indice Nov-Dic", expanded=False):
-            tabla_indice = pd.DataFrame({
-                "Indice": [1.00, 1.20, 1.40, 1.80, 2.00, 3.00],
-                "Significado": [
-                    "Nov-Dic vende igual que el resto del año",
-                    "Nov-Dic vende 20% mas",
-                    "Nov-Dic vende 40% mas",
-                    "Nov-Dic vende 80% mas",
-                    "Nov-Dic vende el doble",
-                    "Nov-Dic vende tres veces mas",
-                ],
-            })
-            st.dataframe(
-                tabla_indice.style.format({"Indice": "{:.2f}"}),
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.info(
-                f"Configuracion actual: el producto debe alcanzar un indice de "
-                f"{umbral_estacional:.2f} o superior para recibir el ajuste."
-            )
-
-        with st.expander("Ver como interpretar el peso V2", expanded=False):
-            tabla_pesos = pd.DataFrame({
-                "Peso CatBoost": [0.90, 0.80, 0.70, 0.60, 0.50],
-                "V2": ["90%", "80%", "70%", "60%", "50%"],
-                "Año anterior": ["10%", "20%", "30%", "40%", "50%"],
-                "Interpretacion": [
-                    "Ajuste muy ligero",
-                    "Ajuste conservador",
-                    "Ajuste moderado",
-                    "Ajuste estacional fuerte",
-                    "Alta dependencia del año anterior",
-                ],
-            })
-            st.dataframe(
-                tabla_pesos.style.format({"Peso CatBoost": "{:.2f}"}),
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.info(
-                f"Configuracion actual: {porcentaje_v2}% CatBoost + "
-                f"{porcentaje_anterior}% mismo mes del año anterior."
-            )
-
-        st.caption(
-            "La formula aplicada es: Prediccion ajustada = "
-            "(Peso CatBoost x Forecast CatBoost) + "
-            "((1 - Peso CatBoost) x Venta del mismo mes del año anterior)."
-        )
-
-
-
     except Exception as e:
         st.exception(e)
