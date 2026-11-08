@@ -260,7 +260,7 @@ def ajustar_lista_estacional(
     historial,
     periodos,
     peso_modelo=0.60,
-    umbral_estacional=1.40,
+    umbral_estacional=1.10,
 ):
     ajustadas, diagnostico = [], []
     for pred_base, periodo in zip(predicciones_base, periodos):
@@ -396,6 +396,107 @@ def backtest(df, n_holdout=2):
             })
 
     return pd.DataFrame(filas)
+
+
+def calcular_metricas_forecast(resultados):
+    """Metricas globales sobre pares producto-mes reales y pronosticados."""
+    if resultados is None or resultados.empty:
+        return {"WAPE": np.nan, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan,
+                "SESGO_PCT": np.nan, "REAL": 0.0, "PRED": 0.0}
+    y = resultados["Actual"].to_numpy(dtype=float)
+    p = resultados["Prediccion"].to_numpy(dtype=float)
+    denom = max(np.abs(y).sum(), 1.0)
+    return {
+        "WAPE": 100.0 * np.abs(y - p).sum() / denom,
+        "MAE": mean_absolute_error(y, p),
+        "RMSE": mean_squared_error(y, p) ** 0.5,
+        "R2": r2_score(y, p) if len(y) >= 2 and np.var(y) > 0 else np.nan,
+        "SESGO_PCT": 100.0 * (p.sum() - y.sum()) / max(abs(y.sum()), 1.0),
+        "REAL": float(y.sum()),
+        "PRED": float(p.sum()),
+    }
+
+@st.cache_data(show_spinner=False)
+def backtest_periodos_objetivo(df, periodos_objetivo, peso_modelo=0.60,
+                                umbral_estacional=1.10,
+                                aplicar_ajuste=True):
+    """Simula un forecast real: entrena solo con datos anteriores al primer objetivo.
+
+    Evita fuga de informacion y evalua exactamente los meses indicados.
+    """
+    periodos_objetivo = sorted(int(x) for x in periodos_objetivo)
+    corte = periodos_objetivo[0]
+    train = df[df["Periodo"] < corte].copy()
+    real = df[df["Periodo"].isin(periodos_objetivo)].copy()
+    if train.empty or real.empty:
+        return pd.DataFrame()
+    modelo_bt, medianas_bt = entrenar(train)
+    filas = []
+    codigos = sorted(set(train["CODIGO"]).intersection(real["CODIGO"]))
+    for codigo in codigos:
+        hist = train[train["CODIGO"] == codigo].sort_values("Periodo")
+        real_sku = real[real["CODIGO"] == codigo].sort_values("Periodo")
+        disponibles = real_sku["Periodo"].astype(int).tolist()
+        if hist.empty or not disponibles:
+            continue
+        pred_base = predecir_recursivo(modelo_bt, medianas_bt, hist, disponibles)
+        if aplicar_ajuste:
+            pred_final, diagnostico = ajustar_lista_estacional(
+                pred_base, hist, disponibles,
+                peso_modelo=peso_modelo,
+                umbral_estacional=umbral_estacional,
+            )
+        else:
+            pred_final = pred_base
+            diagnostico = [{"Ajuste_Aplicado": False} for _ in disponibles]
+        for paso, ((_, r), pb, pf, dg) in enumerate(
+            zip(real_sku.iterrows(), pred_base, pred_final, diagnostico), 1
+        ):
+            filas.append({
+                "Prueba": f"{periodos_objetivo[0]}-{periodos_objetivo[-1]}",
+                "CODIGO": codigo,
+                "DESCRIPCION": r.get("DESCRIPCION", ""),
+                "CATEGORIA": r.get("CATEGORIA", ""),
+                "COMBOS": int(r.get("COMBOS", 0)),
+                "Periodo_Real": int(r["Periodo"]),
+                "Mes_Predecido": paso,
+                "Pred_Base": float(pb),
+                "Prediccion": float(pf),
+                "Actual": float(r["VENTA"]),
+                "Ajuste_Estacional": bool(dg.get("Ajuste_Aplicado", False)),
+            })
+    return pd.DataFrame(filas)
+
+def mostrar_metricas_backtest(nombre, resultados):
+    st.markdown(f"#### {nombre}")
+    if resultados.empty:
+        st.warning("No hay suficientes registros para ejecutar esta prueba.")
+        return
+    m = calcular_metricas_forecast(resultados)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("WAPE", f"{m['WAPE']:.2f}%")
+    c2.metric("MAE", f"${m['MAE']:,.2f}")
+    c3.metric("RMSE", f"${m['RMSE']:,.2f}")
+    c4.metric("R²", f"{m['R2']:.3f}" if pd.notna(m['R2']) else "N/D")
+    c5.metric("Sesgo acumulado", f"{m['SESGO_PCT']:+.2f}%")
+    st.caption(
+        f"Venta real: ${m['REAL']:,.2f} | Pronóstico: ${m['PRED']:,.2f} | "
+        f"Registros producto-mes: {len(resultados):,}"
+    )
+    por_mes = resultados.groupby("Periodo_Real", as_index=False).agg(
+        Venta_Real=("Actual", "sum"), Pronostico=("Prediccion", "sum")
+    )
+    por_mes["Error_pct"] = np.where(
+        por_mes["Venta_Real"].abs() > 0,
+        100 * (por_mes["Pronostico"] - por_mes["Venta_Real"]) / por_mes["Venta_Real"],
+        np.nan,
+    )
+    st.dataframe(
+        por_mes.style.format({
+            "Venta_Real": "${:,.2f}", "Pronostico": "${:,.2f}",
+            "Error_pct": "{:+.2f}%"
+        }), use_container_width=True, hide_index=True
+    )
 
 # =========================================================
 # FUNCIONES DIAGNOSTICAS, NO INTERVIENEN EN EL MODELO
@@ -1047,6 +1148,38 @@ if archivos:
         modelo, medianas = entrenar(df)
 
         # =====================================================
+        # VALIDACION TEMPORAL SIN FUGA DE INFORMACION
+        st.subheader("Validacion temporal del forecast")
+        st.caption("La prueba principal es Nov-Dic 2025: entrena solo hasta octubre de 2025 y compara contra las ventas reales. Sep-Oct 2026 es una prueba secundaria de estabilidad reciente.")
+        pruebas_disponibles = {
+            "Nov-Dic 2025 (principal)": [202511, 202512],
+            "Sep-Oct 2026 (secundaria)": [202609, 202610],
+            "Nov-Dic 2024 (historial corto)": [202411, 202412],
+        }
+        pruebas_sel = st.multiselect(
+            "Pruebas de backtesting", list(pruebas_disponibles),
+            default=["Nov-Dic 2025 (principal)", "Sep-Oct 2026 (secundaria)"],
+        )
+        if st.button("Ejecutar validacion temporal", type="primary"):
+            if not pruebas_sel:
+                st.warning("Selecciona al menos una prueba.")
+            for nombre_prueba in pruebas_sel:
+                with st.spinner(f"Calculando {nombre_prueba}..."):
+                    r_bt = backtest_periodos_objetivo(
+                        df, pruebas_disponibles[nombre_prueba],
+                        peso_modelo=peso_modelo_estacional,
+                        umbral_estacional=umbral_estacional,
+                        aplicar_ajuste=usar_ajuste_estacional,
+                    )
+                mostrar_metricas_backtest(nombre_prueba, r_bt)
+        with st.expander("Como interpretar estas pruebas"):
+            st.markdown(
+                "- **Nov-Dic 2025 es la medicion decisiva**, porque reproduce la temporada objetivo.\n"
+                "- **Sep-Oct 2026 es secundaria**: comprueba nivel reciente, no los picos de fin de ano.\n"
+                "- **Nov-Dic 2024 es una prueba de arranque**: el modelo aun no conoce una temporada Nov-Dic anterior.\n"
+                "- Prioriza WAPE y sesgo para el total; RMSE detecta errores extremos por SKU. R2 es complementario."
+            )
+
         # CONSULTA ACUMULABLE: CATEGORIA, COMBO Y DESCRIPCION
         # =====================================================
         st.subheader("Consulta acumulable por categoria, combo y descripcion")
@@ -1430,4 +1563,3 @@ if archivos:
 
     except Exception as e:
         st.exception(e)
-
