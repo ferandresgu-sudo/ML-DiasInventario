@@ -398,22 +398,30 @@ def backtest(df, n_holdout=2):
     return pd.DataFrame(filas)
 
 
-def calcular_metricas_forecast(resultados):
-    """Metricas globales sobre pares producto-mes reales y pronosticados."""
+def calcular_metricas_forecast(resultados, minimo_venta_wape=1000.0):
+    """Metricas seguras sobre pares producto-mes.
+
+    WAPE se reporta como N/D cuando la venta real total es demasiado pequena,
+    evitando porcentajes absurdos como los observados en categorias nuevas.
+    """
     if resultados is None or resultados.empty:
         return {"WAPE": np.nan, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan,
                 "SESGO_PCT": np.nan, "REAL": 0.0, "PRED": 0.0}
     y = resultados["Actual"].to_numpy(dtype=float)
-    p = resultados["Prediccion"].to_numpy(dtype=float)
-    denom = max(np.abs(y).sum(), 1.0)
+    pred = resultados["Prediccion"].to_numpy(dtype=float)
+    venta_real = float(np.abs(y).sum())
+    wape = (100.0 * np.abs(y - pred).sum() / venta_real
+            if venta_real >= minimo_venta_wape else np.nan)
+    sesgo = (100.0 * (pred.sum() - y.sum()) / abs(y.sum())
+             if abs(y.sum()) >= minimo_venta_wape else np.nan)
     return {
-        "WAPE": 100.0 * np.abs(y - p).sum() / denom,
-        "MAE": mean_absolute_error(y, p),
-        "RMSE": mean_squared_error(y, p) ** 0.5,
-        "R2": r2_score(y, p) if len(y) >= 2 and np.var(y) > 0 else np.nan,
-        "SESGO_PCT": 100.0 * (p.sum() - y.sum()) / max(abs(y.sum()), 1.0),
+        "WAPE": wape,
+        "MAE": mean_absolute_error(y, pred),
+        "RMSE": mean_squared_error(y, pred) ** 0.5,
+        "R2": r2_score(y, pred) if len(y) >= 2 and np.var(y) > 0 else np.nan,
+        "SESGO_PCT": sesgo,
         "REAL": float(y.sum()),
-        "PRED": float(p.sum()),
+        "PRED": float(pred.sum()),
     }
 
 @st.cache_data(show_spinner=False)
@@ -497,6 +505,132 @@ def mostrar_metricas_backtest(nombre, resultados):
             "Error_pct": "{:+.2f}%"
         }), use_container_width=True, hide_index=True
     )
+
+
+def metricas_por_mes(resultados):
+    filas = []
+    if resultados is None or resultados.empty:
+        return pd.DataFrame()
+    for periodo, g in resultados.groupby("Periodo_Real"):
+        m = calcular_metricas_forecast(g)
+        filas.append({"Periodo": int(periodo), **m, "Registros": len(g)})
+    return pd.DataFrame(filas).sort_values("Periodo")
+
+
+def baseline_estacional_crecimiento(df, periodos_objetivo):
+    """Baseline: mismo mes del ano anterior multiplicado por crecimiento YTD."""
+    filas = []
+    for periodo in sorted(int(x) for x in periodos_objetivo):
+        anio, mes = periodo // 100, periodo % 100
+        real_mes = df[df["Periodo"] == periodo]
+        for _, r in real_mes.iterrows():
+            codigo = r["CODIGO"]
+            previo = df[(df["CODIGO"] == codigo) & (df["Periodo"] == periodo - 100)]
+            actual_ytd = df[(df["CODIGO"] == codigo) &
+                            (df["AÑO"] == anio) & (df["MES_NUM"] < mes)]
+            previo_ytd = df[(df["CODIGO"] == codigo) &
+                            (df["AÑO"] == anio - 1) & (df["MES_NUM"] < mes)]
+            if not previo.empty and previo_ytd["VENTA"].sum() > 0:
+                crecimiento = np.clip(
+                    actual_ytd["VENTA"].sum() / previo_ytd["VENTA"].sum(), 0.70, 1.50
+                )
+                pred = float(previo["VENTA"].iloc[0]) * float(crecimiento)
+            else:
+                hist = df[(df["CODIGO"] == codigo) & (df["Periodo"] < periodo)]
+                pred = float(hist["VENTA"].tail(3).mean()) if not hist.empty else 0.0
+            filas.append({
+                "CODIGO": codigo, "CATEGORIA": r.get("CATEGORIA", ""),
+                "Periodo_Real": periodo, "Actual": float(r["VENTA"]),
+                "Prediccion": max(0.0, pred), "Modelo": "Baseline estacional YTD",
+            })
+    return pd.DataFrame(filas)
+
+
+@st.cache_data(show_spinner=False)
+def backtesting_expansivo(df, peso_modelo=0.90, umbral=1.15):
+    """Multiples cortes temporales para medir estabilidad, no solo una temporada."""
+    pruebas = {
+        "Jul-Ago 2025": [202507, 202508],
+        "Sep-Oct 2025": [202509, 202510],
+        "Nov-Dic 2025": [202511, 202512],
+        "Mar-Abr 2026": [202603, 202604],
+        "May-Jun 2026": [202605, 202606],
+        "Sep-Oct 2026": [202609, 202610],
+    }
+    resumen, detalle_total = [], []
+    for nombre, periodos in pruebas.items():
+        r = backtest_periodos_objetivo(
+            df, periodos, peso_modelo=peso_modelo,
+            umbral_estacional=umbral, aplicar_ajuste=True,
+        )
+        if r.empty:
+            continue
+        r["Prueba"] = nombre
+        detalle_total.append(r)
+        m = calcular_metricas_forecast(r)
+        resumen.append({"Prueba": nombre, **m, "Registros": len(r)})
+    detalle = pd.concat(detalle_total, ignore_index=True) if detalle_total else pd.DataFrame()
+    return pd.DataFrame(resumen), detalle
+
+
+def intervalos_empiricos(detalle):
+    """Bandas P10/P50/P90 a partir de errores relativos de backtests disponibles."""
+    if detalle.empty:
+        return pd.DataFrame()
+    d = detalle[(detalle["Actual"] > 1000) & (detalle["Prediccion"] > 0)].copy()
+    d["Ratio_Real_Pred"] = (d["Actual"] / d["Prediccion"]).clip(0.20, 3.00)
+    global_q = d["Ratio_Real_Pred"].quantile([0.10, 0.50, 0.90])
+    filas = [{"CATEGORIA": "GLOBAL", "P10_factor": global_q.loc[0.10],
+              "P50_factor": global_q.loc[0.50], "P90_factor": global_q.loc[0.90],
+              "Registros": len(d)}]
+    for categoria, g in d.groupby("CATEGORIA"):
+        if len(g) < 20:
+            continue
+        q = g["Ratio_Real_Pred"].quantile([0.10, 0.50, 0.90])
+        filas.append({"CATEGORIA": categoria, "P10_factor": q.loc[0.10],
+                      "P50_factor": q.loc[0.50], "P90_factor": q.loc[0.90],
+                      "Registros": len(g)})
+    return pd.DataFrame(filas)
+
+
+def mostrar_validacion_senior(df, peso_modelo, umbral):
+    resumen, detalle = backtesting_expansivo(df, peso_modelo, umbral)
+    if resumen.empty:
+        st.warning("No hay periodos suficientes para ejecutar la validacion expansiva.")
+        return
+    st.markdown("#### Estabilidad en múltiples cortes temporales")
+    st.dataframe(
+        resumen.style.format({"WAPE": "{:.2f}%", "MAE": "${:,.2f}",
+                              "RMSE": "${:,.2f}", "R2": "{:.3f}",
+                              "SESGO_PCT": "{:+.2f}%", "REAL": "${:,.2f}",
+                              "PRED": "${:,.2f}"}),
+        use_container_width=True, hide_index=True,
+    )
+    temporada = backtest_periodos_objetivo(
+        df, [202511, 202512], peso_modelo=peso_modelo,
+        umbral_estacional=umbral, aplicar_ajuste=True,
+    )
+    baseline = baseline_estacional_crecimiento(df, [202511, 202512])
+    comparacion = []
+    for nombre, datos in [("CatBoost ajustado", temporada),
+                          ("Baseline estacional YTD", baseline)]:
+        m = calcular_metricas_forecast(datos)
+        comparacion.append({"Modelo": nombre, **m})
+    st.markdown("#### CatBoost frente a baseline sencillo, Nov-Dic 2025")
+    st.dataframe(pd.DataFrame(comparacion).style.format({
+        "WAPE": "{:.2f}%", "MAE": "${:,.2f}", "RMSE": "${:,.2f}",
+        "R2": "{:.3f}", "SESGO_PCT": "{:+.2f}%", "REAL": "${:,.2f}",
+        "PRED": "${:,.2f}"}), use_container_width=True, hide_index=True)
+    st.markdown("#### Métricas separadas por mes")
+    st.dataframe(metricas_por_mes(temporada).style.format({
+        "WAPE": "{:.2f}%", "MAE": "${:,.2f}", "RMSE": "${:,.2f}",
+        "R2": "{:.3f}", "SESGO_PCT": "{:+.2f}%", "REAL": "${:,.2f}",
+        "PRED": "${:,.2f}"}), use_container_width=True, hide_index=True)
+    st.markdown("#### Factores empíricos para intervalos P10, P50 y P90")
+    st.caption("Multiplica el forecast central por estos factores. Solo se muestran categorías con al menos 20 errores históricos utilizables.")
+    st.dataframe(intervalos_empiricos(detalle).style.format({
+        "P10_factor": "{:.3f}", "P50_factor": "{:.3f}",
+        "P90_factor": "{:.3f}"}), use_container_width=True, hide_index=True)
 
 # =========================================================
 # FUNCIONES DIAGNOSTICAS, NO INTERVIENEN EN EL MODELO
@@ -1261,6 +1395,17 @@ def optimizar_ajuste_por_categoria(df, periodos_objetivo=(202511, 202512)):
         predicciones_mejores.append(detalles_por_clave[clave])
 
     resumen = pd.DataFrame(resultados).sort_values("CATEGORIA").reset_index(drop=True)
+    resumen["ELEGIBLE"] = (
+        (resumen["Registros"] >= 20) & (resumen["REAL"] >= 10_000) &
+        resumen["WAPE"].notna() & (resumen["WAPE"] <= 40) &
+        resumen["SESGO_PCT"].notna() & (resumen["SESGO_PCT"].abs() <= 15) &
+        resumen["R2"].notna() & (resumen["R2"] >= 0)
+    )
+    resumen["Peso_Final"] = np.where(resumen["ELEGIBLE"], resumen["Peso_Modelo"], 0.90)
+    resumen["Umbral_Final"] = np.where(resumen["ELEGIBLE"], resumen["Umbral"], 1.15)
+    resumen["Origen_Configuracion"] = np.where(
+        resumen["ELEGIBLE"], "OPTIMIZACION_CATEGORIA", "GLOBAL_FALLBACK"
+    )
     detalle_final = pd.concat(predicciones_mejores, ignore_index=True) if predicciones_mejores else pd.DataFrame()
     return resumen, detalle_final
 
@@ -1270,7 +1415,7 @@ def mostrar_optimizacion_por_categoria(resumen, detalle):
         st.warning("No hay datos suficientes para optimizar por categoría.")
         return
     st.success(f"Se optimizaron {len(resumen)} categorías con Nov-Dic 2025.")
-    cols = ["CATEGORIA", "Peso_Modelo", "Umbral", "WAPE", "MAE", "RMSE", "R2", "SESGO_PCT", "Ajustes_Aplicados", "Registros", "Score"]
+    cols = ["CATEGORIA", "Peso_Modelo", "Umbral", "Peso_Final", "Umbral_Final", "Origen_Configuracion", "WAPE", "MAE", "RMSE", "R2", "SESGO_PCT", "Ajustes_Aplicados", "Registros", "Score"]
     st.dataframe(
         resumen[cols].style.format({
             "Peso_Modelo": "{:.2f}", "Umbral": "{:.2f}", "WAPE": "{:.2f}%",
@@ -1409,6 +1554,19 @@ if archivos:
             )
 
         st.divider()
+        st.subheader("Validación robusta recomendada")
+        st.write(
+            "Ejecuta backtesting expansivo, comparación contra baseline, métricas "
+            "separadas por mes e intervalos empíricos. Esta sección evita evaluar el "
+            "modelo únicamente con Nov-Dic 2025."
+        )
+        if st.button("Ejecutar validación robusta", type="primary", key="validacion_senior"):
+            with st.spinner("Ejecutando múltiples cortes temporales..."):
+                mostrar_validacion_senior(
+                    df, peso_modelo_estacional, umbral_estacional
+                )
+
+        st.divider()
         st.subheader("Optimización automática del ajuste estacional")
         st.write(
             "La búsqueda evalúa 99 combinaciones sobre Nov-Dic 2025: pesos CatBoost "
@@ -1448,3 +1606,4 @@ if archivos:
             )
     except Exception as e:
         st.exception(e)
+
