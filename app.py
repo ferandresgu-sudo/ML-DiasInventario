@@ -232,68 +232,192 @@ def backtest(df, periodos, peso_directo):
     return pd.DataFrame(filas)
 
 
+# =========================================================
+# AJUSTE ESTACIONAL + CALIBRACION ANTISESGO REGULARIZADA
+# =========================================================
+def indice_estacional(hist, anio_objetivo):
+    h = hist[hist["AÑO"] < anio_objetivo]
+    temp = h[h["MES_NUM"].isin([11, 12])]["VENTA"]
+    resto = h[~h["MES_NUM"].isin([11, 12])]["VENTA"]
+    if len(temp) < 2 or len(resto) < 6 or resto.mean() <= 0:
+        return 1.0
+    return float(temp.mean() / resto.mean())
+
+
+def crecimiento_ytd(hist, anio_objetivo):
+    a = hist[(hist["AÑO"] == anio_objetivo) & (hist["MES_NUM"] <= 10)]
+    b = hist[(hist["AÑO"] == anio_objetivo - 1) & (hist["MES_NUM"] <= 10)]
+    meses = sorted(set(a.MES_NUM) & set(b.MES_NUM))
+    if len(meses) < 6:
+        return 1.0
+    va = a[a.MES_NUM.isin(meses)].VENTA.sum()
+    vb = b[b.MES_NUM.isin(meses)].VENTA.sum()
+    return float(np.clip(va / vb, 0.80, 1.40)) if vb > 0 else 1.0
+
+
+def ajustar_estacional(pred_base, hist, periodo, peso_forecast=0.70, umbral=1.10):
+    mes, ano = periodo % 100, periodo // 100
+    if mes not in [11, 12]:
+        return float(pred_base), np.nan, 1.0, False
+    idx = indice_estacional(hist, ano)
+    mismos = hist[(hist.MES_NUM == mes) & (hist.AÑO < ano)].sort_values("AÑO").tail(2)
+    if mismos.empty or idx < umbral:
+        return float(pred_base), np.nan, idx, False
+    valores = mismos.VENTA.astype(float).to_numpy()
+    ref_hist = valores[-1] if len(valores) == 1 else .65 * valores[-1] + .35 * valores[-2]
+    crec = crecimiento_ytd(hist, ano)
+    ref_ytd = ref_hist * crec
+    ajustada = peso_forecast * pred_base + (1 - peso_forecast) * ref_ytd
+    # Piso prudente, nunca traslada todo el crecimiento YTD.
+    piso = valores[-1] * (1 + .35 * max(crec - 1, 0))
+    return max(float(ajustada), float(piso)), float(ref_ytd), idx, True
+
+
+def factor_antisesgo_regularizado(bt, intensidad=.60, tope=1.10, prior=30):
+    """Aprende factores por mes/categoria, contraidos hacia el global."""
+    if bt.empty:
+        return {"global": 1.0, "mes": {}, "cat_mes": {}}
+    real, pred = bt.Actual.sum(), bt.Pred_estacional.sum()
+    fg = np.clip(real / pred if pred > 0 else 1.0, .95, tope)
+    meses, cats = {}, {}
+    for mes, g in bt.groupby(bt.Periodo % 100):
+        raw = g.Actual.sum() / g.Pred_estacional.sum() if g.Pred_estacional.sum() > 0 else 1.0
+        f = (len(g) * raw + prior * fg) / (len(g) + prior)
+        meses[int(mes)] = float(np.clip(f, .95, tope))
+    for (cat, mes), g in bt.groupby(["CATEGORIA", bt.Periodo % 100]):
+        base = meses.get(int(mes), fg)
+        raw = g.Actual.sum() / g.Pred_estacional.sum() if g.Pred_estacional.sum() > 0 else 1.0
+        f = (len(g) * raw + prior * base) / (len(g) + prior)
+        cats[(str(cat), int(mes))] = float(np.clip(f, .95, tope))
+    # Se aplica solo una fraccion del factor aprendido.
+    def parcial(f): return 1 + intensidad * (f - 1)
+    return {"global": parcial(fg), "mes": {k: parcial(v) for k,v in meses.items()},
+            "cat_mes": {k: parcial(v) for k,v in cats.items()}}
+
+
+def aplicar_antisesgo(pred, categoria, periodo, calibrador):
+    mes = periodo % 100
+    f = calibrador.get("cat_mes", {}).get((str(categoria), mes),
+        calibrador.get("mes", {}).get(mes, calibrador.get("global", 1.0)))
+    return max(0.0, float(pred) * float(f)), float(f)
+
+
+def backtest_integrado(df, periodos, peso_estructural=.15, peso_estacional=.70,
+                       umbral=1.10, calibrador=None):
+    corte = min(periodos)
+    train = df[df.Periodo < corte].copy()
+    real = df[df.Periodo.isin(periodos)].copy()
+    if train.empty or real.empty:
+        return pd.DataFrame()
+    modelos = entrenar_tres_modelos(train)
+    filas=[]
+    for codigo in sorted(set(train.CODIGO) & set(real.CODIGO)):
+        h=train[train.CODIGO==codigo].sort_values("Periodo")
+        r=real[real.CODIGO==codigo].sort_values("Periodo")
+        ps=r.Periodo.astype(int).tolist()
+        if not ps: continue
+        pv,pu,pp,pe,_=pronosticar_sku(modelos,h,ps,1-peso_estructural)
+        for (_,rr),vd,u,pr,ve in zip(r.iterrows(),pv,pu,pp,pe):
+            pb=(1-peso_estructural)*vd + peso_estructural*ve
+            pa,ref,idx,ap=ajustar_estacional(pb,h,int(rr.Periodo),peso_estacional,umbral)
+            pf,factor=(pa,1.0) if calibrador is None else aplicar_antisesgo(pa,rr.CATEGORIA,int(rr.Periodo),calibrador)
+            filas.append({"CODIGO":codigo,"CATEGORIA":rr.CATEGORIA,"Periodo":int(rr.Periodo),
+                "Actual":float(rr.VENTA),"Venta_directa":vd,"Unidades_pred":u,"Precio_pred":pr,
+                "Venta_estructural":ve,"Pred_base_hibrida":pb,"Referencia_estacional":ref,
+                "Indice_estacional":idx,"Ajuste_aplicado":ap,"Pred_estacional":pa,
+                "Factor_antisesgo":factor,"Prediccion":pf})
+    return pd.DataFrame(filas)
+
+
+def optimizar_peso_estructural(df, peso_estacional=.70, umbral=1.10):
+    filas=[]; detalles={}
+    for pe in np.arange(0, .31, .05):
+        d=backtest_integrado(df,[202511,202512],float(pe),peso_estacional,umbral,None)
+        if d.empty: continue
+        m=metricas(d.Actual,d.Pred_estacional)
+        score=m["WAPE"] + .00002*m["RMSE"] + .20*abs(m["SESGO"])
+        filas.append({"Peso_estructural":pe,"Peso_venta_directa":1-pe,**m,"Score":score})
+        detalles[round(float(pe),2)]=d
+    t=pd.DataFrame(filas).sort_values(["Score","WAPE","RMSE"])
+    return t, detalles
+
+
+def forecast_2026_integrado(df, peso_estructural, peso_estacional, umbral, calibrador):
+    modelos=entrenar_tres_modelos(df); filas=[]
+    for codigo,h in df.groupby("CODIGO"):
+        h=h.sort_values("Periodo"); meta=h.iloc[-1]; periodos=[202611,202612]
+        pv,pu,pp,pe,_=pronosticar_sku(modelos,h,periodos,1-peso_estructural)
+        for periodo,vd,u,pr,ve in zip(periodos,pv,pu,pp,pe):
+            pb=(1-peso_estructural)*vd+peso_estructural*ve
+            pa,ref,idx,ap=ajustar_estacional(pb,h,periodo,peso_estacional,umbral)
+            pf,factor=aplicar_antisesgo(pa,meta.CATEGORIA,periodo,calibrador)
+            filas.append({"CODIGO":codigo,"DESCRIPCION":meta.DESCRIPCION,"CATEGORIA":meta.CATEGORIA,
+                "Periodo":periodo,"Venta_directa":vd,"Unidades_pred":u,"Precio_pred":pr,
+                "Venta_estructural":ve,"Pred_base_hibrida":pb,"Referencia_estacional":ref,
+                "Indice_estacional":idx,"Ajuste_aplicado":ap,"Pred_estacional":pa,
+                "Factor_antisesgo":factor,"Prediccion_final":pf})
+    return pd.DataFrame(filas)
+
+
 archivos = st.file_uploader("Carga VENTAS 2024, 2025 y 2026", type=["xlsx"], accept_multiple_files=True)
-peso_directo = st.sidebar.slider("Peso forecast directo de venta", 0.50, 0.90, 0.65, 0.05)
-st.sidebar.caption(f"Venta final = {peso_directo:.0%} venta directa + {1-peso_directo:.0%} unidades x precio")
+with st.sidebar:
+    st.header("Modelo integrado")
+    peso_estacional = st.slider("Peso forecast frente a referencia estacional", .50, .90, .70, .05)
+    umbral = st.slider("Umbral estacional Nov-Dic", 1.00, 1.50, 1.10, .05)
+    intensidad = st.slider("Intensidad antisesgo", 0.0, 1.0, .60, .05)
+    tope = st.slider("Tope factor antisesgo", 1.02, 1.20, 1.10, .01)
 
 if archivos:
     try:
-        df, diagnostico_carga = cargar_archivos([a.getvalue() for a in archivos], [a.name for a in archivos])
-        anos = sorted(df["AÑO"].dropna().astype(int).unique().tolist())
-        conteo_por_ano = df.groupby("AÑO")["CODIGO"].nunique().to_dict()
-        st.success(f"{len(df):,} registros mensuales | {df.CODIGO.nunique():,} productos únicos | años {anos}")
-        st.write("Productos por año:", {int(k): int(v) for k, v in conteo_por_ano.items()})
-        with st.expander("Diagnóstico de archivos y hojas"):
-            st.dataframe(diagnostico_carga, use_container_width=True, hide_index=True)
-        faltan_anios = sorted({2024, 2025, 2026} - set(anos))
-        if faltan_anios:
-            st.error(f"Faltan archivos o datos de los años: {faltan_anios}. Carga los tres Excel antes del backtest.")
-        inconsist = df[(df.UNIDADES == 0) & (df.VENTA > 0)]
-        if len(inconsist):
-            st.warning(f"Hay {len(inconsist):,} producto-mes con venta positiva y cero unidades. Revisa esos casos.")
+        df, diagnostico = cargar_archivos([a.getvalue() for a in archivos], [a.name for a in archivos])
+        st.success(f"{len(df):,} registros | {df.CODIGO.nunique():,} productos | años {sorted(df.AÑO.unique())}")
+        with st.expander("Diagnóstico de carga"):
+            st.dataframe(diagnostico, use_container_width=True, hide_index=True)
 
-        st.subheader("Backtesting comparable")
-        prueba = st.selectbox("Periodo", ["Nov-Dic 2025", "Sep-Oct 2026"])
-        periodos_bt = [202511, 202512] if prueba == "Nov-Dic 2025" else [202609, 202610]
-        if st.button("Ejecutar backtest", type="primary"):
-            periodos_disponibles = set(df["Periodo"].astype(int))
-            faltantes_bt = [p for p in periodos_bt if p not in periodos_disponibles]
-            if faltantes_bt:
-                st.error(f"No se puede ejecutar: faltan periodos reales {faltantes_bt}. Revisa que VENTAS 2025 y VENTAS 2026 estén cargados.")
-                st.stop()
-            with st.spinner("Entrenando tres modelos y evaluando..."):
-                bt = backtest(df, periodos_bt, peso_directo)
-            if bt.empty:
-                st.error("No hubo datos suficientes.")
-            else:
-                m_final = metricas(bt.Actual, bt.Prediccion)
-                m_directo = metricas(bt.Actual, bt.Venta_directa)
-                comp = pd.DataFrame([{"Modelo":"Venta directa", **m_directo},
-                                     {"Modelo":"Venta + unidades x precio", **m_final}])
-                st.dataframe(comp.style.format({"WAPE":"{:.2f}%", "MAE":"${:,.2f}",
-                    "RMSE":"${:,.2f}", "R2":"{:.3f}", "SESGO":"{:+.2f}%"}),
-                    use_container_width=True, hide_index=True)
-                st.caption("Conserva el componente estructural solo si baja WAPE y RMSE y acerca el sesgo a cero.")
-                st.dataframe(bt, use_container_width=True, hide_index=True)
+        st.subheader("1. Optimización del peso unidades × precio")
+        st.caption("Busca de 0% a 30%. Nov-Dic 2025 se usa como validación, no como entrenamiento.")
+        if st.button("Optimizar modelo integrado", type="primary"):
+            with st.spinner("Entrenando y comparando pesos..."):
+                tabla, detalles = optimizar_peso_estructural(df,peso_estacional,umbral)
+            st.session_state["tabla_pesos"] = tabla
+            st.session_state["detalles_pesos"] = detalles
+        if "tabla_pesos" in st.session_state:
+            tabla=st.session_state["tabla_pesos"]; detalles=st.session_state["detalles_pesos"]
+            st.dataframe(tabla.style.format({"Peso_estructural":"{:.0%}","Peso_venta_directa":"{:.0%}",
+                "WAPE":"{:.2f}%","MAE":"${:,.2f}","RMSE":"${:,.2f}","R2":"{:.3f}","SESGO":"{:+.2f}%"}),
+                use_container_width=True,hide_index=True)
+            mejor=float(tabla.iloc[0].Peso_estructural)
+            st.success(f"Peso recomendado: {1-mejor:.0%} venta directa + {mejor:.0%} unidades × precio")
 
-        st.subheader("Forecast noviembre-diciembre 2026")
-        if st.button("Generar forecast 2026"):
-            with st.spinner("Entrenando venta, unidades y precio..."):
-                modelos = entrenar_tres_modelos(df)
-                filas=[]
-                for codigo, h in df.groupby("CODIGO"):
-                    pv,pu,pp,pe,pf = pronosticar_sku(modelos,h,[202611,202612],peso_directo)
-                    meta=h.sort_values("Periodo").iloc[-1]
-                    for periodo,a,b,c,d,e in zip([202611,202612],pv,pu,pp,pe,pf):
-                        filas.append({"CODIGO":codigo,"DESCRIPCION":meta.DESCRIPCION,
-                            "CATEGORIA":meta.CATEGORIA,"Periodo":periodo,"Venta_directa":a,
-                            "Unidades_pred":b,"Precio_pred":c,"Venta_estructural":d,"Venta_final":e})
-                pron=pd.DataFrame(filas)
-            st.dataframe(pron, use_container_width=True, hide_index=True)
-            st.download_button("Descargar forecast CSV", pron.to_csv(index=False).encode("utf-8-sig"),
-                               "forecast_2026_unidades_precio.csv", "text/csv")
+            bt_base=detalles[round(mejor,2)]
+            calibrador=factor_antisesgo_regularizado(bt_base,intensidad,tope,prior=30)
+            bt_cal=bt_base.copy()
+            ajustes=[aplicar_antisesgo(r.Pred_estacional,r.CATEGORIA,int(r.Periodo),calibrador) for _,r in bt_cal.iterrows()]
+            bt_cal["Prediccion"]=[x[0] for x in ajustes]
+            # No se presenta esta metrica como validacion independiente, porque usa 2025 para calibrar.
+            st.info(f"Factor global antisesgo parcial: {calibrador['global']:.3f}. Se reservará para el forecast 2026.")
+
+            st.subheader("2. Comparación honesta Nov-Dic 2025")
+            compar=[]
+            for nombre,col in [("Venta directa","Venta_directa"),("Híbrido sin ajuste","Pred_base_hibrida"),
+                               ("Híbrido + estacional","Pred_estacional")]:
+                m=metricas(bt_base.Actual,bt_base[col]); compar.append({"Modelo":nombre,**m})
+            st.dataframe(pd.DataFrame(compar).style.format({"WAPE":"{:.2f}%","MAE":"${:,.2f}",
+                "RMSE":"${:,.2f}","R2":"{:.3f}","SESGO":"{:+.2f}%"}),use_container_width=True,hide_index=True)
+            st.caption("El factor antisesgo no se reporta como mejora de 2025 porque fue aprendido con ese mismo periodo.")
+
+            st.subheader("3. Forecast noviembre-diciembre 2026")
+            if st.button("Generar forecast final 2026", type="primary"):
+                with st.spinner("Entrenando tres modelos y aplicando ajustes..."):
+                    pron=forecast_2026_integrado(df,mejor,peso_estacional,umbral,calibrador)
+                st.session_state["pron_final"]=pron
+            if "pron_final" in st.session_state:
+                pron=st.session_state["pron_final"]
+                st.dataframe(pron,use_container_width=True,hide_index=True)
+                st.download_button("Descargar forecast final CSV",pron.to_csv(index=False).encode("utf-8-sig"),
+                    "forecast_integrado_nov_dic_2026.csv","text/csv")
     except Exception as e:
         st.exception(e)
 else:
-    st.info("Carga los tres archivos para comenzar.")
+    st.info("Carga los tres archivos Excel para comenzar.")
 
