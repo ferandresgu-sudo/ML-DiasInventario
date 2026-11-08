@@ -1179,6 +1179,125 @@ def optimizar_ajuste_estacional(df, periodos_objetivo=(202511, 202512)):
     return tabla, pd.DataFrame(filas_pred)
 
 
+
+@st.cache_data(show_spinner=False)
+def optimizar_ajuste_por_categoria(df, periodos_objetivo=(202511, 202512)):
+    """Optimiza peso y umbral por CATEGORIA con un solo entrenamiento CatBoost."""
+    periodos_objetivo = sorted(int(x) for x in periodos_objetivo)
+    corte = periodos_objetivo[0]
+    train = df[df["Periodo"] < corte].copy()
+    real = df[df["Periodo"].isin(periodos_objetivo)].copy()
+    if train.empty or real.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    modelo_bt, medianas_bt = entrenar(train)
+    bases = []
+    codigos = sorted(set(train["CODIGO"]).intersection(real["CODIGO"]))
+    for codigo in codigos:
+        hist = train[train["CODIGO"] == codigo].sort_values("Periodo")
+        real_sku = real[real["CODIGO"] == codigo].sort_values("Periodo")
+        periodos = real_sku["Periodo"].astype(int).tolist()
+        if hist.empty or not periodos:
+            continue
+        pred_base = predecir_recursivo(modelo_bt, medianas_bt, hist, periodos)
+        for (_, r), pb in zip(real_sku.iterrows(), pred_base):
+            bases.append({
+                "CATEGORIA": str(r.get("CATEGORIA", "SIN_CATEGORIA")),
+                "CODIGO": codigo,
+                "Periodo_Real": int(r["Periodo"]),
+                "Actual": float(r["VENTA"]),
+                "Pred_Base": float(pb),
+                "Historial": hist,
+            })
+
+    pesos = np.round(np.arange(0.40, 0.91, 0.05), 2)
+    umbrales = np.round(np.arange(1.00, 1.41, 0.05), 2)
+    resultados = []
+    predicciones_mejores = []
+
+    for categoria in sorted({b["CATEGORIA"] for b in bases}):
+        bases_cat = [b for b in bases if b["CATEGORIA"] == categoria]
+        candidatos = []
+        detalles_por_clave = {}
+        for peso in pesos:
+            for umbral in umbrales:
+                detalle = []
+                for b in bases_cat:
+                    pred, indice, referencia, aplicado = ajustar_prediccion_estacional(
+                        b["Pred_Base"], b["Historial"], b["Periodo_Real"],
+                        peso_modelo=float(peso), umbral_estacional=float(umbral),
+                    )
+                    detalle.append({
+                        "CATEGORIA": categoria, "CODIGO": b["CODIGO"],
+                        "Periodo_Real": b["Periodo_Real"], "Actual": b["Actual"],
+                        "Prediccion": float(pred), "Pred_Base": b["Pred_Base"],
+                        "Ajuste_Estacional": bool(aplicado),
+                    })
+                d = pd.DataFrame(detalle)
+                m = calcular_metricas_forecast(d)
+                clave = (float(peso), float(umbral))
+                detalles_por_clave[clave] = d
+                candidatos.append({
+                    "CATEGORIA": categoria, "Peso_Modelo": float(peso),
+                    "Umbral": float(umbral), **m,
+                    "Ajustes_Aplicados": int(d["Ajuste_Estacional"].sum()),
+                    "Registros": len(d),
+                })
+        t = pd.DataFrame(candidatos)
+        t["ABS_SESGO"] = t["SESGO_PCT"].abs()
+        t["Rank_WAPE"] = t["WAPE"].rank(method="min")
+        t["Rank_MAE"] = t["MAE"].rank(method="min")
+        t["Rank_RMSE"] = t["RMSE"].rank(method="min")
+        t["Rank_R2"] = (-t["R2"].fillna(-np.inf)).rank(method="min")
+        t["Rank_SESGO"] = t["ABS_SESGO"].rank(method="min")
+        t["Score"] = (
+            0.35 * t["Rank_WAPE"] + 0.15 * t["Rank_MAE"] +
+            0.20 * t["Rank_RMSE"] + 0.10 * t["Rank_R2"] +
+            0.20 * t["Rank_SESGO"]
+        )
+        mejor = t.sort_values(["Score", "WAPE", "ABS_SESGO", "RMSE"]).iloc[0]
+        resultados.append(mejor.to_dict())
+        clave = (float(mejor["Peso_Modelo"]), float(mejor["Umbral"]))
+        predicciones_mejores.append(detalles_por_clave[clave])
+
+    resumen = pd.DataFrame(resultados).sort_values("CATEGORIA").reset_index(drop=True)
+    detalle_final = pd.concat(predicciones_mejores, ignore_index=True) if predicciones_mejores else pd.DataFrame()
+    return resumen, detalle_final
+
+
+def mostrar_optimizacion_por_categoria(resumen, detalle):
+    if resumen.empty:
+        st.warning("No hay datos suficientes para optimizar por categoría.")
+        return
+    st.success(f"Se optimizaron {len(resumen)} categorías con Nov-Dic 2025.")
+    cols = ["CATEGORIA", "Peso_Modelo", "Umbral", "WAPE", "MAE", "RMSE", "R2", "SESGO_PCT", "Ajustes_Aplicados", "Registros", "Score"]
+    st.dataframe(
+        resumen[cols].style.format({
+            "Peso_Modelo": "{:.2f}", "Umbral": "{:.2f}", "WAPE": "{:.2f}%",
+            "MAE": "${:,.2f}", "RMSE": "${:,.2f}", "R2": "{:.3f}",
+            "SESGO_PCT": "{:+.2f}%", "Score": "{:.2f}",
+        }), use_container_width=True, hide_index=True,
+    )
+    global_cat = calcular_metricas_forecast(detalle)
+    st.markdown("#### Resultado combinado usando la mejor configuración de cada categoría")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("WAPE", f"{global_cat['WAPE']:.2f}%")
+    c2.metric("MAE", f"${global_cat['MAE']:,.2f}")
+    c3.metric("RMSE", f"${global_cat['RMSE']:,.2f}")
+    c4.metric("R²", f"{global_cat['R2']:.3f}" if pd.notna(global_cat['R2']) else "N/D")
+    c5.metric("Sesgo", f"{global_cat['SESGO_PCT']:+.2f}%")
+    st.caption(
+        "Cada categoría usa su propio peso CatBoost y umbral. Las métricas combinadas "
+        "se calculan sobre todas las predicciones finales ajustadas, no promediando "
+        "las métricas de las categorías."
+    )
+    csv = resumen[cols].to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "Descargar configuración por categoría", csv,
+        file_name="configuracion_optima_por_categoria.csv",
+        mime="text/csv", key="descargar_opt_categoria",
+    )
+
 def mostrar_optimizacion(tabla):
     if tabla.empty:
         st.warning("No hay datos suficientes para optimizar Nov-Dic 2025.")
@@ -1305,5 +1424,27 @@ if archivos:
             "adoptarla, confirma que también mantenga resultados razonables en Sep-Oct "
             "2026 y revisa que el sesgo de Nov-Dic 2025 permanezca cerca de cero."
         )
+        st.divider()
+        st.subheader("Optimización automática por categoría")
+        st.write(
+            "Entrena CatBoost una sola vez hasta octubre de 2025 y busca, para cada "
+            "categoría disponible, la mejor combinación entre 99 pares de peso y umbral."
+        )
+        st.warning(
+            "Las categorías con pocos SKU o bajo volumen pueden sobreajustarse. Revisa "
+            "Registros, WAPE y sesgo antes de usar la configuración en producción."
+        )
+        if st.button("Optimizar todas las categorías", type="primary", key="optimizar_categorias"):
+            with st.spinner("Optimizando todas las categorías sobre Nov-Dic 2025..."):
+                resumen_cat, detalle_cat = optimizar_ajuste_por_categoria(
+                    df, (202511, 202512)
+                )
+            st.session_state["resumen_opt_categoria"] = resumen_cat
+            st.session_state["detalle_opt_categoria"] = detalle_cat
+        if "resumen_opt_categoria" in st.session_state:
+            mostrar_optimizacion_por_categoria(
+                st.session_state["resumen_opt_categoria"],
+                st.session_state["detalle_opt_categoria"],
+            )
     except Exception as e:
         st.exception(e)
