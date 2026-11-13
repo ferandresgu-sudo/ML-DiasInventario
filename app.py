@@ -1254,18 +1254,66 @@ if archivos:
                         ],
                     ).properties(height=430, title="Comparación de proyecciones de noviembre por categoría")
                     # Dos gráficas adicionales con el mismo histórico mensual.
-                    # La venta semanal solo actualiza noviembre. Diciembre conserva
-                    # el forecast original porque todavía no existe evidencia real de diciembre.
+                    # Noviembre se actualiza con la venta semanal. Para evitar una caída
+                    # artificial en diciembre, se propaga parcialmente el ajuste relativo
+                    # de noviembre. Configuración prudente para semana 1: 40%, con límite ±15%.
+                    st.markdown("#### Ajuste de continuidad hacia diciembre")
+                    col_prop, col_lim = st.columns(2)
+                    with col_prop:
+                        propagacion_dic = st.slider(
+                            "Propagación del ajuste de noviembre a diciembre",
+                            min_value=0, max_value=100, value=40, step=5,
+                            format="%d%%",
+                            help=(
+                                "Semana 1 recomendada: 40%. Traslada solo una parte de la "
+                                "desviación relativa de noviembre hacia diciembre."
+                            ),
+                        ) / 100.0
+                    with col_lim:
+                        limite_ajuste_dic = st.slider(
+                            "Límite máximo del ajuste de diciembre",
+                            min_value=5, max_value=30, value=15, step=5,
+                            format="±%d%%",
+                            help="Protege diciembre contra una primera semana atípica.",
+                        ) / 100.0
+
+                    def ajustar_diciembre(valor_noviembre_escenario):
+                        if total_original <= 0 or dic <= 0:
+                            return float(dic), 1.0, 0.0
+                        factor_noviembre = float(valor_noviembre_escenario) / float(total_original)
+                        ajuste_sin_limite = (factor_noviembre - 1.0) * propagacion_dic
+                        ajuste_limitado = float(np.clip(
+                            ajuste_sin_limite, -limite_ajuste_dic, limite_ajuste_dic
+                        ))
+                        return float(dic) * (1.0 + ajuste_limitado), factor_noviembre, ajuste_limitado
+
+                    dic_ritmo, factor_nov_ritmo, ajuste_dic_ritmo = ajustar_diciembre(total_ritmo)
+                    dic_nowcast, factor_nov_nowcast, ajuste_dic_nowcast = ajustar_diciembre(total_nowcast)
+
+                    d1, d2 = st.columns(2)
+                    d1.metric(
+                        "Diciembre ajustado por ritmo", f"${dic_ritmo:,.0f}",
+                        f"{ajuste_dic_ritmo:+.1%} vs diciembre original",
+                    )
+                    d2.metric(
+                        "Diciembre ajustado por nowcast", f"${dic_nowcast:,.0f}",
+                        f"{ajuste_dic_nowcast:+.1%} vs diciembre original",
+                    )
+                    st.caption(
+                        "Fórmula: Dic. ajustado = Dic. original × [1 + límite((Nov. escenario / "
+                        "Nov. original − 1) × propagación)]."
+                    )
+
                     octubre_puente = historico[
                         historico["Fecha"] == pd.Timestamp("2026-10-01")
                     ][["Fecha", "Valor"]].copy()
                     if octubre_puente.empty:
                         octubre_puente = historico.sort_values("Fecha").tail(1)[["Fecha", "Valor"]].copy()
 
-                    def crear_grafica_escenario(valor_noviembre, nombre, color, subtitulo):
+                    def crear_grafica_escenario(valor_noviembre, valor_diciembre, nombre, color, subtitulo):
                         puntos = pd.DataFrame({
                             "Fecha": [pd.Timestamp("2026-11-01"), pd.Timestamp("2026-12-01")],
-                            "Valor": [float(valor_noviembre), float(dic)],
+                            "Valor": [float(valor_noviembre), float(valor_diciembre)],
                             "Serie": [nombre, nombre],
                         })
                         puente = octubre_puente.copy()
@@ -1310,31 +1358,48 @@ if archivos:
                     st.markdown("### Evolución mensual con proyección por ritmo")
                     chart_ritmo = crear_grafica_escenario(
                         total_ritmo,
+                        dic_ritmo,
                         "Proyección por ritmo",
                         "#EF4444",
-                        "Azul: ventas reales | Rojo punteado: noviembre por ritmo; diciembre conserva el forecast original",
+                        f"Azul: ventas reales | Rojo: ritmo; diciembre propaga {propagacion_dic:.0%} del ajuste, limitado a ±{limite_ajuste_dic:.0%}",
                     )
                     st.altair_chart(chart_ritmo, use_container_width=True)
                     st.caption(
-                        "La proyección por ritmo extrapola la venta acumulada de la semana 1 a los 30 días de noviembre. "
-                        "No se utiliza para recalcular diciembre."
+                        "Noviembre extrapola la venta de la semana 1 a 30 días. Diciembre recibe solo "
+                        f"{propagacion_dic:.0%} del cambio relativo, con una protección máxima de ±{limite_ajuste_dic:.0%}."
                     )
 
                     st.markdown("### Evolución mensual con nowcast ponderado")
                     chart_nowcast = crear_grafica_escenario(
                         total_nowcast,
+                        dic_nowcast,
                         "Nowcast ponderado",
                         "#10B981",
-                        f"Azul: ventas reales | Verde punteado: nowcast con {peso_real:.0%} de peso semanal; diciembre conserva el forecast original",
+                        f"Azul: ventas reales | Verde: nowcast con {peso_real:.0%} de peso semanal; diciembre ajustado con propagación parcial",
                     )
                     st.altair_chart(chart_nowcast, use_container_width=True)
                     st.caption(
                         "El nowcast combina el forecast original de noviembre con la proyección por ritmo. "
-                        "El peso se controla con el segmentador superior."
+                        "Diciembre mantiene la estructura del forecast, pero incorpora una fracción controlada del cambio de noviembre."
                     )
 
                     st.markdown("### Comparación de proyecciones por categoría")
                     st.altair_chart(barras, use_container_width=True)
+
+                    resumen_escenarios_dic = pd.DataFrame({
+                        "Escenario": ["Forecast original", "Proyección por ritmo", "Nowcast ponderado"],
+                        "Noviembre": [total_original, total_ritmo, total_nowcast],
+                        "Diciembre": [dic, dic_ritmo, dic_nowcast],
+                        "Factor_Noviembre_vs_original": [1.0, factor_nov_ritmo, factor_nov_nowcast],
+                        "Ajuste_propagado_Diciembre": [0.0, ajuste_dic_ritmo, ajuste_dic_nowcast],
+                    })
+                    st.dataframe(
+                        resumen_escenarios_dic.style.format({
+                            "Noviembre": "${:,.2f}", "Diciembre": "${:,.2f}",
+                            "Factor_Noviembre_vs_original": "{:.3f}",
+                            "Ajuste_propagado_Diciembre": "{:+.1%}",
+                        }), use_container_width=True, hide_index=True,
+                    )
 
                     tabla_comp = comparativo[[
                         "CATEGORIA", "Venta_Semana_1", "Prediccion_Original",
