@@ -141,7 +141,7 @@ UMBRAL_ESTACIONAL = 1.20
 
 # Calibración selectiva V2 validada sobre el backtest Nov-Dic 2025 sin combos.
 CALIBRACION_CATEGORIAS_V2 = {
-    "LACTEOS CULINARIOS": 1.10,
+    "LACTEOS CULINARIOS": 1.00,  # Sin uplift: contracción comercial conocida.
     "CHOCOLATE MESA": 1.10,
     "NESTLE PROFESSIONAL": 1.10,
     "RTD": 1.08,
@@ -153,6 +153,14 @@ CALIBRACION_CATEGORIAS_V2 = {
 FACTOR_CALIBRACION_MIN = 0.90
 FACTOR_CALIBRACION_MAX = 1.10
 APLICAR_CALIBRACION_A_COMBOS = False
+
+# Control comercial de diciembre para LACTEOS CULINARIOS.
+# Diciembre se ancla al noviembre actualizado del escenario, no al forecast alto original.
+APLICAR_TOPE_DICIEMBRE_LACTEOS = True
+PISO_DIC_VS_NOV_LACTEOS = 0.95       # Diciembre no cae más de 5% vs noviembre actualizado.
+CRECIMIENTO_BASE_DIC_LACTEOS = 0.05  # Escenario central: +5% vs noviembre actualizado.
+TOPE_DIC_VS_NOV_LACTEOS = 1.10       # Máximo: +10% vs noviembre actualizado.
+USAR_RELACION_HISTORICA_LACTEOS = True
 
 
 def normalizar_codigo(serie):
@@ -1279,18 +1287,79 @@ if archivos:
                             help="Protege diciembre contra una primera semana atípica.",
                         ) / 100.0
 
+                    def relacion_historica_dic_nov_lacteos():
+                        """Mediana robusta Dic/Nov 2024-2025 para Lacteos Culinarios."""
+                        cat_obj = "LACTEOS CULINARIOS"
+                        hist_cat = df[
+                            df["CATEGORIA"].map(normalizar_categoria_calibracion).eq(cat_obj)
+                            & df["AÑO"].isin([2024, 2025])
+                            & df["MES_NUM"].isin([11, 12])
+                        ].groupby(["AÑO", "MES_NUM"], as_index=False)["VENTA"].sum()
+                        ratios = []
+                        for ano in [2024, 2025]:
+                            nov_h = hist_cat.loc[
+                                (hist_cat["AÑO"] == ano) & (hist_cat["MES_NUM"] == 11), "VENTA"
+                            ].sum()
+                            dic_h = hist_cat.loc[
+                                (hist_cat["AÑO"] == ano) & (hist_cat["MES_NUM"] == 12), "VENTA"
+                            ].sum()
+                            if nov_h > 0 and dic_h > 0:
+                                ratios.append(dic_h / nov_h)
+                        if not ratios:
+                            return 1.0 + CRECIMIENTO_BASE_DIC_LACTEOS, []
+                        return float(np.median(ratios)), ratios
+
+                    categoria_actual_norm = (
+                        normalizar_categoria_calibracion(categoria)
+                        if categoria != "TODAS" else "TODAS"
+                    )
+                    seleccion_exclusiva_lacteos = categoria_actual_norm == "LACTEOS CULINARIOS"
+                    relacion_hist_lacteos, ratios_hist_lacteos = relacion_historica_dic_nov_lacteos()
+
                     def ajustar_diciembre(valor_noviembre_escenario):
                         if total_original <= 0 or dic <= 0:
-                            return float(dic), 1.0, 0.0
+                            return float(dic), 1.0, 0.0, "Sin ajuste"
                         factor_noviembre = float(valor_noviembre_escenario) / float(total_original)
+
+                        # Regla especial solo cuando el filtro muestra exclusivamente Lacteos Culinarios.
+                        # Usa noviembre actualizado como ancla y limita diciembre a -5% / +10%.
+                        if APLICAR_TOPE_DICIEMBRE_LACTEOS and seleccion_exclusiva_lacteos:
+                            ratio_base = (
+                                relacion_hist_lacteos
+                                if USAR_RELACION_HISTORICA_LACTEOS
+                                else 1.0 + CRECIMIENTO_BASE_DIC_LACTEOS
+                            )
+                            ratio_controlado = float(np.clip(
+                                ratio_base,
+                                PISO_DIC_VS_NOV_LACTEOS,
+                                TOPE_DIC_VS_NOV_LACTEOS,
+                            ))
+                            dic_controlado = float(valor_noviembre_escenario) * ratio_controlado
+                            ajuste_vs_dic_original = (
+                                dic_controlado / float(dic) - 1.0 if dic > 0 else 0.0
+                            )
+                            metodo = (
+                                f"Lácteos: Nov escenario × {ratio_controlado:.3f} "
+                                f"(relación histórica limitada entre "
+                                f"{PISO_DIC_VS_NOV_LACTEOS:.2f} y {TOPE_DIC_VS_NOV_LACTEOS:.2f})"
+                            )
+                            return dic_controlado, factor_noviembre, ajuste_vs_dic_original, metodo
+
+                        # Para el resto de categorías conserva la propagación parcial existente.
                         ajuste_sin_limite = (factor_noviembre - 1.0) * propagacion_dic
                         ajuste_limitado = float(np.clip(
                             ajuste_sin_limite, -limite_ajuste_dic, limite_ajuste_dic
                         ))
-                        return float(dic) * (1.0 + ajuste_limitado), factor_noviembre, ajuste_limitado
+                        metodo = "Propagación parcial sobre diciembre original"
+                        return (
+                            float(dic) * (1.0 + ajuste_limitado),
+                            factor_noviembre,
+                            ajuste_limitado,
+                            metodo,
+                        )
 
-                    dic_ritmo, factor_nov_ritmo, ajuste_dic_ritmo = ajustar_diciembre(total_ritmo)
-                    dic_nowcast, factor_nov_nowcast, ajuste_dic_nowcast = ajustar_diciembre(total_nowcast)
+                    dic_ritmo, factor_nov_ritmo, ajuste_dic_ritmo, metodo_dic_ritmo = ajustar_diciembre(total_ritmo)
+                    dic_nowcast, factor_nov_nowcast, ajuste_dic_nowcast, metodo_dic_nowcast = ajustar_diciembre(total_nowcast)
 
                     d1, d2 = st.columns(2)
                     d1.metric(
@@ -1301,10 +1370,21 @@ if archivos:
                         "Diciembre ajustado por nowcast", f"${dic_nowcast:,.0f}",
                         f"{ajuste_dic_nowcast:+.1%} vs diciembre original",
                     )
-                    st.caption(
-                        "Fórmula: Dic. ajustado = Dic. original × [1 + límite((Nov. escenario / "
-                        "Nov. original − 1) × propagación)]."
-                    )
+                    if seleccion_exclusiva_lacteos:
+                        ratios_texto = ", ".join(f"{r:.3f}" for r in ratios_hist_lacteos) or "sin historial válido"
+                        st.success(
+                            "Control especial activo para Lácteos Culinarios: diciembre se calcula "
+                            "desde noviembre actualizado y queda limitado entre -5% y +10%."
+                        )
+                        st.caption(
+                            f"Relaciones históricas Dic/Nov disponibles: {ratios_texto}. "
+                            f"Método nowcast: {metodo_dic_nowcast}."
+                        )
+                    else:
+                        st.caption(
+                            "Fórmula general: Dic. ajustado = Dic. original × [1 + límite((Nov. escenario / "
+                            "Nov. original − 1) × propagación)]."
+                        )
 
                     octubre_puente = historico[
                         historico["Fecha"] == pd.Timestamp("2026-10-01")
@@ -1363,7 +1443,7 @@ if archivos:
                         dic_ritmo,
                         "Proyección por ritmo",
                         "#EF4444",
-                        f"Azul: ventas reales | Rojo: ritmo; diciembre propaga {propagacion_dic:.0%} del ajuste, limitado a ±{limite_ajuste_dic:.0%}",
+                        (f"Azul: ventas reales | Rojo: ritmo; diciembre anclado a noviembre con tope +10%" if seleccion_exclusiva_lacteos else f"Azul: ventas reales | Rojo: ritmo; diciembre propaga {propagacion_dic:.0%} del ajuste, limitado a ±{limite_ajuste_dic:.0%}"),
                     )
                     st.altair_chart(chart_ritmo, use_container_width=True)
                     st.caption(
@@ -1377,7 +1457,7 @@ if archivos:
                         dic_nowcast,
                         "Nowcast ponderado",
                         "#10B981",
-                        f"Azul: ventas reales | Verde: nowcast con {peso_real:.0%} de peso semanal; diciembre ajustado con propagación parcial",
+                        (f"Azul: ventas reales | Verde: nowcast con {peso_real:.0%}; diciembre anclado a noviembre con tope +10%" if seleccion_exclusiva_lacteos else f"Azul: ventas reales | Verde: nowcast con {peso_real:.0%} de peso semanal; diciembre ajustado con propagación parcial"),
                     )
                     st.altair_chart(chart_nowcast, use_container_width=True)
                     st.caption(
@@ -1394,6 +1474,7 @@ if archivos:
                         "Diciembre": [dic, dic_ritmo, dic_nowcast],
                         "Factor_Noviembre_vs_original": [1.0, factor_nov_ritmo, factor_nov_nowcast],
                         "Ajuste_propagado_Diciembre": [0.0, ajuste_dic_ritmo, ajuste_dic_nowcast],
+                        "Metodo_Diciembre": ["Forecast original", metodo_dic_ritmo, metodo_dic_nowcast],
                     })
                     st.dataframe(
                         resumen_escenarios_dic.style.format({
@@ -1623,5 +1704,6 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
 
 
