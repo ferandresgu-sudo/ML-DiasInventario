@@ -1255,6 +1255,86 @@ if archivos:
                     ).properties(height=430, title="Comparación de proyecciones de noviembre por categoría")
                     st.altair_chart(barras, use_container_width=True)
 
+                    # Dos gráficas adicionales con el mismo histórico mensual.
+                    # La venta semanal solo actualiza noviembre. Diciembre conserva
+                    # el forecast original porque todavía no existe evidencia real de diciembre.
+                    octubre_puente = historico[
+                        historico["Fecha"] == pd.Timestamp("2026-10-01")
+                    ][["Fecha", "Valor"]].copy()
+                    if octubre_puente.empty:
+                        octubre_puente = historico.sort_values("Fecha").tail(1)[["Fecha", "Valor"]].copy()
+
+                    def crear_grafica_escenario(valor_noviembre, nombre, color, subtitulo):
+                        puntos = pd.DataFrame({
+                            "Fecha": [pd.Timestamp("2026-11-01"), pd.Timestamp("2026-12-01")],
+                            "Valor": [float(valor_noviembre), float(dic)],
+                            "Serie": [nombre, nombre],
+                        })
+                        puente = octubre_puente.copy()
+                        puente["Serie"] = nombre
+                        linea = pd.concat(
+                            [puente[["Fecha", "Valor", "Serie"]], puntos],
+                            ignore_index=True,
+                        ).sort_values("Fecha")
+                        tooltip_escenario = [
+                            alt.Tooltip("Fecha:T", title="Mes", format="%B %Y"),
+                            alt.Tooltip("Valor:Q", title="Venta", format="$,.2f"),
+                            alt.Tooltip("Serie:N", title="Escenario"),
+                        ]
+                        linea_real_esc = alt.Chart(historico).mark_line(
+                            color="#3B82F6", strokeWidth=3.2, interpolate="monotone"
+                        ).encode(x=eje_x, y=eje_y, tooltip=tooltip)
+                        puntos_reales_esc = alt.Chart(historico).mark_circle(
+                            color="#3B82F6", size=44, opacity=0.9
+                        ).encode(x=eje_x, y=eje_y, tooltip=tooltip)
+                        linea_esc = alt.Chart(linea).mark_line(
+                            color=color, strokeWidth=3.5, strokeDash=[8, 5],
+                            interpolate="monotone",
+                        ).encode(x=eje_x, y=eje_y, tooltip=tooltip_escenario)
+                        puntos_esc = alt.Chart(puntos).mark_circle(
+                            color=color, size=125, stroke="white", strokeWidth=1.5
+                        ).encode(x=eje_x, y=eje_y, tooltip=tooltip_escenario)
+                        return alt.layer(
+                            linea_real_esc, puntos_reales_esc, linea_esc, puntos_esc,
+                            regla, etiqueta,
+                        ).properties(
+                            height=520,
+                            title=alt.TitleParams(
+                                text=f"Evolución mensual y {nombre.lower()} Nov-Dic 2026",
+                                subtitle=subtitulo,
+                                anchor="start", fontSize=18, subtitleFontSize=12,
+                                offset=16,
+                            ),
+                        ).configure_view(strokeWidth=0).configure_axis(
+                            labelFontSize=12, titleFontSize=13
+                        )
+
+                    st.markdown("### Evolución mensual con proyección por ritmo")
+                    chart_ritmo = crear_grafica_escenario(
+                        total_ritmo,
+                        "Proyección por ritmo",
+                        "#EF4444",
+                        "Azul: ventas reales | Rojo punteado: noviembre por ritmo; diciembre conserva el forecast original",
+                    )
+                    st.altair_chart(chart_ritmo, use_container_width=True)
+                    st.caption(
+                        "La proyección por ritmo extrapola la venta acumulada de la semana 1 a los 30 días de noviembre. "
+                        "No se utiliza para recalcular diciembre."
+                    )
+
+                    st.markdown("### Evolución mensual con nowcast ponderado")
+                    chart_nowcast = crear_grafica_escenario(
+                        total_nowcast,
+                        "Nowcast ponderado",
+                        "#10B981",
+                        f"Azul: ventas reales | Verde punteado: nowcast con {peso_real:.0%} de peso semanal; diciembre conserva el forecast original",
+                    )
+                    st.altair_chart(chart_nowcast, use_container_width=True)
+                    st.caption(
+                        "El nowcast combina el forecast original de noviembre con la proyección por ritmo. "
+                        "El peso se controla con el segmentador superior."
+                    )
+
                     tabla_comp = comparativo[[
                         "CATEGORIA", "Venta_Semana_1", "Prediccion_Original",
                         "Cumplimiento_Forecast", "Proyeccion_Ritmo", "Nowcast_Ponderado",
@@ -1414,5 +1494,6 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
 
 
