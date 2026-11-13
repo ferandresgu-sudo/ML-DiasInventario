@@ -1158,6 +1158,8 @@ if archivos:
             # --------------------------------------------------------------
             # Seguimiento de noviembre con venta real de la primera semana
             # --------------------------------------------------------------
+            # Valor predeterminado disponible también para la tabla SKU.
+            peso_real = 0.30
             st.markdown("### Seguimiento semanal de noviembre")
             if archivo_semanal is None:
                 st.info(
@@ -1429,8 +1431,9 @@ if archivos:
             # ------------------------------------------------------------------
             st.markdown("### Tabla resumen: predicción por SKU (Nov-Dic 2026)")
             st.caption(
-                "Predicción final de venta por código, respetando los filtros actuales "
-                "de universo, categoría, tipo de producto y SKU."
+                "Incluye forecast original, proyección por ritmo y nowcast ponderado de noviembre. "
+                "Como la venta semanal está agregada por categoría, los escenarios por SKU se estiman "
+                "distribuyendo la venta semanal según la participación de cada SKU en el forecast original."
             )
 
             tabla_sku = (
@@ -1458,6 +1461,58 @@ if archivos:
             tabla_sku["Total_NovDic"] = (
                 tabla_sku["Prediccion_Nov_2026"] + tabla_sku["Prediccion_Dic_2026"]
             )
+
+            # --------------------------------------------------------------
+            # Escenarios de noviembre por SKU
+            # --------------------------------------------------------------
+            # La tabla semanal disponible está agregada por categoría. Por ello,
+            # la venta de semana 1 se distribuye entre SKU según la participación
+            # de cada SKU en el forecast original de noviembre de su categoría.
+            # Es una estimación por SKU, no una venta real observada por código.
+            tabla_sku["Categoria_normalizada"] = tabla_sku["CATEGORIA"].map(
+                normalizar_categoria_calibracion
+            )
+            tabla_sku["Participacion_SKU_Categoria"] = np.where(
+                tabla_sku.groupby("Categoria_normalizada")["Prediccion_Nov_2026"]
+                         .transform("sum") > 0,
+                tabla_sku["Prediccion_Nov_2026"] /
+                tabla_sku.groupby("Categoria_normalizada")["Prediccion_Nov_2026"]
+                         .transform("sum"),
+                0.0,
+            )
+            tabla_sku["Venta_Semana_1_SKU_Estimada"] = np.nan
+            tabla_sku["Proyeccion_Ritmo_Nov_2026"] = np.nan
+            tabla_sku["Nowcast_Ponderado_Nov_2026"] = np.nan
+
+            if archivo_semanal is not None:
+                venta_semanal_sku = cargar_venta_semanal_noviembre(archivo_semanal)[
+                    ["Categoria_normalizada", "Venta_Semana_1"]
+                ].copy()
+                tabla_sku = tabla_sku.merge(
+                    venta_semanal_sku,
+                    on="Categoria_normalizada",
+                    how="left",
+                )
+                tabla_sku["Venta_Semana_1_SKU_Estimada"] = (
+                    tabla_sku["Venta_Semana_1"]
+                    * tabla_sku["Participacion_SKU_Categoria"]
+                )
+                tabla_sku["Proyeccion_Ritmo_Nov_2026"] = (
+                    tabla_sku["Venta_Semana_1_SKU_Estimada"] * 30.0 / 7.0
+                )
+                tabla_sku["Nowcast_Ponderado_Nov_2026"] = (
+                    (1.0 - peso_real) * tabla_sku["Prediccion_Nov_2026"]
+                    + peso_real * tabla_sku["Proyeccion_Ritmo_Nov_2026"]
+                )
+                tabla_sku = tabla_sku.drop(columns=["Venta_Semana_1"])
+            else:
+                st.info(
+                    "Para mostrar ritmo y nowcast por SKU, carga PREDICCIONES NOVIEMBRE.xlsx. "
+                    "Como la venta semanal está por categoría, el reparto por SKU se estima "
+                    "con la participación del forecast original de noviembre."
+                )
+
+            tabla_sku = tabla_sku.drop(columns=["Categoria_normalizada"])
             tabla_sku = tabla_sku.sort_values(
                 ["CATEGORIA", "CODIGO"]
             ).reset_index(drop=True)
@@ -1468,14 +1523,22 @@ if archivos:
                 "CODIGO": "",
                 "DESCRIPCION": "",
                 "Prediccion_Nov_2026": tabla_sku["Prediccion_Nov_2026"].sum(),
+                "Venta_Semana_1_SKU_Estimada": tabla_sku["Venta_Semana_1_SKU_Estimada"].sum(min_count=1),
+                "Proyeccion_Ritmo_Nov_2026": tabla_sku["Proyeccion_Ritmo_Nov_2026"].sum(min_count=1),
+                "Nowcast_Ponderado_Nov_2026": tabla_sku["Nowcast_Ponderado_Nov_2026"].sum(min_count=1),
                 "Prediccion_Dic_2026": tabla_sku["Prediccion_Dic_2026"].sum(),
                 "Total_NovDic": tabla_sku["Total_NovDic"].sum(),
+                "Participacion_SKU_Categoria": np.nan,
             }])
             tabla_sku_mostrar = pd.concat([tabla_sku, fila_total], ignore_index=True)
 
             st.dataframe(
                 tabla_sku_mostrar.style.format({
                     "Prediccion_Nov_2026": "${:,.2f}",
+                    "Venta_Semana_1_SKU_Estimada": "${:,.2f}",
+                    "Proyeccion_Ritmo_Nov_2026": "${:,.2f}",
+                    "Nowcast_Ponderado_Nov_2026": "${:,.2f}",
+                    "Participacion_SKU_Categoria": "{:.2%}",
                     "Prediccion_Dic_2026": "${:,.2f}",
                     "Total_NovDic": "${:,.2f}",
                 }),
@@ -1484,9 +1547,9 @@ if archivos:
                 height=440,
             )
             st.download_button(
-                "Descargar tabla SKU Nov-Dic 2026 CSV",
+                "Descargar tabla SKU con ritmo y nowcast CSV",
                 tabla_sku.to_csv(index=False).encode("utf-8-sig"),
-                "tabla_sku_prediccion_nov_dic_2026.csv",
+                "tabla_sku_forecast_ritmo_nowcast_nov_dic_2026.csv",
                 "text/csv",
             )
 
@@ -1560,3 +1623,5 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
+
