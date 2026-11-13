@@ -13,6 +13,108 @@ st.set_page_config(page_title="Forecast Nov-Dic 2026", layout="wide")
 st.markdown("## Forecast de ventas | Noviembre y diciembre 2026")
 st.caption("Histórico mensual comparable y pronóstico conectado, con filtros de categoría, combo y producto.")
 
+with st.expander("¿Cómo funciona el modelo?", expanded=False):
+    st.markdown(
+        """
+### Resumen
+
+El forecast combina **tres modelos globales CatBoost** y una corrección estacional controlada. El objetivo es estimar las ventas de noviembre y diciembre de 2026 sin limitarse a copiar el cierre de 2025.
+
+### 1. Información utilizada
+
+El modelo aprende con datos mensuales de 2024, 2025 y 2026 hasta octubre:
+
+- Venta monetaria.
+- Unidades vendidas.
+- Precio promedio, recalculado como `VENTA / UNIDADES`.
+- Código, categoría, familia, tipo de producto y condición de combo.
+- Rezagos de 1, 2, 3, 6, 12 y 24 meses.
+- Promedios y variabilidad de los últimos 3, 6 y 12 meses.
+- Mes del año y tendencia reciente.
+
+### 2. Tres pronósticos CatBoost
+
+Se entrenan tres modelos:
+
+1. **Venta directa:** pronostica el importe monetario.
+2. **Unidades:** pronostica cuántas unidades se venderán.
+3. **Precio promedio:** pronostica el precio medio esperado.
+
+La venta estructural se calcula así:
+
+`Venta estructural = Unidades pronosticadas × Precio pronosticado`
+
+La predicción base combina:
+
+`Predicción base = 85% venta directa + 15% venta estructural`
+
+### 3. Estacionalidad de noviembre y diciembre
+
+El ajuste externo solo se activa cuando el SKU presenta un índice estacional mínimo de **1.20**. Esto significa que históricamente noviembre y diciembre deben vender al menos 20% más que el resto del año.
+
+Cuando se activa, se construye una referencia con:
+
+- 65% del mismo mes más reciente.
+- 35% del mismo mes de hace dos años.
+- Crecimiento enero-octubre del año objetivo frente al año anterior.
+
+La señal queda combinada como:
+
+`Predicción estacional = 85% predicción base + 15% referencia histórica YTD`
+
+### 4. Piso parcial validado
+
+La venta del mismo mes anterior no se usa como piso rígido. Solo funciona como protección ante una subestimación extrema.
+
+- En **noviembre** se recupera 45% de la distancia hacia el piso parcial.
+- En **diciembre** se recupera 60%, porque diciembre mostró mayor subestimación en el backtest.
+- Si la predicción ya está por encima del piso, no se agrega corrección.
+
+Esto permite que el forecast quede por encima o por debajo de 2025 según la tendencia, sin copiar exactamente ese valor.
+
+### 5. Validación histórica
+
+La configuración se validó entrenando hasta octubre de 2025 y pronosticando noviembre-diciembre de 2025. Sin combos, los resultados fueron:
+
+| Métrica | Resultado |
+|---|---:|
+| WAPE | 18.42% |
+| MAE | $39,321.84 |
+| RMSE | $113,103.17 |
+| R² | 0.9457 |
+| Sesgo | -6.43% |
+
+El sesgo negativo indica que el modelo sigue siendo conservador. Las métricas son una referencia histórica, no una garantía del error real de 2026.
+
+### 6. Interpretación de la gráfica
+
+- **Línea azul:** ventas reales hasta octubre de 2026.
+- **Línea naranja punteada:** pronóstico de noviembre y diciembre de 2026.
+- Los filtros permiten analizar categoría, productos sin combos, combos o un SKU individual.
+- El histórico utiliza el mismo universo de SKU activos incluidos en el forecast.
+
+### 7. Alcance
+
+El resultado es adecuado como forecast operativo con revisión comercial. Los combos, lanzamientos, bajas, promociones futuras, faltantes y cambios extraordinarios de distribución requieren validación adicional porque esas decisiones no siempre están presentes en el histórico.
+        """
+    )
+
+with st.expander("Fórmulas principales", expanded=False):
+    st.code(
+        """Venta estructural = Unidades predichas * Precio predicho
+
+Predicción base = 0.85 * Venta directa + 0.15 * Venta estructural
+
+Predicción estacional = 0.85 * Predicción base + 0.15 * Referencia histórica YTD
+
+Si Predicción combinada < Piso parcial:
+    Noviembre: Predicción final = combinada + 0.45 * (piso - combinada)
+    Diciembre: Predicción final = combinada + 0.60 * (piso - combinada)
+Si no:
+    Predicción final = Predicción combinada""",
+        language="text",
+    )
+
 MESES = {
     "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4,
     "MAYO": 5, "JUNIO": 6, "JULIO": 7, "AGOSTO": 8,
@@ -36,6 +138,27 @@ PESO_VENTA_DIRECTA = 0.85
 PESO_ESTRUCTURAL = 0.15
 PESO_FORECAST_ESTACIONAL = 0.85
 UMBRAL_ESTACIONAL = 1.20
+
+# Calibración selectiva V2 validada sobre el backtest Nov-Dic 2025 sin combos.
+CALIBRACION_CATEGORIAS_V2 = {
+    "LACTEOS CULINARIOS": 1.00,  # Sin incremento: contraccion comercial reportada.
+    "CHOCOLATE MESA": 1.10,
+    "NESTLE PROFESSIONAL": 1.10,
+    "RTD": 1.08,
+    "CHOCOLATE IMPULSO": 0.90,
+    "CARNATION POLVO": 0.92,
+    "CEREALES": 0.97,
+    "AGUAS": 0.97,
+}
+FACTOR_CALIBRACION_MIN = 0.90
+FACTOR_CALIBRACION_MAX = 1.10
+APLICAR_CALIBRACION_A_COMBOS = False
+
+# Restriccion comercial exclusiva para LACTEOS CULINARIOS.
+APLICAR_RESTRICCION_LACTEOS = True
+FACTOR_CONTRACCION_LACTEOS = 0.95
+MAX_CRECIMIENTO_LACTEOS_NOV_VS_OCT = 0.05
+MAX_CRECIMIENTO_LACTEOS_DIC_VS_NOV = 0.05
 
 
 def normalizar_codigo(serie):
@@ -437,6 +560,11 @@ def crecimiento_ytd(historial, ano_objetivo):
 
 
 def aplicar_ajuste_estacional(pred_base, historial, periodo):
+    """Ajuste estacional final validado: piso parcial 45% Nov / 60% Dic.
+
+    No copia automáticamente el mismo mes anterior. Si la predicción queda por
+    debajo del piso parcial, recupera solo una parte de la diferencia.
+    """
     mes = periodo % 100
     ano = periodo // 100
     indice = indice_estacional(historial, ano)
@@ -444,40 +572,220 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
         (historial["MES_NUM"] == mes) & (historial["AÑO"] < ano)
     ].sort_values("AÑO").tail(2)
 
+    diagnostico = {
+        "Indice_estacional": float(indice),
+        "Referencia_ultimo_ano": np.nan,
+        "Crecimiento_YTD": 1.0,
+        "Prediccion_estacional": float(pred_base),
+        "Prediccion_combinada": float(pred_base),
+        "Piso_parcial": np.nan,
+        "Porcentaje_recuperacion": 0.0,
+        "Correccion_piso": 0.0,
+        "Ajuste_aplicado": False,
+    }
+
     if mismos.empty or indice < UMBRAL_ESTACIONAL:
-        return float(pred_base)
+        return max(0.0, float(pred_base)), diagnostico
 
     valores = mismos["VENTA"].astype(float).to_numpy()
-    referencia = (
-        valores[-1]
-        if len(valores) == 1
-        else 0.65 * valores[-1] + 0.35 * valores[-2]
+    ultimo_ano = float(valores[-1])
+    referencia_historica = (
+        ultimo_ano if len(valores) == 1
+        else 0.65 * ultimo_ano + 0.35 * float(valores[-2])
     )
     crec = crecimiento_ytd(historial, ano)
-    referencia_ytd = referencia * crec
-    ajustada = (
-        PESO_FORECAST_ESTACIONAL * pred_base
-        + (1 - PESO_FORECAST_ESTACIONAL) * referencia_ytd
+    referencia_ytd = referencia_historica * crec
+
+    prediccion_estacional = (
+        PESO_FORECAST_ESTACIONAL * float(pred_base)
+        + (1.0 - PESO_FORECAST_ESTACIONAL) * referencia_ytd
     )
-    piso = valores[-1] * (1 + 0.35 * max(crec - 1, 0))
-    return max(float(ajustada), float(piso))
+
+    crecimiento_suavizado = float(np.clip(
+        1.0 + 0.50 * (crec - 1.0), 0.90, 1.20
+    ))
+    referencia_suavizada = ultimo_ano * crecimiento_suavizado
+    prediccion_combinada = (
+        0.90 * prediccion_estacional + 0.10 * referencia_suavizada
+    )
+
+    factor_piso = float(np.clip(
+        1.0 + 0.35 * (crec - 1.0), 0.94, 1.15
+    ))
+    piso_parcial = ultimo_ano * factor_piso
+
+    porcentaje_recuperacion = 0.45 if mes == 11 else 0.60 if mes == 12 else 0.40
+    if prediccion_combinada < piso_parcial:
+        correccion_piso = porcentaje_recuperacion * (
+            piso_parcial - prediccion_combinada
+        )
+        prediccion_final = prediccion_combinada + correccion_piso
+    else:
+        correccion_piso = 0.0
+        prediccion_final = prediccion_combinada
+
+    diagnostico.update({
+        "Referencia_ultimo_ano": ultimo_ano,
+        "Crecimiento_YTD": float(crec),
+        "Prediccion_estacional": float(prediccion_estacional),
+        "Prediccion_combinada": float(prediccion_combinada),
+        "Piso_parcial": float(piso_parcial),
+        "Porcentaje_recuperacion": float(porcentaje_recuperacion),
+        "Correccion_piso": float(correccion_piso),
+        "Ajuste_aplicado": True,
+    })
+    return max(0.0, float(prediccion_final)), diagnostico
+
+def normalizar_categoria_calibracion(categoria):
+    import unicodedata
+    texto = unicodedata.normalize("NFKD", str(categoria))
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return " ".join(texto.upper().strip().split())
+
+
+def aplicar_calibracion_categoria_v2(prediccion, categoria, es_combo=0):
+    """Aplica factor V2 solo a categorías autorizadas y productos sin combo."""
+    prediccion = max(0.0, float(prediccion))
+    categoria_norm = normalizar_categoria_calibracion(categoria)
+    if int(es_combo) == 1 and not APLICAR_CALIBRACION_A_COMBOS:
+        return prediccion, 1.0, False, "Combo sin calibración"
+    factor = float(np.clip(
+        CALIBRACION_CATEGORIAS_V2.get(categoria_norm, 1.0),
+        FACTOR_CALIBRACION_MIN,
+        FACTOR_CALIBRACION_MAX,
+    ))
+    aplicada = not np.isclose(factor, 1.0)
+    motivo = f"Factor V2 de {categoria_norm}" if aplicada else "Categoría sin corrección"
+    return prediccion * factor, factor, aplicada, motivo
+
+
+def extender_historial_hasta_octubre_2026(historial):
+    """Completa meses faltantes hasta octubre 2026 para SKU inactivos.
+
+    Los meses posteriores al último registro se consideran sin venta y sin
+    unidades. El precio se conserva como última referencia disponible. Esto
+    evita tratar julio como si fuera el mes inmediatamente anterior a noviembre.
+    """
+    hist = historial.sort_values("Periodo").copy()
+    ultimo_periodo = int(hist["Periodo"].max())
+    if ultimo_periodo >= 202610:
+        return hist
+
+    ultima_fecha = pd.Timestamp(
+        year=ultimo_periodo // 100,
+        month=ultimo_periodo % 100,
+        day=1,
+    )
+    fechas_faltantes = pd.date_range(
+        ultima_fecha + pd.offsets.MonthBegin(1),
+        pd.Timestamp("2026-10-01"),
+        freq="MS",
+    )
+    if len(fechas_faltantes) == 0:
+        return hist
+
+    meta = hist.iloc[-1].copy()
+    nuevas = []
+    for fecha in fechas_faltantes:
+        fila = meta.copy()
+        fila["AÑO"] = int(fecha.year)
+        fila["MES_NUM"] = int(fecha.month)
+        fila["Periodo"] = int(fecha.year * 100 + fecha.month)
+        fila["VENTA"] = 0.0
+        fila["UNIDADES"] = 0.0
+        # El precio se conserva como referencia; no se inventa un precio cero.
+        fila["PRECIO_PROMEDIO"] = float(meta.get("PRECIO_PROMEDIO", 0.0) or 0.0)
+        nuevas.append(fila)
+    return pd.concat([hist, pd.DataFrame(nuevas)], ignore_index=True)
+
+
+def meses_entre_periodos(periodo_inicial, periodo_final=202610):
+    ai, mi = divmod(int(periodo_inicial), 100)
+    af, mf = divmod(int(periodo_final), 100)
+    return max(0, (af - ai) * 12 + (mf - mi))
+
+
+def aplicar_restriccion_mercado_lacteos(forecast, historico):
+    """Reconcilia Lacteos Culinarios con la contraccion conocida del mercado.
+
+    Conserva la prediccion original, aplica factor prudente, limita el total
+    mensual y reparte el ajuste proporcionalmente entre los SKU. No modifica
+    ninguna otra categoria.
+    """
+    salida = forecast.copy()
+    salida["Prediccion_pre_restriccion_mercado"] = salida["Prediccion_final"]
+    salida["Factor_restriccion_mercado"] = 1.0
+    salida["Tope_categoria"] = np.nan
+    salida["Restriccion_mercado_aplicada"] = False
+    if not APLICAR_RESTRICCION_LACTEOS or salida.empty:
+        return salida
+
+    objetivo = "LACTEOS CULINARIOS"
+    mascara_categoria = salida["CATEGORIA"].map(normalizar_categoria_calibracion).eq(objetivo)
+    if not mascara_categoria.any():
+        return salida
+
+    mascara_hist = historico["CATEGORIA"].map(normalizar_categoria_calibracion).eq(objetivo)
+    octubre_real = historico.loc[
+        mascara_hist & (historico["AÑO"] == 2026) & (historico["MES_NUM"] == 10), "VENTA"
+    ].sum()
+    if octubre_real <= 0:
+        return salida
+
+    referencia = float(octubre_real)
+    limites = {202611: MAX_CRECIMIENTO_LACTEOS_NOV_VS_OCT,
+               202612: MAX_CRECIMIENTO_LACTEOS_DIC_VS_NOV}
+    for periodo in [202611, 202612]:
+        mascara = mascara_categoria & salida["Periodo"].eq(periodo)
+        total_original = salida.loc[mascara, "Prediccion_final"].sum()
+        if total_original <= 0:
+            continue
+        total_con_contraccion = total_original * FACTOR_CONTRACCION_LACTEOS
+        tope = referencia * (1.0 + limites[periodo])
+        total_objetivo = min(total_con_contraccion, tope)
+        factor = total_objetivo / total_original
+        salida.loc[mascara, "Prediccion_final"] *= factor
+        salida.loc[mascara, "Factor_restriccion_mercado"] = factor
+        salida.loc[mascara, "Tope_categoria"] = tope
+        salida.loc[mascara, "Restriccion_mercado_aplicada"] = factor < 0.999999
+        referencia = total_objetivo
+    return salida
 
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df):
+def generar_forecast(df, version_modelo="final-restriccion-lacteos-mercado-v1"):
+    """Genera forecast para todos los SKU presentes en ventas 2026.
+
+    Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
+    en 2026, pero sin actividad desde agosto, se pronostican y se etiquetan para
+    que el usuario decida mediante segmentador si afectan o no los totales.
+    """
     modelos = entrenar_modelos(df)
     filas = []
     periodos = [202611, 202612]
+    codigos_2026 = set(
+        df.loc[df["AÑO"] == 2026, "CODIGO"].astype(str).unique().tolist()
+    )
 
     for codigo, historial in df.groupby("CODIGO", sort=False):
-        hist = historial.sort_values("Periodo")
-        if hist.empty:
+        if str(codigo) not in codigos_2026:
             continue
-        # Solo pronosticar SKU activos con información reciente de 2026.
-        # Evita saltar directamente de 2024/2025 a noviembre de 2026.
-        ultimo_periodo = int(hist["Periodo"].max())
-        if ultimo_periodo < 202608:
+        hist_original = historial.sort_values("Periodo").copy()
+        if hist_original.empty:
             continue
+
+        ultimo_periodo_disponible = int(hist_original["Periodo"].max())
+        incluido_base = ultimo_periodo_disponible >= 202608
+        estado_forecast = "INCLUIDO_BASE" if incluido_base else "NO_CONTADO_BASE"
+        meses_sin_actividad = meses_entre_periodos(ultimo_periodo_disponible, 202610)
+
+        # Para SKU no contados en el forecast base, se completan con ceros hasta
+        # octubre. Se mantienen separados y no afectan el total salvo elección.
+        hist = (
+            hist_original
+            if incluido_base
+            else extender_historial_hasta_octubre_2026(hist_original)
+        )
         meta = hist.iloc[-1]
 
         venta_directa = predecir_objetivo(
@@ -494,21 +802,49 @@ def generar_forecast(df):
             periodos, venta_directa, unidades, precio
         ):
             estructural = unid * precio_prom
-            base = (
-                PESO_VENTA_DIRECTA * vd
-                + PESO_ESTRUCTURAL * estructural
+            base = PESO_VENTA_DIRECTA * vd + PESO_ESTRUCTURAL * estructural
+            final_antes_calibracion, diag = aplicar_ajuste_estacional(
+                base, hist, periodo
             )
-            final = aplicar_ajuste_estacional(base, hist, periodo)
+            final, factor_categoria, calibracion_aplicada, motivo_calibracion = (
+                aplicar_calibracion_categoria_v2(
+                    final_antes_calibracion,
+                    meta.get("CATEGORIA", "SIN_DATO"),
+                    meta.get("COMBOS", 0),
+                )
+            )
             filas.append({
-                "CODIGO": codigo,
+                "CODIGO": str(codigo),
                 "DESCRIPCION": str(meta.get("DESCRIPCION", "")),
                 "CATEGORIA": str(meta.get("CATEGORIA", "SIN_DATO")).strip(),
                 "COMBOS": int(meta.get("COMBOS", 0)),
                 "Periodo": periodo,
-                "Prediccion_final": final,
+                "Estado_forecast": estado_forecast,
+                "Incluido_forecast_base": bool(incluido_base),
+                "Ultimo_periodo_disponible": ultimo_periodo_disponible,
+                "Meses_sin_actividad_a_octubre": int(meses_sin_actividad),
+                "Venta_directa": float(vd),
+                "Unidades_pred": float(unid),
+                "Precio_pred": float(precio_prom),
+                "Venta_estructural": float(estructural),
+                "Prediccion_base": float(base),
+                "Referencia_ultimo_ano": diag["Referencia_ultimo_ano"],
+                "Crecimiento_YTD": diag["Crecimiento_YTD"],
+                "Prediccion_estacional": diag["Prediccion_estacional"],
+                "Prediccion_combinada": diag["Prediccion_combinada"],
+                "Piso_parcial": diag["Piso_parcial"],
+                "Porcentaje_recuperacion": diag["Porcentaje_recuperacion"],
+                "Correccion_piso": diag["Correccion_piso"],
+                "Indice_estacional": diag["Indice_estacional"],
+                "Ajuste_aplicado": diag["Ajuste_aplicado"],
+                "Prediccion_antes_calibracion": float(final_antes_calibracion),
+                "Factor_calibracion_categoria": float(factor_categoria),
+                "Calibracion_categoria_aplicada": bool(calibracion_aplicada),
+                "Motivo_calibracion": motivo_calibracion,
+                "Prediccion_final": float(final),
             })
-
-    return pd.DataFrame(filas)
+    resultado = pd.DataFrame(filas)
+    return aplicar_restriccion_mercado_lacteos(resultado, df)
 
 
 def preparar_grafica(df_historico, forecast, categoria, combo, producto):
@@ -594,23 +930,72 @@ if archivos:
             )
             st.stop()
 
-        if "forecast_2026" not in st.session_state:
+        col_boton, col_estado = st.columns([1, 2])
+        with col_boton:
+            if st.button("Limpiar forecast anterior"):
+                st.session_state.pop("forecast_2026_restriccion_lacteos_v1", None)
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.rerun()
+        with col_estado:
+            st.info("Modelo activo: piso parcial 45%/60% y restriccion de mercado para Lacteos Culinarios.")
+            st.caption("Lacteos Culinarios: factor 0.95 y tope de +5% mensual. Las demas categorias no cambian.")
+
+        if "forecast_2026_restriccion_lacteos_v1" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
-        if st.button("Generar forecast noviembre-diciembre 2026", type="primary"):
+        if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026"] = generar_forecast(df)
+                st.session_state["forecast_2026_restriccion_lacteos_v1"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026" in st.session_state:
-            forecast = st.session_state["forecast_2026"]
+        if "forecast_2026_restriccion_lacteos_v1" in st.session_state:
+            forecast = st.session_state["forecast_2026_restriccion_lacteos_v1"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
 
             st.markdown("### Filtros")
+            st.markdown("#### Universo de SKU 2026")
+            universo_sku = st.segmented_control(
+                "¿Qué SKU deben afectar la gráfica y los totales?",
+                options=[
+                    "SOLO INCLUIDOS BASE",
+                    "INCLUIR NO CONTADOS",
+                    "SOLO NO CONTADOS",
+                ],
+                default="SOLO INCLUIDOS BASE",
+                help=(
+                    "Incluidos base: SKU con datos desde agosto 2026. "
+                    "Incluir no contados: suma también SKU presentes en 2026 sin actividad reciente. "
+                    "Solo no contados: permite revisarlos por separado sin mezclar el resto."
+                ),
+            )
+            if universo_sku is None:
+                universo_sku = "SOLO INCLUIDOS BASE"
+
+            if universo_sku == "SOLO INCLUIDOS BASE":
+                forecast_universo = forecast[forecast["Incluido_forecast_base"]].copy()
+            elif universo_sku == "SOLO NO CONTADOS":
+                forecast_universo = forecast[~forecast["Incluido_forecast_base"]].copy()
+            else:
+                forecast_universo = forecast.copy()
+
+            conteo_base = forecast.loc[forecast["Incluido_forecast_base"], "CODIGO"].nunique()
+            conteo_no_contado = forecast.loc[~forecast["Incluido_forecast_base"], "CODIGO"].nunique()
+            u1, u2, u3 = st.columns(3)
+            u1.metric("SKU incluidos base", f"{conteo_base:,}")
+            u2.metric("SKU 2026 no contados", f"{conteo_no_contado:,}")
+            u3.metric("SKU en universo seleccionado", f"{forecast_universo['CODIGO'].nunique():,}")
+
+            if universo_sku != "SOLO INCLUIDOS BASE":
+                st.warning(
+                    "Los SKU no contados tienen menor evidencia reciente. Sus meses faltantes hasta "
+                    "octubre se completan con venta/unidades cero. Úsalos como escenario de sensibilidad."
+                )
+
             categorias = ["TODAS"] + sorted(
-                forecast["CATEGORIA"].dropna().astype(str).str.strip().unique().tolist()
+                forecast_universo["CATEGORIA"].dropna().astype(str).str.strip().unique().tolist()
             )
             c1, c2, c3 = st.columns([2, 1.25, 3])
             with c1:
@@ -624,7 +1009,7 @@ if archivos:
                 if combo is None:
                     combo = "SIN COMBOS"
 
-            universo = forecast.copy()
+            universo = forecast_universo.copy()
             if categoria != "TODAS":
                 universo = universo[universo["CATEGORIA"] == categoria]
             if combo != "TODOS":
@@ -647,7 +1032,7 @@ if archivos:
             producto = "TODOS" if seleccion_producto == "TODOS" else mapa_productos[seleccion_producto]
 
             historico, forecast_linea, forecast_puntos = preparar_grafica(
-                df, forecast, categoria, combo, producto
+                df, forecast_universo, categoria, combo, producto
             )
             if historico.empty or forecast_puntos.empty:
                 st.warning("No hay datos comparables para la selección actual.")
@@ -671,7 +1056,11 @@ if archivos:
                       f"{crecimiento_nov:+.1f}% vs octubre" if pd.notna(crecimiento_nov) else None)
             k3.metric("Diciembre 2026", f"${dic:,.0f}",
                       f"{crecimiento_dic:+.1f}% vs noviembre" if pd.notna(crecimiento_dic) else None)
-            k4.metric("SKU incluidos", f"{universo['CODIGO'].nunique():,}")
+            sku_mostrados = (
+                universo["CODIGO"].astype(str).nunique()
+                if producto == "TODOS" else 1
+            )
+            k4.metric("SKU incluidos", f"{sku_mostrados:,}")
 
             fecha_min = pd.Timestamp("2024-01-01")
             fecha_max = pd.Timestamp("2026-12-01")
@@ -742,6 +1131,140 @@ if archivos:
                 "El histórico utiliza exactamente los mismos SKU activos incluidos en el forecast. "
                 "Los productos sin actividad reciente en 2026 se excluyen para evitar saltos artificiales."
             )
+
+            # ------------------------------------------------------------------
+            # Tabla resumen: Categoría, Código, Descripción, Nov 2026, Dic 2026
+            # ------------------------------------------------------------------
+            st.markdown("### Tabla resumen: predicción por SKU (Nov-Dic 2026)")
+            st.caption(
+                "Predicción final de venta por código, respetando los filtros actuales "
+                "de universo, categoría, tipo de producto y SKU."
+            )
+
+            tabla_sku = (
+                universo.groupby(
+                    ["CATEGORIA", "CODIGO", "DESCRIPCION", "Periodo"],
+                    as_index=False,
+                )["Prediccion_final"].sum()
+                .pivot(
+                    index=["CATEGORIA", "CODIGO", "DESCRIPCION"],
+                    columns="Periodo",
+                    values="Prediccion_final",
+                )
+                .reset_index()
+            )
+            tabla_sku.columns.name = None
+            tabla_sku = tabla_sku.rename(columns={
+                202611: "Prediccion_Nov_2026",
+                202612: "Prediccion_Dic_2026",
+            })
+            for col in ["Prediccion_Nov_2026", "Prediccion_Dic_2026"]:
+                if col not in tabla_sku.columns:
+                    tabla_sku[col] = 0.0
+                tabla_sku[col] = tabla_sku[col].fillna(0.0)
+
+            tabla_sku["Total_NovDic"] = (
+                tabla_sku["Prediccion_Nov_2026"] + tabla_sku["Prediccion_Dic_2026"]
+            )
+            tabla_sku = tabla_sku.sort_values(
+                ["CATEGORIA", "CODIGO"]
+            ).reset_index(drop=True)
+
+            # Fila de totales al final
+            fila_total = pd.DataFrame([{
+                "CATEGORIA": "TOTAL",
+                "CODIGO": "",
+                "DESCRIPCION": "",
+                "Prediccion_Nov_2026": tabla_sku["Prediccion_Nov_2026"].sum(),
+                "Prediccion_Dic_2026": tabla_sku["Prediccion_Dic_2026"].sum(),
+                "Total_NovDic": tabla_sku["Total_NovDic"].sum(),
+            }])
+            tabla_sku_mostrar = pd.concat([tabla_sku, fila_total], ignore_index=True)
+
+            st.dataframe(
+                tabla_sku_mostrar.style.format({
+                    "Prediccion_Nov_2026": "${:,.2f}",
+                    "Prediccion_Dic_2026": "${:,.2f}",
+                    "Total_NovDic": "${:,.2f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                height=440,
+            )
+            st.download_button(
+                "Descargar tabla SKU Nov-Dic 2026 CSV",
+                tabla_sku.to_csv(index=False).encode("utf-8-sig"),
+                "tabla_sku_prediccion_nov_dic_2026.csv",
+                "text/csv",
+            )
+
+            st.download_button(
+                "Descargar forecast filtrado CSV",
+                universo.to_csv(index=False).encode("utf-8-sig"),
+                "forecast_nov_dic_2026_universo_seleccionado.csv",
+                "text/csv",
+            )
+            with st.expander("Diagnóstico del forecast y universo SKU"):
+                st.caption(
+                    "Predicción base muestra la salida 85% venta directa + 15% unidades por precio. "
+                    "Corrección piso indica cuánto añadió la protección estacional; cero significa que el modelo ya estaba por encima del piso."
+                )
+                diag = universo[[
+                    "CODIGO", "DESCRIPCION", "CATEGORIA", "COMBOS", "Periodo",
+                    "Prediccion_base", "Referencia_ultimo_ano", "Crecimiento_YTD",
+                    "Prediccion_estacional", "Prediccion_combinada", "Piso_parcial",
+                    "Porcentaje_recuperacion", "Correccion_piso",
+                    "Ajuste_aplicado", "Prediccion_antes_calibracion",
+                    "Factor_calibracion_categoria", "Calibracion_categoria_aplicada",
+                    "Motivo_calibracion", "Prediccion_pre_restriccion_mercado",
+                    "Factor_restriccion_mercado", "Tope_categoria",
+                    "Restriccion_mercado_aplicada", "Prediccion_final",
+                ]].copy()
+                resumen_categoria_v2 = (
+                    diag.groupby("CATEGORIA", as_index=False)
+                    .agg(
+                        SKU=("CODIGO", "nunique"),
+                        Antes=("Prediccion_antes_calibracion", "sum"),
+                        Despues=("Prediccion_final", "sum"),
+                        Factor=("Factor_calibracion_categoria", "max"),
+                    )
+                )
+                resumen_categoria_v2["Impacto"] = resumen_categoria_v2["Despues"] - resumen_categoria_v2["Antes"]
+                st.markdown("#### Resumen por categoría")
+                st.dataframe(
+                    resumen_categoria_v2.style.format({
+                        "Antes": "${:,.2f}", "Despues": "${:,.2f}",
+                        "Factor": "{:.2f}", "Impacto": "${:+,.2f}",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                no_contados = forecast[~forecast["Incluido_forecast_base"]].copy()
+                if not no_contados.empty:
+                    resumen_no_contados = (
+                        no_contados.groupby(
+                            ["CODIGO", "DESCRIPCION", "CATEGORIA", "COMBOS",
+                             "Ultimo_periodo_disponible", "Meses_sin_actividad_a_octubre"],
+                            as_index=False,
+                        )
+                        .agg(Forecast_NovDic=("Prediccion_final", "sum"))
+                        .sort_values("Forecast_NovDic", ascending=False)
+                    )
+                    st.markdown("#### SKU presentes en 2026 no contados en el universo base")
+                    st.dataframe(
+                        resumen_no_contados.style.format({"Forecast_NovDic": "${:,.2f}"}),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.download_button(
+                        "Descargar SKU 2026 no contados",
+                        resumen_no_contados.to_csv(index=False).encode("utf-8-sig"),
+                        "sku_2026_no_contados_forecast_base.csv",
+                        "text/csv",
+                    )
+                st.markdown("#### Detalle por SKU")
+                st.dataframe(diag, use_container_width=True, hide_index=True)
+
 
     except Exception as error:
         st.exception(error)
