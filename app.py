@@ -141,7 +141,7 @@ UMBRAL_ESTACIONAL = 1.20
 
 # Calibración selectiva V2 validada sobre el backtest Nov-Dic 2025 sin combos.
 CALIBRACION_CATEGORIAS_V2 = {
-    "LACTEOS CULINARIOS": 1.00,  # Sin incremento: contraccion comercial reportada.
+    "LACTEOS CULINARIOS": 1.10,
     "CHOCOLATE MESA": 1.10,
     "NESTLE PROFESSIONAL": 1.10,
     "RTD": 1.08,
@@ -153,12 +153,6 @@ CALIBRACION_CATEGORIAS_V2 = {
 FACTOR_CALIBRACION_MIN = 0.90
 FACTOR_CALIBRACION_MAX = 1.10
 APLICAR_CALIBRACION_A_COMBOS = False
-
-# Restriccion comercial exclusiva para LACTEOS CULINARIOS.
-APLICAR_RESTRICCION_LACTEOS = True
-FACTOR_CONTRACCION_LACTEOS = 0.95
-MAX_CRECIMIENTO_LACTEOS_NOV_VS_OCT = 0.05
-MAX_CRECIMIENTO_LACTEOS_DIC_VS_NOV = 0.05
 
 
 def normalizar_codigo(serie):
@@ -705,55 +699,8 @@ def meses_entre_periodos(periodo_inicial, periodo_final=202610):
     return max(0, (af - ai) * 12 + (mf - mi))
 
 
-def aplicar_restriccion_mercado_lacteos(forecast, historico):
-    """Reconcilia Lacteos Culinarios con la contraccion conocida del mercado.
-
-    Conserva la prediccion original, aplica factor prudente, limita el total
-    mensual y reparte el ajuste proporcionalmente entre los SKU. No modifica
-    ninguna otra categoria.
-    """
-    salida = forecast.copy()
-    salida["Prediccion_pre_restriccion_mercado"] = salida["Prediccion_final"]
-    salida["Factor_restriccion_mercado"] = 1.0
-    salida["Tope_categoria"] = np.nan
-    salida["Restriccion_mercado_aplicada"] = False
-    if not APLICAR_RESTRICCION_LACTEOS or salida.empty:
-        return salida
-
-    objetivo = "LACTEOS CULINARIOS"
-    mascara_categoria = salida["CATEGORIA"].map(normalizar_categoria_calibracion).eq(objetivo)
-    if not mascara_categoria.any():
-        return salida
-
-    mascara_hist = historico["CATEGORIA"].map(normalizar_categoria_calibracion).eq(objetivo)
-    octubre_real = historico.loc[
-        mascara_hist & (historico["AÑO"] == 2026) & (historico["MES_NUM"] == 10), "VENTA"
-    ].sum()
-    if octubre_real <= 0:
-        return salida
-
-    referencia = float(octubre_real)
-    limites = {202611: MAX_CRECIMIENTO_LACTEOS_NOV_VS_OCT,
-               202612: MAX_CRECIMIENTO_LACTEOS_DIC_VS_NOV}
-    for periodo in [202611, 202612]:
-        mascara = mascara_categoria & salida["Periodo"].eq(periodo)
-        total_original = salida.loc[mascara, "Prediccion_final"].sum()
-        if total_original <= 0:
-            continue
-        total_con_contraccion = total_original * FACTOR_CONTRACCION_LACTEOS
-        tope = referencia * (1.0 + limites[periodo])
-        total_objetivo = min(total_con_contraccion, tope)
-        factor = total_objetivo / total_original
-        salida.loc[mascara, "Prediccion_final"] *= factor
-        salida.loc[mascara, "Factor_restriccion_mercado"] = factor
-        salida.loc[mascara, "Tope_categoria"] = tope
-        salida.loc[mascara, "Restriccion_mercado_aplicada"] = factor < 0.999999
-        referencia = total_objetivo
-    return salida
-
-
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="final-restriccion-lacteos-mercado-v1"):
+def generar_forecast(df, version_modelo="final-45-60-calibracion-V2-universo-2026-v2"):
     """Genera forecast para todos los SKU presentes en ventas 2026.
 
     Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
@@ -843,8 +790,78 @@ def generar_forecast(df, version_modelo="final-restriccion-lacteos-mercado-v1"):
                 "Motivo_calibracion": motivo_calibracion,
                 "Prediccion_final": float(final),
             })
-    resultado = pd.DataFrame(filas)
-    return aplicar_restriccion_mercado_lacteos(resultado, df)
+    return pd.DataFrame(filas)
+
+
+def cargar_venta_semanal_noviembre(archivo):
+    """Lee la tabla dinámica por categoría de la hoja PREDICCIONES NOVIEMBRE.
+
+    Devuelve solo categorías válidas. La fila Total general se conserva aparte
+    mediante la suma de categorías para evitar duplicar importes.
+    """
+    if archivo is None:
+        return pd.DataFrame(columns=["CATEGORIA", "Venta_Semana_1", "Unidades_Semana_1"])
+    contenido = archivo.getvalue()
+    tabla = pd.read_excel(
+        io.BytesIO(contenido), sheet_name="PREDICCIONES NOVIEMBRE",
+        usecols="A:D", engine="openpyxl",
+    )
+    renombres = {}
+    for col in tabla.columns:
+        nombre = _normalizar_encabezado(col)
+        if nombre == "CATEGORIA": renombres[col] = "CATEGORIA"
+        elif nombre == "VENTA SEMANAL 1": renombres[col] = "Venta_Semana_1"
+        elif nombre == "UNIDADES VENDIDAS": renombres[col] = "Unidades_Semana_1"
+    tabla = tabla.rename(columns=renombres)
+    requeridas = {"CATEGORIA", "Venta_Semana_1"}
+    if not requeridas.issubset(tabla.columns):
+        raise ValueError(
+            "La hoja PREDICCIONES NOVIEMBRE debe contener CATEGORIA y Venta Semanal 1."
+        )
+    if "Unidades_Semana_1" not in tabla.columns:
+        tabla["Unidades_Semana_1"] = 0.0
+    tabla["CATEGORIA"] = tabla["CATEGORIA"].astype(str).str.strip()
+    tabla["Categoria_normalizada"] = tabla["CATEGORIA"].map(normalizar_categoria_calibracion)
+    tabla["Venta_Semana_1"] = pd.to_numeric(tabla["Venta_Semana_1"], errors="coerce")
+    tabla["Unidades_Semana_1"] = pd.to_numeric(tabla["Unidades_Semana_1"], errors="coerce")
+    tabla = tabla[
+        tabla["Venta_Semana_1"].notna()
+        & ~tabla["Categoria_normalizada"].isin(["TOTAL GENERAL", "NAN", "NONE", ""])
+    ].copy()
+    return (tabla.groupby(["CATEGORIA", "Categoria_normalizada"], as_index=False)
+            .agg(Venta_Semana_1=("Venta_Semana_1", "sum"),
+                 Unidades_Semana_1=("Unidades_Semana_1", "sum")))
+
+
+def construir_comparativo_semanal(forecast_filtrado, venta_semanal, peso_real=0.30):
+    """Compara forecast original, ritmo lineal y nowcast ponderado de noviembre."""
+    nov = forecast_filtrado[forecast_filtrado["Periodo"] == 202611].copy()
+    if nov.empty or venta_semanal.empty:
+        return pd.DataFrame()
+    base = (nov.assign(Categoria_normalizada=nov["CATEGORIA"].map(normalizar_categoria_calibracion))
+              .groupby("Categoria_normalizada", as_index=False)
+              .agg(Prediccion_Original=("Prediccion_final", "sum")))
+    comp = venta_semanal.merge(base, on="Categoria_normalizada", how="inner")
+    dias_transcurridos = 7.0
+    dias_mes = 30.0
+    comp["Avance_Calendario"] = dias_transcurridos / dias_mes
+    comp["Cumplimiento_Forecast"] = np.where(
+        comp["Prediccion_Original"] > 0,
+        comp["Venta_Semana_1"] / comp["Prediccion_Original"], np.nan,
+    )
+    comp["Proyeccion_Ritmo"] = comp["Venta_Semana_1"] * dias_mes / dias_transcurridos
+    comp["Nowcast_Ponderado"] = (
+        (1.0 - peso_real) * comp["Prediccion_Original"]
+        + peso_real * comp["Proyeccion_Ritmo"]
+    )
+    comp["Brecha_Ritmo_pp"] = (
+        comp["Cumplimiento_Forecast"] - comp["Avance_Calendario"]
+    ) * 100
+    comp["Estado"] = np.select(
+        [comp["Brecha_Ritmo_pp"] >= 5, comp["Brecha_Ritmo_pp"] <= -5],
+        ["ADELANTADA", "REZAGADA"], default="EN RANGO",
+    )
+    return comp
 
 
 def preparar_grafica(df_historico, forecast, categoria, combo, producto):
@@ -907,6 +924,13 @@ archivos = st.file_uploader(
     type=["xlsx"],
     accept_multiple_files=True,
 )
+archivo_semanal = st.file_uploader(
+    "Carga PREDICCIONES NOVIEMBRE.xlsx para comparar la venta real de la semana 1",
+    type=["xlsx"],
+    accept_multiple_files=False,
+    key="archivo_venta_semanal_noviembre",
+    help="Se lee la tabla por categoría de la hoja PREDICCIONES NOVIEMBRE.",
+)
 
 if archivos:
     try:
@@ -933,24 +957,23 @@ if archivos:
         col_boton, col_estado = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_restriccion_lacteos_v1", None)
+                st.session_state.pop("forecast_2026_final_universo_2026_v2", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
         with col_estado:
-            st.info("Modelo activo: piso parcial 45%/60% y restriccion de mercado para Lacteos Culinarios.")
-            st.caption("Lacteos Culinarios: factor 0.95 y tope de +5% mensual. Las demas categorias no cambian.")
+            st.info("Modelo final activo: piso parcial 45%/60% y universo 2026 seleccionable.")
 
-        if "forecast_2026_restriccion_lacteos_v1" not in st.session_state:
+        if "forecast_2026_final_universo_2026_v2" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
         if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_restriccion_lacteos_v1"] = generar_forecast(df)
+                st.session_state["forecast_2026_final_universo_2026_v2"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_restriccion_lacteos_v1" in st.session_state:
-            forecast = st.session_state["forecast_2026_restriccion_lacteos_v1"]
+        if "forecast_2026_final_universo_2026_v2" in st.session_state:
+            forecast = st.session_state["forecast_2026_final_universo_2026_v2"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -1132,6 +1155,129 @@ if archivos:
                 "Los productos sin actividad reciente en 2026 se excluyen para evitar saltos artificiales."
             )
 
+            # --------------------------------------------------------------
+            # Seguimiento de noviembre con venta real de la primera semana
+            # --------------------------------------------------------------
+            st.markdown("### Seguimiento semanal de noviembre")
+            if archivo_semanal is None:
+                st.info(
+                    "Carga PREDICCIONES NOVIEMBRE.xlsx arriba para comparar el forecast "
+                    "con la venta real acumulada de la semana 1."
+                )
+            else:
+                venta_semanal = cargar_venta_semanal_noviembre(archivo_semanal)
+                peso_real = st.slider(
+                    "Peso de la venta real semanal en el nowcast",
+                    min_value=0, max_value=100, value=30, step=5,
+                    format="%d%%",
+                    help=(
+                        "30% conserva estabilidad del forecast y permite que el ritmo real "
+                        "actualice gradualmente la proyección mensual."
+                    ),
+                ) / 100.0
+                comparativo = construir_comparativo_semanal(
+                    forecast_universo, venta_semanal, peso_real
+                )
+                if categoria != "TODAS":
+                    cat_norm = normalizar_categoria_calibracion(categoria)
+                    comparativo = comparativo[
+                        comparativo["Categoria_normalizada"] == cat_norm
+                    ].copy()
+
+                categorias_disponibles = sorted(comparativo["CATEGORIA"].unique().tolist())
+                categorias_seleccionadas = st.multiselect(
+                    "Segmentador de categorías para comparar proyecciones",
+                    options=categorias_disponibles,
+                    default=categorias_disponibles,
+                    help="Permite comparar una o varias categorías sin alterar el forecast original.",
+                )
+                comparativo = comparativo[
+                    comparativo["CATEGORIA"].isin(categorias_seleccionadas)
+                ].copy()
+
+                escenarios = st.segmented_control(
+                    "Escenarios visibles",
+                    options=["TODOS", "FORECAST VS NOWCAST", "FORECAST VS RITMO"],
+                    default="TODOS",
+                ) or "TODOS"
+
+                if comparativo.empty:
+                    st.warning("No hay categorías coincidentes entre el forecast y la tabla semanal.")
+                else:
+                    total_semana = comparativo["Venta_Semana_1"].sum()
+                    total_original = comparativo["Prediccion_Original"].sum()
+                    total_ritmo = comparativo["Proyeccion_Ritmo"].sum()
+                    total_nowcast = comparativo["Nowcast_Ponderado"].sum()
+                    avance = total_semana / total_original if total_original > 0 else np.nan
+                    s1, s2, s3, s4 = st.columns(4)
+                    s1.metric("Venta real semana 1", f"${total_semana:,.0f}")
+                    s2.metric("Forecast original Nov", f"${total_original:,.0f}")
+                    s3.metric("Proyección por ritmo", f"${total_ritmo:,.0f}",
+                              f"{(total_ritmo/total_original-1)*100:+.1f}% vs forecast" if total_original else None)
+                    s4.metric("Nowcast ponderado", f"${total_nowcast:,.0f}",
+                              f"{(total_nowcast/total_original-1)*100:+.1f}% vs forecast" if total_original else None)
+                    st.caption(
+                        f"Avance acumulado: {avance:.1%}. Avance calendario de referencia: 23.3% (7 de 30 días)."
+                    )
+
+                    columnas_escenario = {
+                        "TODOS": ["Prediccion_Original", "Proyeccion_Ritmo", "Nowcast_Ponderado"],
+                        "FORECAST VS NOWCAST": ["Prediccion_Original", "Nowcast_Ponderado"],
+                        "FORECAST VS RITMO": ["Prediccion_Original", "Proyeccion_Ritmo"],
+                    }[escenarios]
+                    etiquetas = {
+                        "Prediccion_Original": "Forecast original",
+                        "Proyeccion_Ritmo": "Proyección por ritmo",
+                        "Nowcast_Ponderado": "Nowcast ponderado",
+                    }
+                    grafica_comp = comparativo.melt(
+                        id_vars=["CATEGORIA"], value_vars=columnas_escenario,
+                        var_name="Escenario", value_name="Valor",
+                    )
+                    grafica_comp["Escenario"] = grafica_comp["Escenario"].map(etiquetas)
+                    barras = alt.Chart(grafica_comp).mark_bar().encode(
+                        x=alt.X("CATEGORIA:N", title=None, sort="-y",
+                                axis=alt.Axis(labelAngle=-35, labelLimit=180)),
+                        xOffset="Escenario:N",
+                        y=alt.Y("Valor:Q", title="Venta proyectada", axis=alt.Axis(format="$,.2s")),
+                        color=alt.Color(
+                            "Escenario:N", title="Escenario",
+                            scale=alt.Scale(
+                                domain=["Forecast original", "Proyección por ritmo", "Nowcast ponderado"],
+                                range=["#F59E0B", "#EF4444", "#10B981"],
+                            ),
+                        ),
+                        tooltip=[
+                            alt.Tooltip("CATEGORIA:N", title="Categoría"),
+                            alt.Tooltip("Escenario:N", title="Escenario"),
+                            alt.Tooltip("Valor:Q", title="Valor", format="$,.2f"),
+                        ],
+                    ).properties(height=430, title="Comparación de proyecciones de noviembre por categoría")
+                    st.altair_chart(barras, use_container_width=True)
+
+                    tabla_comp = comparativo[[
+                        "CATEGORIA", "Venta_Semana_1", "Prediccion_Original",
+                        "Cumplimiento_Forecast", "Proyeccion_Ritmo", "Nowcast_Ponderado",
+                        "Brecha_Ritmo_pp", "Estado",
+                    ]].sort_values("Brecha_Ritmo_pp")
+                    st.dataframe(
+                        tabla_comp.style.format({
+                            "Venta_Semana_1": "${:,.2f}",
+                            "Prediccion_Original": "${:,.2f}",
+                            "Cumplimiento_Forecast": "{:.1%}",
+                            "Proyeccion_Ritmo": "${:,.2f}",
+                            "Nowcast_Ponderado": "${:,.2f}",
+                            "Brecha_Ritmo_pp": "{:+.1f} pp",
+                        }),
+                        use_container_width=True, hide_index=True,
+                    )
+                    st.download_button(
+                        "Descargar comparativo semanal CSV",
+                        tabla_comp.to_csv(index=False).encode("utf-8-sig"),
+                        "comparativo_semana_1_vs_forecast_noviembre.csv",
+                        "text/csv",
+                    )
+
             # ------------------------------------------------------------------
             # Tabla resumen: Categoría, Código, Descripción, Nov 2026, Dic 2026
             # ------------------------------------------------------------------
@@ -1216,9 +1362,7 @@ if archivos:
                     "Porcentaje_recuperacion", "Correccion_piso",
                     "Ajuste_aplicado", "Prediccion_antes_calibracion",
                     "Factor_calibracion_categoria", "Calibracion_categoria_aplicada",
-                    "Motivo_calibracion", "Prediccion_pre_restriccion_mercado",
-                    "Factor_restriccion_mercado", "Tope_categoria",
-                    "Restriccion_mercado_aplicada", "Prediccion_final",
+                    "Motivo_calibracion", "Prediccion_final",
                 ]].copy()
                 resumen_categoria_v2 = (
                     diag.groupby("CATEGORIA", as_index=False)
