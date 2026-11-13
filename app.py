@@ -1253,8 +1253,6 @@ if archivos:
                             alt.Tooltip("Valor:Q", title="Valor", format="$,.2f"),
                         ],
                     ).properties(height=430, title="Comparación de proyecciones de noviembre por categoría")
-                    st.altair_chart(barras, use_container_width=True)
-
                     # Dos gráficas adicionales con el mismo histórico mensual.
                     # La venta semanal solo actualiza noviembre. Diciembre conserva
                     # el forecast original porque todavía no existe evidencia real de diciembre.
@@ -1334,6 +1332,9 @@ if archivos:
                         "El nowcast combina el forecast original de noviembre con la proyección por ritmo. "
                         "El peso se controla con el segmentador superior."
                     )
+
+                    st.markdown("### Comparación de proyecciones por categoría")
+                    st.altair_chart(barras, use_container_width=True)
 
                     tabla_comp = comparativo[[
                         "CATEGORIA", "Venta_Semana_1", "Prediccion_Original",
@@ -1494,5 +1495,3 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
-
-
