@@ -12,7 +12,6 @@ except ImportError:
 st.set_page_config(page_title="Forecast Nov-Dic 2026", layout="wide")
 st.markdown("## Forecast de ventas | Noviembre y diciembre 2026")
 st.caption("Histórico mensual comparable y pronóstico conectado, con filtros de categoría, combo y producto.")
-st.info("Entrada recomendada: VENTAS_UNIFICADAS_MODELO.xlsx. La app lee CONSOLIDADO y recalcula todas las variables históricas automáticamente.")
 
 with st.expander("¿Cómo funciona el modelo?", expanded=False):
     st.markdown(
@@ -124,13 +123,12 @@ MESES = {
 }
 
 CAT_FEATURES = ["CODIGO", "CATEGORIA", "FAMILIA", "TIPO", "COMBOS"]
-LAGS = [1, 2, 3, 6, 12]
+LAGS = [1, 2, 3, 6, 12, 24]
 NUM_FEATURES = (
     [f"lag{x}" for x in LAGS]
     + [
-        "mean3", "median3", "std3", "mean6", "median6", "std6", "mean12", "std12",
+        "mean3", "std3", "mean6", "std6", "mean12", "std12",
         "sin_mes", "cos_mes", "MES_NUM", "ANO", "tendencia_3_12",
-        "volatilidad6", "meses_historicos", "meses_desde_ultima_venta", "REGISTRO_PRESENTE",
     ]
 )
 FEATURES = NUM_FEATURES + CAT_FEATURES
@@ -138,8 +136,8 @@ FEATURES = NUM_FEATURES + CAT_FEATURES
 # Configuración seleccionada en el backtest Nov-Dic 2025.
 PESO_VENTA_DIRECTA = 0.85
 PESO_ESTRUCTURAL = 0.15
-PESO_FORECAST_ESTACIONAL = 0.70
-UMBRAL_ESTACIONAL = 1.10
+PESO_FORECAST_ESTACIONAL = 0.85
+UMBRAL_ESTACIONAL = 1.20
 
 # Calibración selectiva V2 validada sobre el backtest Nov-Dic 2025 sin combos.
 CALIBRACION_CATEGORIAS_V2 = {
@@ -218,58 +216,6 @@ def cargar_archivos(archivos):
     """
     partes = []
     diagnostico = []
-
-    # Entrada recomendada: libro único generado por Copilot.
-    # Se lee CONSOLIDADO para conservar trazabilidad y se reconstruyen las features
-    # dentro de la app, evitando depender de columnas calculadas manualmente.
-    if len(archivos) == 1:
-        archivo_unico = archivos[0]
-        try:
-            contenido_unico = archivo_unico.getvalue()
-            libro_unico = pd.ExcelFile(io.BytesIO(contenido_unico), engine="openpyxl")
-            if "CONSOLIDADO" in libro_unico.sheet_names:
-                h = pd.read_excel(libro_unico, sheet_name="CONSOLIDADO")
-                h.columns = [_normalizar_encabezado(c) for c in h.columns]
-                requeridas = {"FECHA", "CODIGO", "VENTA", "UNIDADES"}
-                faltantes = sorted(requeridas - set(h.columns))
-                if faltantes:
-                    raise ValueError("CONSOLIDADO no contiene: " + ", ".join(faltantes))
-                temp = pd.DataFrame()
-                temp["CODIGO"] = normalizar_codigo(h["CODIGO"])
-                temp["VENTA"] = pd.to_numeric(h["VENTA"], errors="coerce")
-                temp["UNIDADES"] = pd.to_numeric(h["UNIDADES"], errors="coerce")
-                fecha = pd.to_datetime(h["FECHA"], errors="coerce")
-                temp["AÑO"] = fecha.dt.year
-                temp["MES_NUM"] = fecha.dt.month
-                for col in ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO"]:
-                    temp[col] = h[col] if col in h.columns else "SIN_DATO"
-                temp["COMBOS"] = h["COMBOS"] if "COMBOS" in h.columns else 0
-                temp = temp.dropna(subset=["CODIGO", "VENTA", "UNIDADES", "AÑO", "MES_NUM"])
-                temp["AÑO"] = temp["AÑO"].astype(int)
-                temp["MES_NUM"] = temp["MES_NUM"].astype(int)
-                temp["VENTA"] = temp["VENTA"].clip(lower=0)
-                temp["UNIDADES"] = temp["UNIDADES"].clip(lower=0)
-                temp["COMBOS"] = pd.to_numeric(temp["COMBOS"], errors="coerce").fillna(0).clip(0, 1).astype(int)
-                temp["Periodo"] = temp["AÑO"] * 100 + temp["MES_NUM"]
-                for col in ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO"]:
-                    temp[col] = temp[col].fillna("SIN_DATO").astype(str).str.strip()
-                agrupado = (
-                    temp.groupby(["CODIGO", "Periodo", "MES_NUM", "AÑO"], as_index=False)
-                    .agg(VENTA=("VENTA", "sum"), UNIDADES=("UNIDADES", "sum"),
-                         DESCRIPCION=("DESCRIPCION", "first"), CATEGORIA=("CATEGORIA", "first"),
-                         FAMILIA=("FAMILIA", "first"), TIPO=("TIPO", "first"), COMBOS=("COMBOS", "max"))
-                )
-                agrupado["PRECIO_PROMEDIO"] = np.where(
-                    agrupado["UNIDADES"] > 0, agrupado["VENTA"] / agrupado["UNIDADES"], np.nan
-                )
-                diagnostico.append({"Archivo": archivo_unico.name, "Hoja": "CONSOLIDADO",
-                    "Estado": "CARGADA", "Filas": len(temp), "Año asignado": "2024-2026",
-                    "Detalle": f"Base unificada: {temp['CODIGO'].nunique()} SKU; features recalculadas sin leakage"})
-                return completar_calendario(agrupado), pd.DataFrame(diagnostico)
-        except Exception as exc:
-            diagnostico.append({"Archivo": archivo_unico.name, "Hoja": "CONSOLIDADO",
-                "Estado": "ERROR", "Filas": 0, "Año asignado": "-",
-                "Detalle": f"No fue posible leer la base unificada: {exc}"})
 
     aliases = {
         "CODIGO": ["CODIGO", "CÓDIGO", "SKU", "COD PRODUCTO", "COD. PRODUCTO"],
@@ -438,9 +384,7 @@ def completar_calendario(df):
             dict(year=x["AÑO"], month=x["MES_NUM"], day=1)
         )
         x.index = fechas
-        x["REGISTRO_PRESENTE"] = 1
         x = x.reindex(pd.date_range(fechas.min(), fechas.max(), freq="MS"))
-        x["REGISTRO_PRESENTE"] = x["REGISTRO_PRESENTE"].fillna(0).astype(int)
         x["CODIGO"] = codigo
         x["AÑO"] = x.index.year
         x["MES_NUM"] = x.index.month
@@ -478,10 +422,6 @@ def crear_features(df, objetivo):
         z[f"mean{ventana}"] = grupo.transform(
             lambda s: s.shift(1).rolling(ventana, min_periods=2).mean()
         )
-        if ventana in [3, 6]:
-            z[f"median{ventana}"] = grupo.transform(
-                lambda s: s.shift(1).rolling(ventana, min_periods=2).median()
-            )
         z[f"std{ventana}"] = grupo.transform(
             lambda s: s.shift(1).rolling(ventana, min_periods=2).std()
         ).fillna(0)
@@ -489,12 +429,6 @@ def crear_features(df, objetivo):
     z["sin_mes"] = np.sin(2 * np.pi * z["MES_NUM"] / 12)
     z["cos_mes"] = np.cos(2 * np.pi * z["MES_NUM"] / 12)
     z["ANO"] = z["AÑO"]
-    z["REGISTRO_PRESENTE"] = pd.to_numeric(z.get("REGISTRO_PRESENTE", 1), errors="coerce").fillna(0)
-    z["volatilidad6"] = np.where(z["mean6"].abs() > 1e-9, z["std6"] / z["mean6"].abs(), 0.0)
-    z["meses_historicos"] = z.groupby("CODIGO").cumcount()
-    venta_positiva = z["VENTA"].gt(0)
-    ultima_pos = z.groupby("CODIGO").cumcount().where(venta_positiva).groupby(z["CODIGO"]).ffill()
-    z["meses_desde_ultima_venta"] = (z.groupby("CODIGO").cumcount() - ultima_pos).fillna(z.groupby("CODIGO").cumcount())
     z["tendencia_3_12"] = np.where(
         z["mean12"].abs() > 1e-9, z["mean3"] / z["mean12"], 1.0
     )
@@ -511,7 +445,7 @@ def nuevo_modelo():
         iterations=500,
         depth=7,
         learning_rate=0.05,
-        loss_function="RMSE",
+        loss_function="MAE",
         eval_metric="MAE",
         l2_leaf_reg=10,
         random_seed=42,
@@ -523,10 +457,6 @@ def nuevo_modelo():
 
 def entrenar_objetivo(df, objetivo):
     f = crear_features(df, objetivo).dropna(subset=["lag1", objetivo]).copy()
-    # Los meses creados para completar el calendario mantienen continuidad temporal,
-    # pero no se usan como target porque sin inventario no sabemos si la ausencia fue venta cero.
-    if "REGISTRO_PRESENTE" in f.columns:
-        f = f[f["REGISTRO_PRESENTE"].eq(1)].copy()
     medianas = f[NUM_FEATURES].median().fillna(0)
     f[NUM_FEATURES] = f[NUM_FEATURES].fillna(medianas)
     pesos = np.where(f["MES_NUM"].isin([11, 12]), 2.5, 1.0)
@@ -561,8 +491,6 @@ def vector_futuro(historial, periodo, objetivo, medianas):
     for ventana in [3, 6, 12]:
         arreglo = np.asarray(valores[-ventana:], dtype=float)
         fila[f"mean{ventana}"] = arreglo.mean() if len(arreglo) >= 2 else np.nan
-        if ventana in [3, 6]:
-            fila[f"median{ventana}"] = np.median(arreglo) if len(arreglo) >= 2 else np.nan
         fila[f"std{ventana}"] = arreglo.std(ddof=1) if len(arreglo) >= 2 else 0.0
 
     mes = periodo % 100
@@ -571,11 +499,6 @@ def vector_futuro(historial, periodo, objetivo, medianas):
     fila["cos_mes"] = np.cos(2 * np.pi * mes / 12)
     fila["MES_NUM"] = mes
     fila["ANO"] = ano
-    fila["REGISTRO_PRESENTE"] = 0
-    fila["volatilidad6"] = fila["std6"] / abs(fila["mean6"]) if pd.notna(fila["mean6"]) and abs(fila["mean6"]) > 1e-9 else 0.0
-    fila["meses_historicos"] = len(hist)
-    positivos = np.flatnonzero(np.asarray(valores) > 0)
-    fila["meses_desde_ultima_venta"] = len(valores) - 1 - int(positivos[-1]) if len(positivos) else len(valores)
     fila["tendencia_3_12"] = (
         fila["mean3"] / fila["mean12"]
         if pd.notna(fila["mean12"]) and fila["mean12"] > 0
@@ -693,7 +616,7 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
     ))
     piso_parcial = ultimo_ano * factor_piso
 
-    porcentaje_recuperacion = 0.65 if mes == 11 else 0.70 if mes == 12 else 0.40
+    porcentaje_recuperacion = 0.45 if mes == 11 else 0.60 if mes == 12 else 0.40
     if prediccion_combinada < piso_parcial:
         correccion_piso = porcentaje_recuperacion * (
             piso_parcial - prediccion_combinada
@@ -785,7 +708,7 @@ def meses_entre_periodos(periodo_inicial, periodo_final=202610):
 
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="anti-subestimacion-adaptativo-v4"):
+def generar_forecast(df, version_modelo="final-45-60-calibracion-V2-universo-2026-v2"):
     """Genera forecast para todos los SKU presentes en ventas 2026.
 
     Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
@@ -918,8 +841,8 @@ def cargar_venta_semanal_noviembre(archivo):
                  Unidades_Semana_1=("Unidades_Semana_1", "sum")))
 
 
-def construir_comparativo_semanal(forecast_filtrado, venta_semanal, peso_real=None):
-    """Nowcast adaptativo por categoría con límites contra una semana atípica."""
+def construir_comparativo_semanal(forecast_filtrado, venta_semanal, peso_real=0.30):
+    """Compara forecast original, ritmo lineal y nowcast ponderado de noviembre."""
     nov = forecast_filtrado[forecast_filtrado["Periodo"] == 202611].copy()
     if nov.empty or venta_semanal.empty:
         return pd.DataFrame()
@@ -927,36 +850,25 @@ def construir_comparativo_semanal(forecast_filtrado, venta_semanal, peso_real=No
               .groupby("Categoria_normalizada", as_index=False)
               .agg(Prediccion_Original=("Prediccion_final", "sum")))
     comp = venta_semanal.merge(base, on="Categoria_normalizada", how="inner")
-    dias_transcurridos, dias_mes = 7.0, 30.0
+    dias_transcurridos = 7.0
+    dias_mes = 30.0
     comp["Avance_Calendario"] = dias_transcurridos / dias_mes
     comp["Cumplimiento_Forecast"] = np.where(
         comp["Prediccion_Original"] > 0,
-        comp["Venta_Semana_1"] / comp["Prediccion_Original"], np.nan)
+        comp["Venta_Semana_1"] / comp["Prediccion_Original"], np.nan,
+    )
     comp["Proyeccion_Ritmo"] = comp["Venta_Semana_1"] * dias_mes / dias_transcurridos
-    comp["Factor_Ritmo_Bruto"] = np.where(
-        comp["Prediccion_Original"] > 0,
-        comp["Proyeccion_Ritmo"] / comp["Prediccion_Original"], 1.0)
-    # La semana 1 no puede reducir el modelo más de 25% ni elevarlo más de 60%.
-    comp["Factor_Ritmo_Controlado"] = comp["Factor_Ritmo_Bruto"].clip(0.75, 1.60)
-    comp["Proyeccion_Ritmo_Ajustada"] = (
-        comp["Prediccion_Original"] * comp["Factor_Ritmo_Controlado"])
-    brecha = (comp["Factor_Ritmo_Bruto"] - 1.0).abs()
-    comp["Peso_Ritmo_Adaptativo"] = np.select(
-        [brecha < 0.10, brecha < 0.25, brecha < 0.50],
-        [0.20, 0.35, 0.50], default=0.60)
-    # El slider queda como control opcional: 0 usa pesos adaptativos.
-    if peso_real is not None and peso_real > 0:
-        comp["Peso_Ritmo_Adaptativo"] = np.maximum(
-            comp["Peso_Ritmo_Adaptativo"], float(peso_real))
     comp["Nowcast_Ponderado"] = (
-        (1.0 - comp["Peso_Ritmo_Adaptativo"]) * comp["Prediccion_Original"]
-        + comp["Peso_Ritmo_Adaptativo"] * comp["Proyeccion_Ritmo_Ajustada"])
-    comp["Forecast_Operativo"] = comp["Nowcast_Ponderado"]
+        (1.0 - peso_real) * comp["Prediccion_Original"]
+        + peso_real * comp["Proyeccion_Ritmo"]
+    )
     comp["Brecha_Ritmo_pp"] = (
-        comp["Cumplimiento_Forecast"] - comp["Avance_Calendario"]) * 100
+        comp["Cumplimiento_Forecast"] - comp["Avance_Calendario"]
+    ) * 100
     comp["Estado"] = np.select(
         [comp["Brecha_Ritmo_pp"] >= 5, comp["Brecha_Ritmo_pp"] <= -5],
-        ["ADELANTADA", "REZAGADA"], default="EN RANGO")
+        ["ADELANTADA", "REZAGADA"], default="EN RANGO",
+    )
     return comp
 
 
@@ -1016,7 +928,7 @@ def preparar_grafica(df_historico, forecast, categoria, combo, producto):
 
 
 archivos = st.file_uploader(
-    "Carga VENTAS_UNIFICADAS_MODELO.xlsx (recomendado) o los tres archivos 2024-2026",
+    "Carga los archivos de ventas 2024, 2025 y 2026",
     type=["xlsx"],
     accept_multiple_files=True,
 )
@@ -1053,23 +965,23 @@ if archivos:
         col_boton, col_estado = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_adaptativo_v4", None)
+                st.session_state.pop("forecast_2026_final_universo_2026_v2", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
         with col_estado:
-            st.info("Modelo corregido: RMSE, meses sintéticos excluidos del target, estacionalidad reforzada y nowcast adaptativo.")
+            st.info("Modelo final activo: piso parcial 45%/60% y universo 2026 seleccionable.")
 
-        if "forecast_2026_adaptativo_v4" not in st.session_state:
+        if "forecast_2026_final_universo_2026_v2" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
         if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_adaptativo_v4"] = generar_forecast(df)
+                st.session_state["forecast_2026_final_universo_2026_v2"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_adaptativo_v4" in st.session_state:
-            forecast = st.session_state["forecast_2026_adaptativo_v4"]
+        if "forecast_2026_final_universo_2026_v2" in st.session_state:
+            forecast = st.session_state["forecast_2026_final_universo_2026_v2"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -1265,12 +1177,12 @@ if archivos:
             else:
                 venta_semanal = cargar_venta_semanal_noviembre(archivo_semanal)
                 peso_real = st.slider(
-                    "Peso mínimo manual del ritmo (0% = adaptación automática)",
-                    min_value=0, max_value=60, value=0, step=5,
+                    "Peso de la venta real semanal en el nowcast",
+                    min_value=0, max_value=100, value=30, step=5,
                     format="%d%%",
                     help=(
-                        "En 0%, el sistema asigna 20%, 35%, 50% o 60% según la brecha entre ritmo y forecast. "
-                        "Un valor manual actúa como peso mínimo, no como peso fijo."
+                        "30% conserva estabilidad del forecast y permite que el ritmo real "
+                        "actualice gradualmente la proyección mensual."
                     ),
                 ) / 100.0
                 comparativo = construir_comparativo_semanal(
@@ -1791,10 +1703,4 @@ if archivos:
     except Exception as error:
         st.exception(error)
 else:
-    st.info("Carga VENTAS_UNIFICADAS_MODELO.xlsx para comenzar. También se mantienen compatibles los tres Excel anuales.")
-
-
-
-
-
-
+    st.info("Carga los tres archivos Excel para comenzar.")
