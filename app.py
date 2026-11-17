@@ -12,6 +12,7 @@ except ImportError:
 st.set_page_config(page_title="Forecast Nov-Dic 2026", layout="wide")
 st.markdown("## Forecast de ventas | Noviembre y diciembre 2026")
 st.caption("Histórico mensual comparable y pronóstico conectado, con filtros de categoría, combo y producto.")
+st.info("Entrada recomendada: VENTAS_UNIFICADAS_MODELO.xlsx. La app lee CONSOLIDADO y recalcula todas las variables históricas automáticamente.")
 
 with st.expander("¿Cómo funciona el modelo?", expanded=False):
     st.markdown(
@@ -123,12 +124,13 @@ MESES = {
 }
 
 CAT_FEATURES = ["CODIGO", "CATEGORIA", "FAMILIA", "TIPO", "COMBOS"]
-LAGS = [1, 2, 3, 6, 12, 24]
+LAGS = [1, 2, 3, 6, 12]
 NUM_FEATURES = (
     [f"lag{x}" for x in LAGS]
     + [
-        "mean3", "std3", "mean6", "std6", "mean12", "std12",
+        "mean3", "median3", "std3", "mean6", "median6", "std6", "mean12", "std12",
         "sin_mes", "cos_mes", "MES_NUM", "ANO", "tendencia_3_12",
+        "volatilidad6", "meses_historicos", "meses_desde_ultima_venta", "REGISTRO_PRESENTE",
     ]
 )
 FEATURES = NUM_FEATURES + CAT_FEATURES
@@ -216,6 +218,58 @@ def cargar_archivos(archivos):
     """
     partes = []
     diagnostico = []
+
+    # Entrada recomendada: libro único generado por Copilot.
+    # Se lee CONSOLIDADO para conservar trazabilidad y se reconstruyen las features
+    # dentro de la app, evitando depender de columnas calculadas manualmente.
+    if len(archivos) == 1:
+        archivo_unico = archivos[0]
+        try:
+            contenido_unico = archivo_unico.getvalue()
+            libro_unico = pd.ExcelFile(io.BytesIO(contenido_unico), engine="openpyxl")
+            if "CONSOLIDADO" in libro_unico.sheet_names:
+                h = pd.read_excel(libro_unico, sheet_name="CONSOLIDADO")
+                h.columns = [_normalizar_encabezado(c) for c in h.columns]
+                requeridas = {"FECHA", "CODIGO", "VENTA", "UNIDADES"}
+                faltantes = sorted(requeridas - set(h.columns))
+                if faltantes:
+                    raise ValueError("CONSOLIDADO no contiene: " + ", ".join(faltantes))
+                temp = pd.DataFrame()
+                temp["CODIGO"] = normalizar_codigo(h["CODIGO"])
+                temp["VENTA"] = pd.to_numeric(h["VENTA"], errors="coerce")
+                temp["UNIDADES"] = pd.to_numeric(h["UNIDADES"], errors="coerce")
+                fecha = pd.to_datetime(h["FECHA"], errors="coerce")
+                temp["AÑO"] = fecha.dt.year
+                temp["MES_NUM"] = fecha.dt.month
+                for col in ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO"]:
+                    temp[col] = h[col] if col in h.columns else "SIN_DATO"
+                temp["COMBOS"] = h["COMBOS"] if "COMBOS" in h.columns else 0
+                temp = temp.dropna(subset=["CODIGO", "VENTA", "UNIDADES", "AÑO", "MES_NUM"])
+                temp["AÑO"] = temp["AÑO"].astype(int)
+                temp["MES_NUM"] = temp["MES_NUM"].astype(int)
+                temp["VENTA"] = temp["VENTA"].clip(lower=0)
+                temp["UNIDADES"] = temp["UNIDADES"].clip(lower=0)
+                temp["COMBOS"] = pd.to_numeric(temp["COMBOS"], errors="coerce").fillna(0).clip(0, 1).astype(int)
+                temp["Periodo"] = temp["AÑO"] * 100 + temp["MES_NUM"]
+                for col in ["DESCRIPCION", "CATEGORIA", "FAMILIA", "TIPO"]:
+                    temp[col] = temp[col].fillna("SIN_DATO").astype(str).str.strip()
+                agrupado = (
+                    temp.groupby(["CODIGO", "Periodo", "MES_NUM", "AÑO"], as_index=False)
+                    .agg(VENTA=("VENTA", "sum"), UNIDADES=("UNIDADES", "sum"),
+                         DESCRIPCION=("DESCRIPCION", "first"), CATEGORIA=("CATEGORIA", "first"),
+                         FAMILIA=("FAMILIA", "first"), TIPO=("TIPO", "first"), COMBOS=("COMBOS", "max"))
+                )
+                agrupado["PRECIO_PROMEDIO"] = np.where(
+                    agrupado["UNIDADES"] > 0, agrupado["VENTA"] / agrupado["UNIDADES"], np.nan
+                )
+                diagnostico.append({"Archivo": archivo_unico.name, "Hoja": "CONSOLIDADO",
+                    "Estado": "CARGADA", "Filas": len(temp), "Año asignado": "2024-2026",
+                    "Detalle": f"Base unificada: {temp['CODIGO'].nunique()} SKU; features recalculadas sin leakage"})
+                return completar_calendario(agrupado), pd.DataFrame(diagnostico)
+        except Exception as exc:
+            diagnostico.append({"Archivo": archivo_unico.name, "Hoja": "CONSOLIDADO",
+                "Estado": "ERROR", "Filas": 0, "Año asignado": "-",
+                "Detalle": f"No fue posible leer la base unificada: {exc}"})
 
     aliases = {
         "CODIGO": ["CODIGO", "CÓDIGO", "SKU", "COD PRODUCTO", "COD. PRODUCTO"],
@@ -384,7 +438,9 @@ def completar_calendario(df):
             dict(year=x["AÑO"], month=x["MES_NUM"], day=1)
         )
         x.index = fechas
+        x["REGISTRO_PRESENTE"] = 1
         x = x.reindex(pd.date_range(fechas.min(), fechas.max(), freq="MS"))
+        x["REGISTRO_PRESENTE"] = x["REGISTRO_PRESENTE"].fillna(0).astype(int)
         x["CODIGO"] = codigo
         x["AÑO"] = x.index.year
         x["MES_NUM"] = x.index.month
@@ -422,6 +478,10 @@ def crear_features(df, objetivo):
         z[f"mean{ventana}"] = grupo.transform(
             lambda s: s.shift(1).rolling(ventana, min_periods=2).mean()
         )
+        if ventana in [3, 6]:
+            z[f"median{ventana}"] = grupo.transform(
+                lambda s: s.shift(1).rolling(ventana, min_periods=2).median()
+            )
         z[f"std{ventana}"] = grupo.transform(
             lambda s: s.shift(1).rolling(ventana, min_periods=2).std()
         ).fillna(0)
@@ -429,6 +489,12 @@ def crear_features(df, objetivo):
     z["sin_mes"] = np.sin(2 * np.pi * z["MES_NUM"] / 12)
     z["cos_mes"] = np.cos(2 * np.pi * z["MES_NUM"] / 12)
     z["ANO"] = z["AÑO"]
+    z["REGISTRO_PRESENTE"] = pd.to_numeric(z.get("REGISTRO_PRESENTE", 1), errors="coerce").fillna(0)
+    z["volatilidad6"] = np.where(z["mean6"].abs() > 1e-9, z["std6"] / z["mean6"].abs(), 0.0)
+    z["meses_historicos"] = z.groupby("CODIGO").cumcount()
+    venta_positiva = z["VENTA"].gt(0)
+    ultima_pos = z.groupby("CODIGO").cumcount().where(venta_positiva).groupby(z["CODIGO"]).ffill()
+    z["meses_desde_ultima_venta"] = (z.groupby("CODIGO").cumcount() - ultima_pos).fillna(z.groupby("CODIGO").cumcount())
     z["tendencia_3_12"] = np.where(
         z["mean12"].abs() > 1e-9, z["mean3"] / z["mean12"], 1.0
     )
@@ -491,6 +557,8 @@ def vector_futuro(historial, periodo, objetivo, medianas):
     for ventana in [3, 6, 12]:
         arreglo = np.asarray(valores[-ventana:], dtype=float)
         fila[f"mean{ventana}"] = arreglo.mean() if len(arreglo) >= 2 else np.nan
+        if ventana in [3, 6]:
+            fila[f"median{ventana}"] = np.median(arreglo) if len(arreglo) >= 2 else np.nan
         fila[f"std{ventana}"] = arreglo.std(ddof=1) if len(arreglo) >= 2 else 0.0
 
     mes = periodo % 100
@@ -499,6 +567,11 @@ def vector_futuro(historial, periodo, objetivo, medianas):
     fila["cos_mes"] = np.cos(2 * np.pi * mes / 12)
     fila["MES_NUM"] = mes
     fila["ANO"] = ano
+    fila["REGISTRO_PRESENTE"] = 0
+    fila["volatilidad6"] = fila["std6"] / abs(fila["mean6"]) if pd.notna(fila["mean6"]) and abs(fila["mean6"]) > 1e-9 else 0.0
+    fila["meses_historicos"] = len(hist)
+    positivos = np.flatnonzero(np.asarray(valores) > 0)
+    fila["meses_desde_ultima_venta"] = len(valores) - 1 - int(positivos[-1]) if len(positivos) else len(valores)
     fila["tendencia_3_12"] = (
         fila["mean3"] / fila["mean12"]
         if pd.notna(fila["mean12"]) and fila["mean12"] > 0
@@ -708,7 +781,7 @@ def meses_entre_periodos(periodo_inicial, periodo_final=202610):
 
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="final-45-60-calibracion-V2-universo-2026-v2"):
+def generar_forecast(df, version_modelo="unificado-features-automaticas-v3"):
     """Genera forecast para todos los SKU presentes en ventas 2026.
 
     Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
@@ -928,7 +1001,7 @@ def preparar_grafica(df_historico, forecast, categoria, combo, producto):
 
 
 archivos = st.file_uploader(
-    "Carga los archivos de ventas 2024, 2025 y 2026",
+    "Carga VENTAS_UNIFICADAS_MODELO.xlsx (recomendado) o los tres archivos 2024-2026",
     type=["xlsx"],
     accept_multiple_files=True,
 )
@@ -965,23 +1038,23 @@ if archivos:
         col_boton, col_estado = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_final_universo_2026_v2", None)
+                st.session_state.pop("forecast_2026_unificado_v3", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
         with col_estado:
-            st.info("Modelo final activo: piso parcial 45%/60% y universo 2026 seleccionable.")
+            st.info("Modelo unificado activo: lags 1-12, medianas, volatilidad, historial y presencia de registro.")
 
-        if "forecast_2026_final_universo_2026_v2" not in st.session_state:
+        if "forecast_2026_unificado_v3" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
         if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_final_universo_2026_v2"] = generar_forecast(df)
+                st.session_state["forecast_2026_unificado_v3"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_final_universo_2026_v2" in st.session_state:
-            forecast = st.session_state["forecast_2026_final_universo_2026_v2"]
+        if "forecast_2026_unificado_v3" in st.session_state:
+            forecast = st.session_state["forecast_2026_unificado_v3"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -1703,7 +1776,8 @@ if archivos:
     except Exception as error:
         st.exception(error)
 else:
-    st.info("Carga los tres archivos Excel para comenzar.")
+    st.info("Carga VENTAS_UNIFICADAS_MODELO.xlsx para comenzar. También se mantienen compatibles los tres Excel anuales.")
+
 
 
 
