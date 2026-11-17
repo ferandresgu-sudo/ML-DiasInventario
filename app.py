@@ -708,7 +708,7 @@ def meses_entre_periodos(periodo_inicial, periodo_final=202610):
 
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="selectivo-lacteos-cereales-v1"):
+def generar_forecast(df, version_modelo="forecast-original-corregido-selectivo-v1"):
     """Genera forecast para todos los SKU presentes en ventas 2026.
 
     Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
@@ -858,6 +858,49 @@ def construir_comparativo_semanal(forecast_filtrado, venta_semanal, peso_real=0.
         comp["Venta_Semana_1"] / comp["Prediccion_Original"], np.nan,
     )
     comp["Proyeccion_Ritmo"] = comp["Venta_Semana_1"] * dias_mes / dias_transcurridos
+
+    # Conservamos el valor del modelo solo para auditoría. La columna visible
+    # Prediccion_Original se corrige directamente, sin crear una barra adicional.
+    comp["Prediccion_Modelo_Sin_Ajuste"] = comp["Prediccion_Original"]
+    comp["Peso_Correccion_Ritmo"] = 0.0
+    comp["Tope_Correccion"] = np.nan
+
+    lacteos = comp["Categoria_normalizada"].eq("LACTEOS CULINARIOS")
+    cereales = comp["Categoria_normalizada"].eq("CEREALES")
+
+    # Lácteos: forecast y ritmo están próximos. Se recupera 90% de la brecha.
+    comp.loc[lacteos, "Peso_Correccion_Ritmo"] = 0.90
+
+    # Cereales: la semana 1 está muy por encima del modelo. Se recupera 50%
+    # de la brecha, pero con tope de 1.60x para no extrapolar una posible promoción.
+    comp.loc[cereales, "Peso_Correccion_Ritmo"] = 0.50
+    comp.loc[cereales, "Tope_Correccion"] = 1.60
+
+    comp["Prediccion_Original"] = (
+        comp["Prediccion_Modelo_Sin_Ajuste"]
+        + comp["Peso_Correccion_Ritmo"]
+        * (comp["Proyeccion_Ritmo"] - comp["Prediccion_Modelo_Sin_Ajuste"])
+    )
+    comp.loc[cereales, "Prediccion_Original"] = np.minimum(
+        comp.loc[cereales, "Prediccion_Original"],
+        comp.loc[cereales, "Prediccion_Modelo_Sin_Ajuste"] * 1.60,
+    )
+    comp["Factor_Correccion_Aplicado"] = np.where(
+        comp["Prediccion_Modelo_Sin_Ajuste"] > 0,
+        comp["Prediccion_Original"] / comp["Prediccion_Modelo_Sin_Ajuste"],
+        1.0,
+    )
+    comp["Correccion_Aplicada"] = np.select(
+        [lacteos, cereales],
+        ["Lácteos: 90% de brecha", "Cereales: 50% de brecha; tope 1.60x"],
+        default="Sin corrección",
+    )
+
+    # El nowcast se recalcula desde el forecast ya corregido.
+    comp["Cumplimiento_Forecast"] = np.where(
+        comp["Prediccion_Original"] > 0,
+        comp["Venta_Semana_1"] / comp["Prediccion_Original"], np.nan,
+    )
     comp["Nowcast_Ponderado"] = (
         (1.0 - peso_real) * comp["Prediccion_Original"]
         + peso_real * comp["Proyeccion_Ritmo"]
@@ -871,48 +914,6 @@ def construir_comparativo_semanal(forecast_filtrado, venta_semanal, peso_real=0.
     )
     return comp
 
-
-
-def aplicar_ajuste_selectivo_ritmo(comparativo,
-                                    peso_lacteos=0.90,
-                                    peso_cereales=0.50,
-                                    tope_cereales=1.60):
-    """Corrige solo LACTEOS CULINARIOS y CEREALES.
-
-    Formula: forecast + peso * (ritmo - forecast).
-    Lacteos usa 90% de la brecha porque forecast y ritmo estan cercanos.
-    Cereales usa 50% de la brecha y un tope de 1.60x porque el ritmo semanal
-    es casi 2.9x el forecast y extrapolarlo completo seria riesgoso.
-    Las demas categorias mantienen el forecast original.
-    """
-    x = comparativo.copy()
-    if x.empty:
-        return x
-    x["Peso_Ajuste_Selectivo"] = 0.0
-    x["Tope_Ajuste_Selectivo"] = np.nan
-    lacteos = x["Categoria_normalizada"].eq("LACTEOS CULINARIOS")
-    cereales = x["Categoria_normalizada"].eq("CEREALES")
-    x.loc[lacteos, "Peso_Ajuste_Selectivo"] = float(peso_lacteos)
-    x.loc[cereales, "Peso_Ajuste_Selectivo"] = float(peso_cereales)
-    x.loc[cereales, "Tope_Ajuste_Selectivo"] = float(tope_cereales)
-    x["Forecast_Ajustado_Selectivo"] = (
-        x["Prediccion_Original"]
-        + x["Peso_Ajuste_Selectivo"]
-        * (x["Proyeccion_Ritmo"] - x["Prediccion_Original"])
-    )
-    # El ajuste de Cereales nunca supera el tope relativo al forecast original.
-    x.loc[cereales, "Forecast_Ajustado_Selectivo"] = np.minimum(
-        x.loc[cereales, "Forecast_Ajustado_Selectivo"],
-        x.loc[cereales, "Prediccion_Original"] * float(tope_cereales),
-    )
-    x["Factor_Ajuste_Selectivo"] = np.where(
-        x["Prediccion_Original"] > 0,
-        x["Forecast_Ajustado_Selectivo"] / x["Prediccion_Original"], 1.0,
-    )
-    x["Motivo_Ajuste_Selectivo"] = "Sin ajuste: se conserva forecast"
-    x.loc[lacteos, "Motivo_Ajuste_Selectivo"] = "Lacteos: 90% de la brecha hacia ritmo"
-    x.loc[cereales, "Motivo_Ajuste_Selectivo"] = "Cereales: 50% de brecha, tope 1.60x"
-    return x
 
 def preparar_grafica(df_historico, forecast, categoria, combo, producto):
     """Prepara histórico comparable y una línea forecast conectada a octubre 2026."""
@@ -1007,23 +1008,23 @@ if archivos:
         col_boton, col_estado = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_selectivo_lacteos_cereales_v1", None)
+                st.session_state.pop("forecast_2026_original_corregido_selectivo_v1", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
         with col_estado:
-            st.info("Modelo base activo con ajuste semanal selectivo para Lácteos Culinarios y Cereales.")
+            st.info("Modelo base activo. En seguimiento semanal, la barra naranja se corrige solo para Lácteos Culinarios y Cereales.")
 
-        if "forecast_2026_selectivo_lacteos_cereales_v1" not in st.session_state:
+        if "forecast_2026_original_corregido_selectivo_v1" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
         if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_selectivo_lacteos_cereales_v1"] = generar_forecast(df)
+                st.session_state["forecast_2026_original_corregido_selectivo_v1"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_selectivo_lacteos_cereales_v1" in st.session_state:
-            forecast = st.session_state["forecast_2026_selectivo_lacteos_cereales_v1"]
+        if "forecast_2026_original_corregido_selectivo_v1" in st.session_state:
+            forecast = st.session_state["forecast_2026_original_corregido_selectivo_v1"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -1230,28 +1231,10 @@ if archivos:
                 comparativo = construir_comparativo_semanal(
                     forecast_universo, venta_semanal, peso_real
                 )
-                st.markdown("#### Corrección selectiva de sobre/subestimación")
-                a1, a2, a3 = st.columns(3)
-                with a1:
-                    peso_lacteos = st.slider(
-                        "Lácteos: % de la brecha hacia ritmo",
-                        0, 100, 90, 5, format="%d%%",
-                        help="90% es razonable porque el ritmo está cerca del forecast original.",
-                    ) / 100.0
-                with a2:
-                    peso_cereales = st.slider(
-                        "Cereales: % de la brecha hacia ritmo",
-                        0, 100, 50, 5, format="%d%%",
-                        help="50% reduce la subestimación sin copiar una semana que podría contener promoción.",
-                    ) / 100.0
-                with a3:
-                    tope_cereales = st.slider(
-                        "Tope de Cereales vs forecast",
-                        110, 200, 160, 5, format="%d%%",
-                        help="Evita elevar Cereales hasta 2.9 veces el forecast por una sola semana.",
-                    ) / 100.0
-                comparativo = aplicar_ajuste_selectivo_ritmo(
-                    comparativo, peso_lacteos, peso_cereales, tope_cereales
+                st.info(
+                    "La barra naranja ya incluye la corrección selectiva: Lácteos recupera 90% "
+                    "de la brecha hacia ritmo; Cereales recupera 50% con máximo de 1.60x. "
+                    "Las demás categorías conservan el forecast del modelo."
                 )
                 if categoria != "TODAS":
                     cat_norm = normalizar_categoria_calibracion(categoria)
@@ -1264,7 +1247,7 @@ if archivos:
                     "Segmentador de categorías para comparar proyecciones",
                     options=categorias_disponibles,
                     default=categorias_disponibles,
-                    help="Permite comparar una o varias categorías sin alterar el forecast original.",
+                    help="Lácteos Culinarios y Cereales ya incorporan la corrección selectiva en la barra naranja.",
                 )
                 comparativo = comparativo[
                     comparativo["CATEGORIA"].isin(categorias_seleccionadas)
@@ -1283,30 +1266,27 @@ if archivos:
                     total_original = comparativo["Prediccion_Original"].sum()
                     total_ritmo = comparativo["Proyeccion_Ritmo"].sum()
                     total_nowcast = comparativo["Nowcast_Ponderado"].sum()
-                    total_selectivo = comparativo["Forecast_Ajustado_Selectivo"].sum()
                     avance = total_semana / total_original if total_original > 0 else np.nan
                     s1, s2, s3, s4 = st.columns(4)
                     s1.metric("Venta real semana 1", f"${total_semana:,.0f}")
                     s2.metric("Forecast original Nov", f"${total_original:,.0f}")
                     s3.metric("Proyección por ritmo", f"${total_ritmo:,.0f}",
                               f"{(total_ritmo/total_original-1)*100:+.1f}% vs forecast" if total_original else None)
-                    s4.metric("Forecast ajustado selectivo", f"${total_selectivo:,.0f}",
-                              f"{(total_selectivo/total_original-1)*100:+.1f}% vs forecast" if total_original else None)
-                    st.caption(f"Nowcast ponderado de referencia: ${total_nowcast:,.0f}.")
+                    s4.metric("Nowcast ponderado", f"${total_nowcast:,.0f}",
+                              f"{(total_nowcast/total_original-1)*100:+.1f}% vs forecast" if total_original else None)
                     st.caption(
                         f"Avance acumulado: {avance:.1%}. Avance calendario de referencia: 23.3% (7 de 30 días)."
                     )
 
                     columnas_escenario = {
-                        "TODOS": ["Prediccion_Original", "Proyeccion_Ritmo", "Nowcast_Ponderado", "Forecast_Ajustado_Selectivo"],
-                        "FORECAST VS NOWCAST": ["Prediccion_Original", "Nowcast_Ponderado", "Forecast_Ajustado_Selectivo"],
+                        "TODOS": ["Prediccion_Original", "Proyeccion_Ritmo", "Nowcast_Ponderado"],
+                        "FORECAST VS NOWCAST": ["Prediccion_Original", "Nowcast_Ponderado"],
                         "FORECAST VS RITMO": ["Prediccion_Original", "Proyeccion_Ritmo"],
                     }[escenarios]
                     etiquetas = {
-                        "Prediccion_Original": "Forecast original",
+                        "Prediccion_Original": "Forecast original corregido",
                         "Proyeccion_Ritmo": "Proyección por ritmo",
                         "Nowcast_Ponderado": "Nowcast ponderado",
-                        "Forecast_Ajustado_Selectivo": "Forecast ajustado selectivo",
                     }
                     grafica_comp = comparativo.melt(
                         id_vars=["CATEGORIA"], value_vars=columnas_escenario,
@@ -1321,8 +1301,8 @@ if archivos:
                         color=alt.Color(
                             "Escenario:N", title="Escenario",
                             scale=alt.Scale(
-                                domain=["Forecast original", "Proyección por ritmo", "Nowcast ponderado", "Forecast ajustado selectivo"],
-                                range=["#F59E0B", "#EF4444", "#10B981", "#8B5CF6"],
+                                domain=["Forecast original corregido", "Proyección por ritmo", "Nowcast ponderado"],
+                                range=["#F59E0B", "#EF4444", "#10B981"],
                             ),
                         ),
                         tooltip=[
@@ -1553,22 +1533,20 @@ if archivos:
                     )
 
                     tabla_comp = comparativo[[
-                        "CATEGORIA", "Venta_Semana_1", "Prediccion_Original",
+                        "CATEGORIA", "Venta_Semana_1", "Prediccion_Modelo_Sin_Ajuste",
+                        "Prediccion_Original", "Factor_Correccion_Aplicado", "Correccion_Aplicada",
                         "Cumplimiento_Forecast", "Proyeccion_Ritmo", "Nowcast_Ponderado",
-                        "Forecast_Ajustado_Selectivo", "Factor_Ajuste_Selectivo",
-                        "Peso_Ajuste_Selectivo", "Motivo_Ajuste_Selectivo",
                         "Brecha_Ritmo_pp", "Estado",
                     ]].sort_values("Brecha_Ritmo_pp")
                     st.dataframe(
                         tabla_comp.style.format({
                             "Venta_Semana_1": "${:,.2f}",
+                            "Prediccion_Modelo_Sin_Ajuste": "${:,.2f}",
                             "Prediccion_Original": "${:,.2f}",
+                            "Factor_Correccion_Aplicado": "{:.3f}",
                             "Cumplimiento_Forecast": "{:.1%}",
                             "Proyeccion_Ritmo": "${:,.2f}",
                             "Nowcast_Ponderado": "${:,.2f}",
-                            "Forecast_Ajustado_Selectivo": "${:,.2f}",
-                            "Factor_Ajuste_Selectivo": "{:.3f}",
-                            "Peso_Ajuste_Selectivo": "{:.0%}",
                             "Brecha_Ritmo_pp": "{:+.1f} pp",
                         }),
                         use_container_width=True, hide_index=True,
