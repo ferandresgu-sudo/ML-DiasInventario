@@ -11,7 +11,7 @@ except ImportError:
 
 st.set_page_config(page_title="Forecast Nov-Dic 2026", layout="wide")
 st.markdown("## Forecast de ventas | Noviembre y diciembre 2026")
-st.caption("Histórico mensual comparable y pronóstico conectado, con filtros de categoría, combo y producto.")
+st.caption("Histórico mensual comparable y pronóstico conectado, con reconciliación opcional al ritmo semanal por categoría.")
 
 with st.expander("¿Cómo funciona el modelo?", expanded=False):
     st.markdown(
@@ -708,7 +708,7 @@ def meses_entre_periodos(periodo_inicial, periodo_final=202610):
 
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="final-45-60-calibracion-V2-universo-2026-v2"):
+def generar_forecast(df, version_modelo="forecast-reconciliado-ritmo-v1"):
     """Genera forecast para todos los SKU presentes en ventas 2026.
 
     Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
@@ -872,6 +872,62 @@ def construir_comparativo_semanal(forecast_filtrado, venta_semanal, peso_real=0.
     return comp
 
 
+
+def reconciliar_forecast_al_ritmo(forecast, venta_semanal, dias_transcurridos=7.0,
+                                   dias_mes=30.0, limite_inferior=0.70,
+                                   limite_superior=3.00, propagacion_diciembre=0.40,
+                                   limite_diciembre=0.20):
+    """Convierte el forecast de noviembre en forecast operativo alineado al ritmo.
+
+    La alineación ocurre por categoría. Cada SKU conserva su participación relativa
+    dentro de la categoría. Diciembre recibe solo una parte del factor de noviembre.
+    """
+    salida = forecast.copy()
+    if salida.empty or venta_semanal.empty:
+        return salida, pd.DataFrame()
+
+    nov = salida[salida["Periodo"] == 202611].copy()
+    nov["Categoria_normalizada"] = nov["CATEGORIA"].map(normalizar_categoria_calibracion)
+    total_categoria = (nov.groupby("Categoria_normalizada", as_index=False)
+                         .agg(Forecast_Original_Categoria=("Prediccion_final", "sum")))
+    semanal = venta_semanal[["CATEGORIA", "Categoria_normalizada", "Venta_Semana_1"]].copy()
+    factores = semanal.merge(total_categoria, on="Categoria_normalizada", how="inner")
+    factores["Proyeccion_Ritmo_Categoria"] = (
+        factores["Venta_Semana_1"] * float(dias_mes) / float(dias_transcurridos)
+    )
+    factores["Factor_Ritmo_Bruto"] = np.where(
+        factores["Forecast_Original_Categoria"] > 0,
+        factores["Proyeccion_Ritmo_Categoria"] / factores["Forecast_Original_Categoria"],
+        1.0,
+    )
+    factores["Factor_Ritmo_Aplicado"] = factores["Factor_Ritmo_Bruto"].clip(
+        lower=float(limite_inferior), upper=float(limite_superior)
+    )
+    mapa_factor = dict(zip(factores["Categoria_normalizada"], factores["Factor_Ritmo_Aplicado"]))
+    salida["Categoria_normalizada_tmp"] = salida["CATEGORIA"].map(normalizar_categoria_calibracion)
+    salida["Factor_reconciliacion_ritmo"] = salida["Categoria_normalizada_tmp"].map(mapa_factor).fillna(1.0)
+    salida["Prediccion_modelo_sin_ritmo"] = salida["Prediccion_final"]
+
+    mascara_nov = salida["Periodo"] == 202611
+    salida.loc[mascara_nov, "Prediccion_final"] = (
+        salida.loc[mascara_nov, "Prediccion_final"]
+        * salida.loc[mascara_nov, "Factor_reconciliacion_ritmo"]
+    )
+
+    # Diciembre no copia el ritmo completo. Propaga parcialmente la desviación
+    # y limita el ajuste para no convertir una sola semana en una regla permanente.
+    mascara_dic = salida["Periodo"] == 202612
+    ajuste_dic = (
+        (salida.loc[mascara_dic, "Factor_reconciliacion_ritmo"] - 1.0)
+        * float(propagacion_diciembre)
+    ).clip(lower=-float(limite_diciembre), upper=float(limite_diciembre))
+    salida.loc[mascara_dic, "Prediccion_final"] = (
+        salida.loc[mascara_dic, "Prediccion_final"] * (1.0 + ajuste_dic)
+    )
+    salida["Reconciliado_con_ritmo"] = salida["Factor_reconciliacion_ritmo"].ne(1.0)
+    salida = salida.drop(columns=["Categoria_normalizada_tmp"])
+    return salida, factores
+
 def preparar_grafica(df_historico, forecast, categoria, combo, producto):
     """Prepara histórico comparable y una línea forecast conectada a octubre 2026."""
     futuro = forecast.copy()
@@ -965,23 +1021,23 @@ if archivos:
         col_boton, col_estado = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_final_universo_2026_v2", None)
+                st.session_state.pop("forecast_2026_reconciliado_ritmo_v1", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
         with col_estado:
-            st.info("Modelo final activo: piso parcial 45%/60% y universo 2026 seleccionable.")
+            st.info("Modelo base activo con reconciliación opcional al ritmo semanal por categoría.")
 
-        if "forecast_2026_final_universo_2026_v2" not in st.session_state:
+        if "forecast_2026_reconciliado_ritmo_v1" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
         if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_final_universo_2026_v2"] = generar_forecast(df)
+                st.session_state["forecast_2026_reconciliado_ritmo_v1"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_final_universo_2026_v2" in st.session_state:
-            forecast = st.session_state["forecast_2026_final_universo_2026_v2"]
+        if "forecast_2026_reconciliado_ritmo_v1" in st.session_state:
+            forecast = st.session_state["forecast_2026_reconciliado_ritmo_v1"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -1176,6 +1232,47 @@ if archivos:
                 )
             else:
                 venta_semanal = cargar_venta_semanal_noviembre(archivo_semanal)
+                st.markdown("#### Reconciliación del forecast con el ritmo real")
+                alinear_ritmo = st.checkbox(
+                    "Alinear el forecast operativo de noviembre con la proyección por ritmo",
+                    value=True,
+                    help=(
+                        "Ajusta cada categoría para que el forecast de noviembre alcance el ritmo "
+                        "observado en la semana 1. No modifica el modelo entrenado; crea una salida "
+                        "operativa reconciliada y conserva el forecast previo para diagnóstico."
+                    ),
+                )
+                propagacion_modelo_dic = st.slider(
+                    "Propagación del factor de noviembre a diciembre",
+                    min_value=0, max_value=60, value=40, step=5,
+                    format="%d%%",
+                    help="Diciembre recibe solo una fracción del ajuste de noviembre.",
+                ) / 100.0
+                if alinear_ritmo:
+                    forecast_universo, diagnostico_ritmo = reconciliar_forecast_al_ritmo(
+                        forecast_universo,
+                        venta_semanal,
+                        dias_transcurridos=7.0,
+                        dias_mes=30.0,
+                        limite_inferior=0.70,
+                        limite_superior=3.00,
+                        propagacion_diciembre=propagacion_modelo_dic,
+                        limite_diciembre=0.20,
+                    )
+                    st.success(
+                        "Forecast operativo reconciliado: noviembre queda alineado al ritmo por categoría; "
+                        "diciembre recibe una propagación parcial limitada a ±20%."
+                    )
+                    with st.expander("Factores de reconciliación por categoría"):
+                        st.dataframe(
+                            diagnostico_ritmo.style.format({
+                                "Venta_Semana_1": "${:,.2f}",
+                                "Forecast_Original_Categoria": "${:,.2f}",
+                                "Proyeccion_Ritmo_Categoria": "${:,.2f}",
+                                "Factor_Ritmo_Bruto": "{:.3f}",
+                                "Factor_Ritmo_Aplicado": "{:.3f}",
+                            }), use_container_width=True, hide_index=True,
+                        )
                 peso_real = st.slider(
                     "Peso de la venta real semanal en el nowcast",
                     min_value=0, max_value=100, value=30, step=5,
