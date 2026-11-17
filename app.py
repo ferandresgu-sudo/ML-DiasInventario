@@ -138,8 +138,8 @@ FEATURES = NUM_FEATURES + CAT_FEATURES
 # Configuración seleccionada en el backtest Nov-Dic 2025.
 PESO_VENTA_DIRECTA = 0.85
 PESO_ESTRUCTURAL = 0.15
-PESO_FORECAST_ESTACIONAL = 0.85
-UMBRAL_ESTACIONAL = 1.20
+PESO_FORECAST_ESTACIONAL = 0.70
+UMBRAL_ESTACIONAL = 1.10
 
 # Calibración selectiva V2 validada sobre el backtest Nov-Dic 2025 sin combos.
 CALIBRACION_CATEGORIAS_V2 = {
@@ -511,7 +511,7 @@ def nuevo_modelo():
         iterations=500,
         depth=7,
         learning_rate=0.05,
-        loss_function="MAE",
+        loss_function="RMSE",
         eval_metric="MAE",
         l2_leaf_reg=10,
         random_seed=42,
@@ -523,6 +523,10 @@ def nuevo_modelo():
 
 def entrenar_objetivo(df, objetivo):
     f = crear_features(df, objetivo).dropna(subset=["lag1", objetivo]).copy()
+    # Los meses creados para completar el calendario mantienen continuidad temporal,
+    # pero no se usan como target porque sin inventario no sabemos si la ausencia fue venta cero.
+    if "REGISTRO_PRESENTE" in f.columns:
+        f = f[f["REGISTRO_PRESENTE"].eq(1)].copy()
     medianas = f[NUM_FEATURES].median().fillna(0)
     f[NUM_FEATURES] = f[NUM_FEATURES].fillna(medianas)
     pesos = np.where(f["MES_NUM"].isin([11, 12]), 2.5, 1.0)
@@ -689,7 +693,7 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
     ))
     piso_parcial = ultimo_ano * factor_piso
 
-    porcentaje_recuperacion = 0.45 if mes == 11 else 0.60 if mes == 12 else 0.40
+    porcentaje_recuperacion = 0.65 if mes == 11 else 0.70 if mes == 12 else 0.40
     if prediccion_combinada < piso_parcial:
         correccion_piso = porcentaje_recuperacion * (
             piso_parcial - prediccion_combinada
@@ -781,7 +785,7 @@ def meses_entre_periodos(periodo_inicial, periodo_final=202610):
 
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="unificado-features-automaticas-v3"):
+def generar_forecast(df, version_modelo="anti-subestimacion-adaptativo-v4"):
     """Genera forecast para todos los SKU presentes en ventas 2026.
 
     Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
@@ -914,8 +918,8 @@ def cargar_venta_semanal_noviembre(archivo):
                  Unidades_Semana_1=("Unidades_Semana_1", "sum")))
 
 
-def construir_comparativo_semanal(forecast_filtrado, venta_semanal, peso_real=0.30):
-    """Compara forecast original, ritmo lineal y nowcast ponderado de noviembre."""
+def construir_comparativo_semanal(forecast_filtrado, venta_semanal, peso_real=None):
+    """Nowcast adaptativo por categoría con límites contra una semana atípica."""
     nov = forecast_filtrado[forecast_filtrado["Periodo"] == 202611].copy()
     if nov.empty or venta_semanal.empty:
         return pd.DataFrame()
@@ -923,25 +927,36 @@ def construir_comparativo_semanal(forecast_filtrado, venta_semanal, peso_real=0.
               .groupby("Categoria_normalizada", as_index=False)
               .agg(Prediccion_Original=("Prediccion_final", "sum")))
     comp = venta_semanal.merge(base, on="Categoria_normalizada", how="inner")
-    dias_transcurridos = 7.0
-    dias_mes = 30.0
+    dias_transcurridos, dias_mes = 7.0, 30.0
     comp["Avance_Calendario"] = dias_transcurridos / dias_mes
     comp["Cumplimiento_Forecast"] = np.where(
         comp["Prediccion_Original"] > 0,
-        comp["Venta_Semana_1"] / comp["Prediccion_Original"], np.nan,
-    )
+        comp["Venta_Semana_1"] / comp["Prediccion_Original"], np.nan)
     comp["Proyeccion_Ritmo"] = comp["Venta_Semana_1"] * dias_mes / dias_transcurridos
+    comp["Factor_Ritmo_Bruto"] = np.where(
+        comp["Prediccion_Original"] > 0,
+        comp["Proyeccion_Ritmo"] / comp["Prediccion_Original"], 1.0)
+    # La semana 1 no puede reducir el modelo más de 25% ni elevarlo más de 60%.
+    comp["Factor_Ritmo_Controlado"] = comp["Factor_Ritmo_Bruto"].clip(0.75, 1.60)
+    comp["Proyeccion_Ritmo_Ajustada"] = (
+        comp["Prediccion_Original"] * comp["Factor_Ritmo_Controlado"])
+    brecha = (comp["Factor_Ritmo_Bruto"] - 1.0).abs()
+    comp["Peso_Ritmo_Adaptativo"] = np.select(
+        [brecha < 0.10, brecha < 0.25, brecha < 0.50],
+        [0.20, 0.35, 0.50], default=0.60)
+    # El slider queda como control opcional: 0 usa pesos adaptativos.
+    if peso_real is not None and peso_real > 0:
+        comp["Peso_Ritmo_Adaptativo"] = np.maximum(
+            comp["Peso_Ritmo_Adaptativo"], float(peso_real))
     comp["Nowcast_Ponderado"] = (
-        (1.0 - peso_real) * comp["Prediccion_Original"]
-        + peso_real * comp["Proyeccion_Ritmo"]
-    )
+        (1.0 - comp["Peso_Ritmo_Adaptativo"]) * comp["Prediccion_Original"]
+        + comp["Peso_Ritmo_Adaptativo"] * comp["Proyeccion_Ritmo_Ajustada"])
+    comp["Forecast_Operativo"] = comp["Nowcast_Ponderado"]
     comp["Brecha_Ritmo_pp"] = (
-        comp["Cumplimiento_Forecast"] - comp["Avance_Calendario"]
-    ) * 100
+        comp["Cumplimiento_Forecast"] - comp["Avance_Calendario"]) * 100
     comp["Estado"] = np.select(
         [comp["Brecha_Ritmo_pp"] >= 5, comp["Brecha_Ritmo_pp"] <= -5],
-        ["ADELANTADA", "REZAGADA"], default="EN RANGO",
-    )
+        ["ADELANTADA", "REZAGADA"], default="EN RANGO")
     return comp
 
 
@@ -1038,23 +1053,23 @@ if archivos:
         col_boton, col_estado = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_unificado_v3", None)
+                st.session_state.pop("forecast_2026_adaptativo_v4", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
         with col_estado:
-            st.info("Modelo unificado activo: lags 1-12, medianas, volatilidad, historial y presencia de registro.")
+            st.info("Modelo corregido: RMSE, meses sintéticos excluidos del target, estacionalidad reforzada y nowcast adaptativo.")
 
-        if "forecast_2026_unificado_v3" not in st.session_state:
+        if "forecast_2026_adaptativo_v4" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
         if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_unificado_v3"] = generar_forecast(df)
+                st.session_state["forecast_2026_adaptativo_v4"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_unificado_v3" in st.session_state:
-            forecast = st.session_state["forecast_2026_unificado_v3"]
+        if "forecast_2026_adaptativo_v4" in st.session_state:
+            forecast = st.session_state["forecast_2026_adaptativo_v4"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -1250,12 +1265,12 @@ if archivos:
             else:
                 venta_semanal = cargar_venta_semanal_noviembre(archivo_semanal)
                 peso_real = st.slider(
-                    "Peso de la venta real semanal en el nowcast",
-                    min_value=0, max_value=100, value=30, step=5,
+                    "Peso mínimo manual del ritmo (0% = adaptación automática)",
+                    min_value=0, max_value=60, value=0, step=5,
                     format="%d%%",
                     help=(
-                        "30% conserva estabilidad del forecast y permite que el ritmo real "
-                        "actualice gradualmente la proyección mensual."
+                        "En 0%, el sistema asigna 20%, 35%, 50% o 60% según la brecha entre ritmo y forecast. "
+                        "Un valor manual actúa como peso mínimo, no como peso fijo."
                     ),
                 ) / 100.0
                 comparativo = construir_comparativo_semanal(
@@ -1777,6 +1792,8 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga VENTAS_UNIFICADAS_MODELO.xlsx para comenzar. También se mantienen compatibles los tres Excel anuales.")
+
+
 
 
 
