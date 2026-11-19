@@ -736,15 +736,45 @@ def ajustar_diciembre_lacteos_18(forecast):
     if total_nov > 0 and total_dic > objetivo_dic:
         factor = float(objetivo_dic / total_dic)
         out.loc[dic, "Prediccion_final"] *= factor
-        out.loc[dic, "Unidades_pred"] *= factor
+        out.loc[dic, "Unidades_pred"] = np.where(
+            out.loc[dic, "Precio_pred"] > 0,
+            out.loc[dic, "Prediccion_final"] / out.loc[dic, "Precio_pred"],
+            0.0,
+        )
         out.loc[dic, "Venta_estructural"] = out.loc[dic, "Unidades_pred"] * out.loc[dic, "Precio_pred"]
         out.loc[dic, "Factor_control_diciembre_lacteos"] = factor
         out.loc[dic, "Control_diciembre_lacteos_aplicado"] = True
     return out
 
 
+def reconciliar_unidades_con_venta(historial, venta_final, precio_modelo):
+    """Convierte el forecast monetario final a unidades usando un precio robusto.
+
+    Evita publicar unidades incompatibles con la venta. El precio de reconciliacion
+    combina 70% de la mediana ponderada de los ultimos 3 meses con venta/unidades
+    y 30% del precio CatBoost, limitado al rango historico reciente p10-p90.
+    """
+    h = historial.sort_values("Periodo").copy()
+    h = h[(h["VENTA"] > 0) & (h["UNIDADES"] > 0)].tail(12)
+    precio_modelo = float(precio_modelo) if pd.notna(precio_modelo) else np.nan
+    if h.empty:
+        precio_reconciliado = precio_modelo if pd.notna(precio_modelo) and precio_modelo > 0 else 0.0
+    else:
+        h["Precio_observado"] = h["VENTA"] / h["UNIDADES"]
+        recientes = h.tail(3)
+        precio_reciente = recientes["VENTA"].sum() / recientes["UNIDADES"].sum()
+        p10 = float(h["Precio_observado"].quantile(0.10))
+        p90 = float(h["Precio_observado"].quantile(0.90))
+        if not np.isfinite(precio_modelo) or precio_modelo <= 0:
+            precio_modelo = precio_reciente
+        precio_reconciliado = 0.70 * precio_reciente + 0.30 * precio_modelo
+        if np.isfinite(p10) and np.isfinite(p90) and p90 > 0:
+            precio_reconciliado = float(np.clip(precio_reconciliado, max(p10, 0.01), max(p90, 0.01)))
+    unidades = float(venta_final) / precio_reconciliado if precio_reconciliado > 0 else 0.0
+    return max(0.0, unidades), max(0.0, precio_reconciliado)
+
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="forecast-lacteos-diciembre-18-v3"):
+def generar_forecast(df, version_modelo="forecast-unidades-reconciliadas-v4"):
     """Genera forecast para todos los SKU presentes en ventas 2026.
 
     Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
@@ -804,6 +834,12 @@ def generar_forecast(df, version_modelo="forecast-lacteos-diciembre-18-v3"):
                     meta.get("COMBOS", 0),
                 )
             )
+            # Reconciliacion obligatoria: las unidades publicadas se derivan de la
+            # venta monetaria final y de un precio consistente con el historial.
+            unidades_modelo = float(unid)
+            unidades_reconciliadas, precio_reconciliado = reconciliar_unidades_con_venta(
+                hist, final, precio_prom
+            )
             filas.append({
                 "CODIGO": str(codigo),
                 "DESCRIPCION": str(meta.get("DESCRIPCION", "")),
@@ -815,9 +851,12 @@ def generar_forecast(df, version_modelo="forecast-lacteos-diciembre-18-v3"):
                 "Ultimo_periodo_disponible": ultimo_periodo_disponible,
                 "Meses_sin_actividad_a_octubre": int(meses_sin_actividad),
                 "Venta_directa": float(vd),
-                "Unidades_pred": float(unid),
-                "Precio_pred": float(precio_prom),
-                "Venta_estructural": float(estructural),
+                "Unidades_modelo_sin_reconciliar": unidades_modelo,
+                "Unidades_pred": float(unidades_reconciliadas),
+                "Precio_modelo": float(precio_prom),
+                "Precio_pred": float(precio_reconciliado),
+                "Venta_estructural_modelo": float(estructural),
+                "Venta_estructural": float(unidades_reconciliadas * precio_reconciliado),
                 "Prediccion_base": float(base),
                 "Referencia_ultimo_ano": diag["Referencia_ultimo_ano"],
                 "Crecimiento_YTD": diag["Crecimiento_YTD"],
@@ -1045,23 +1084,23 @@ if archivos:
         col_boton, col_estado = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_lacteos_diciembre_18_v3", None)
+                st.session_state.pop("forecast_2026_unidades_reconciliadas_v4", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
         with col_estado:
             st.info("Modelo activo. Diciembre de Lácteos Culinarios se limita a +18% frente a noviembre; el ajuste se distribuye proporcionalmente por SKU y unidades.")
 
-        if "forecast_2026_lacteos_diciembre_18_v3" not in st.session_state:
+        if "forecast_2026_unidades_reconciliadas_v4" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
         if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_lacteos_diciembre_18_v3"] = generar_forecast(df)
+                st.session_state["forecast_2026_unidades_reconciliadas_v4"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_lacteos_diciembre_18_v3" in st.session_state:
-            forecast = st.session_state["forecast_2026_lacteos_diciembre_18_v3"]
+        if "forecast_2026_unidades_reconciliadas_v4" in st.session_state:
+            forecast = st.session_state["forecast_2026_unidades_reconciliadas_v4"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -1600,9 +1639,9 @@ if archivos:
             # ------------------------------------------------------------------
             st.markdown("### Tabla resumen: predicción por SKU (Nov-Dic 2026)")
             st.caption(
-                "Incluye forecast original, proyección por ritmo y nowcast ponderado de noviembre. "
-                "Como la venta semanal está agregada por categoría, los escenarios por SKU se estiman "
-                "distribuyendo la venta semanal según la participación de cada SKU en el forecast original."
+                "Incluye ventas y unidades reconciliadas: Unidades = Predicción monetaria / Precio promedio robusto. "
+                "La venta semanal está agregada por categoría; los escenarios por SKU se distribuyen "
+                "según la participación monetaria de cada SKU."
             )
 
             tabla_sku = (
@@ -1794,7 +1833,7 @@ if archivos:
                     "Factor_calibracion_categoria", "Calibracion_categoria_aplicada",
                     "Motivo_calibracion", "Prediccion_antes_control_lacteos",
                     "Unidades_antes_control_lacteos", "Factor_control_diciembre_lacteos",
-                    "Control_diciembre_lacteos_aplicado", "Prediccion_final", "Unidades_pred",
+                    "Control_diciembre_lacteos_aplicado", "Prediccion_final", "Unidades_modelo_sin_reconciliar", "Precio_modelo", "Precio_pred", "Unidades_pred",
                 ]].copy()
                 resumen_categoria_v2 = (
                     diag.groupby("CATEGORIA", as_index=False)
@@ -1846,6 +1885,7 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
 
 
 
