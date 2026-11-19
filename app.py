@@ -1585,13 +1585,47 @@ if archivos:
                 202611: "Prediccion_Nov_2026",
                 202612: "Prediccion_Dic_2026",
             })
-            for col in ["Prediccion_Nov_2026", "Prediccion_Dic_2026"]:
+
+            # Agrega las unidades predichas por el modelo CatBoost de UNIDADES.
+            tabla_unidades_sku = (
+                universo.groupby(
+                    ["CATEGORIA", "CODIGO", "DESCRIPCION", "Periodo"],
+                    as_index=False,
+                )["Unidades_pred"].sum()
+                .pivot(
+                    index=["CATEGORIA", "CODIGO", "DESCRIPCION"],
+                    columns="Periodo",
+                    values="Unidades_pred",
+                )
+                .reset_index()
+            )
+            tabla_unidades_sku.columns.name = None
+            tabla_unidades_sku = tabla_unidades_sku.rename(columns={
+                202611: "Unidades_Pred_Nov_2026",
+                202612: "Unidades_Pred_Dic_2026",
+            })
+            tabla_sku = tabla_sku.merge(
+                tabla_unidades_sku,
+                on=["CATEGORIA", "CODIGO", "DESCRIPCION"],
+                how="left",
+                validate="one_to_one",
+            )
+            for col in [
+                "Prediccion_Nov_2026", "Prediccion_Dic_2026",
+                "Unidades_Pred_Nov_2026", "Unidades_Pred_Dic_2026",
+            ]:
                 if col not in tabla_sku.columns:
                     tabla_sku[col] = 0.0
-                tabla_sku[col] = tabla_sku[col].fillna(0.0)
+                tabla_sku[col] = pd.to_numeric(
+                    tabla_sku[col], errors="coerce"
+                ).fillna(0.0)
 
             tabla_sku["Total_NovDic"] = (
                 tabla_sku["Prediccion_Nov_2026"] + tabla_sku["Prediccion_Dic_2026"]
+            )
+            tabla_sku["Total_Unidades_NovDic"] = (
+                tabla_sku["Unidades_Pred_Nov_2026"]
+                + tabla_sku["Unidades_Pred_Dic_2026"]
             )
 
             # --------------------------------------------------------------
@@ -1655,11 +1689,14 @@ if archivos:
                 "CODIGO": "",
                 "DESCRIPCION": "",
                 "Prediccion_Nov_2026": tabla_sku["Prediccion_Nov_2026"].sum(),
+                "Unidades_Pred_Nov_2026": tabla_sku["Unidades_Pred_Nov_2026"].sum(),
                 "Venta_Semana_1_SKU_Estimada": tabla_sku["Venta_Semana_1_SKU_Estimada"].sum(min_count=1),
                 "Proyeccion_Ritmo_Nov_2026": tabla_sku["Proyeccion_Ritmo_Nov_2026"].sum(min_count=1),
                 "Nowcast_Ponderado_Nov_2026": tabla_sku["Nowcast_Ponderado_Nov_2026"].sum(min_count=1),
                 "Prediccion_Dic_2026": tabla_sku["Prediccion_Dic_2026"].sum(),
+                "Unidades_Pred_Dic_2026": tabla_sku["Unidades_Pred_Dic_2026"].sum(),
                 "Total_NovDic": tabla_sku["Total_NovDic"].sum(),
+                "Total_Unidades_NovDic": tabla_sku["Total_Unidades_NovDic"].sum(),
                 "Participacion_SKU_Categoria": np.nan,
             }])
             tabla_sku_mostrar = pd.concat([tabla_sku, fila_total], ignore_index=True)
@@ -1667,21 +1704,24 @@ if archivos:
             st.dataframe(
                 tabla_sku_mostrar.style.format({
                     "Prediccion_Nov_2026": "${:,.2f}",
+                    "Unidades_Pred_Nov_2026": "{:,.0f}",
                     "Venta_Semana_1_SKU_Estimada": "${:,.2f}",
                     "Proyeccion_Ritmo_Nov_2026": "${:,.2f}",
                     "Nowcast_Ponderado_Nov_2026": "${:,.2f}",
                     "Participacion_SKU_Categoria": "{:.2%}",
                     "Prediccion_Dic_2026": "${:,.2f}",
+                    "Unidades_Pred_Dic_2026": "{:,.0f}",
                     "Total_NovDic": "${:,.2f}",
+                    "Total_Unidades_NovDic": "{:,.0f}",
                 }),
                 use_container_width=True,
                 hide_index=True,
                 height=440,
             )
             st.download_button(
-                "Descargar tabla SKU con ritmo y nowcast CSV",
+                "Descargar tabla SKU con ventas, unidades, ritmo y nowcast CSV",
                 tabla_sku.to_csv(index=False).encode("utf-8-sig"),
-                "tabla_sku_forecast_ritmo_nowcast_nov_dic_2026.csv",
+                "tabla_sku_forecast_ventas_unidades_ritmo_nowcast_nov_dic_2026.csv",
                 "text/csv",
             )
 
@@ -1755,3 +1795,4 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
