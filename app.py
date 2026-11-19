@@ -1683,31 +1683,39 @@ if archivos:
                          .transform("sum"),
                 0.0,
             )
-            tabla_sku["Venta_Semana_1_SKU_Estimada"] = np.nan
+            tabla_sku["Participacion_Unidades_SKU_Categoria"] = np.where(
+                tabla_sku.groupby("Categoria_normalizada")["Unidades_Pred_Nov_2026"].transform("sum") > 0,
+                tabla_sku["Unidades_Pred_Nov_2026"] / tabla_sku.groupby("Categoria_normalizada")["Unidades_Pred_Nov_2026"].transform("sum"),
+                0.0,
+            )
+            tabla_sku["Monto_Venta_Semana_Prediccion_SKU_Estimado"] = np.nan
+            tabla_sku["Unidades_Vendidas_Semana_Prediccion_SKU_Estimadas"] = np.nan
             tabla_sku["Proyeccion_Ritmo_Nov_2026"] = np.nan
             tabla_sku["Nowcast_Ponderado_Nov_2026"] = np.nan
 
             if archivo_semanal is not None:
                 venta_semanal_sku = cargar_venta_semanal_noviembre(archivo_semanal)[
-                    ["Categoria_normalizada", "Venta_Semana_1"]
+                    ["Categoria_normalizada", "Venta_Semana_1", "Unidades_Semana_1"]
                 ].copy()
                 tabla_sku = tabla_sku.merge(
                     venta_semanal_sku,
                     on="Categoria_normalizada",
                     how="left",
                 )
-                tabla_sku["Venta_Semana_1_SKU_Estimada"] = (
-                    tabla_sku["Venta_Semana_1"]
-                    * tabla_sku["Participacion_SKU_Categoria"]
+                tabla_sku["Monto_Venta_Semana_Prediccion_SKU_Estimado"] = (
+                    tabla_sku["Venta_Semana_1"] * tabla_sku["Participacion_SKU_Categoria"]
+                )
+                tabla_sku["Unidades_Vendidas_Semana_Prediccion_SKU_Estimadas"] = (
+                    tabla_sku["Unidades_Semana_1"] * tabla_sku["Participacion_Unidades_SKU_Categoria"]
                 )
                 tabla_sku["Proyeccion_Ritmo_Nov_2026"] = (
-                    tabla_sku["Venta_Semana_1_SKU_Estimada"] * 30.0 / 7.0
+                    tabla_sku["Monto_Venta_Semana_Prediccion_SKU_Estimado"] * 30.0 / 7.0
                 )
                 tabla_sku["Nowcast_Ponderado_Nov_2026"] = (
                     (1.0 - peso_real) * tabla_sku["Prediccion_Nov_2026"]
                     + peso_real * tabla_sku["Proyeccion_Ritmo_Nov_2026"]
                 )
-                tabla_sku = tabla_sku.drop(columns=["Venta_Semana_1"])
+                tabla_sku = tabla_sku.drop(columns=["Venta_Semana_1", "Unidades_Semana_1"])
             else:
                 st.info(
                     "Para mostrar ritmo y nowcast por SKU, carga PREDICCIONES NOVIEMBRE.xlsx. "
@@ -1727,7 +1735,8 @@ if archivos:
                 "DESCRIPCION": "",
                 "Prediccion_Nov_2026": tabla_sku["Prediccion_Nov_2026"].sum(),
                 "Unidades_Pred_Nov_2026": tabla_sku["Unidades_Pred_Nov_2026"].sum(),
-                "Venta_Semana_1_SKU_Estimada": tabla_sku["Venta_Semana_1_SKU_Estimada"].sum(min_count=1),
+                "Monto_Venta_Semana_Prediccion_SKU_Estimado": tabla_sku["Monto_Venta_Semana_Prediccion_SKU_Estimado"].sum(min_count=1),
+                "Unidades_Vendidas_Semana_Prediccion_SKU_Estimadas": tabla_sku["Unidades_Vendidas_Semana_Prediccion_SKU_Estimadas"].sum(min_count=1),
                 "Proyeccion_Ritmo_Nov_2026": tabla_sku["Proyeccion_Ritmo_Nov_2026"].sum(min_count=1),
                 "Nowcast_Ponderado_Nov_2026": tabla_sku["Nowcast_Ponderado_Nov_2026"].sum(min_count=1),
                 "Prediccion_Dic_2026": tabla_sku["Prediccion_Dic_2026"].sum(),
@@ -1735,6 +1744,7 @@ if archivos:
                 "Total_NovDic": tabla_sku["Total_NovDic"].sum(),
                 "Total_Unidades_NovDic": tabla_sku["Total_Unidades_NovDic"].sum(),
                 "Participacion_SKU_Categoria": np.nan,
+                "Participacion_Unidades_SKU_Categoria": np.nan,
             }])
             tabla_sku_mostrar = pd.concat([tabla_sku, fila_total], ignore_index=True)
 
@@ -1742,10 +1752,12 @@ if archivos:
                 tabla_sku_mostrar.style.format({
                     "Prediccion_Nov_2026": "${:,.2f}",
                     "Unidades_Pred_Nov_2026": "{:,.0f}",
-                    "Venta_Semana_1_SKU_Estimada": "${:,.2f}",
+                    "Monto_Venta_Semana_Prediccion_SKU_Estimado": "${:,.2f}",
+                    "Unidades_Vendidas_Semana_Prediccion_SKU_Estimadas": "{:,.0f}",
                     "Proyeccion_Ritmo_Nov_2026": "${:,.2f}",
                     "Nowcast_Ponderado_Nov_2026": "${:,.2f}",
                     "Participacion_SKU_Categoria": "{:.2%}",
+                    "Participacion_Unidades_SKU_Categoria": "{:.2%}",
                     "Prediccion_Dic_2026": "${:,.2f}",
                     "Unidades_Pred_Dic_2026": "{:,.0f}",
                     "Total_NovDic": "${:,.2f}",
@@ -1756,7 +1768,7 @@ if archivos:
                 height=440,
             )
             st.download_button(
-                "Descargar tabla SKU con ventas, unidades, ritmo y nowcast CSV",
+                "Descargar tabla SKU con semana de predicción, unidades, ritmo y nowcast CSV",
                 tabla_sku.to_csv(index=False).encode("utf-8-sig"),
                 "tabla_sku_forecast_ventas_unidades_ritmo_nowcast_nov_dic_2026.csv",
                 "text/csv",
@@ -1834,5 +1846,7 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
+
 
 
