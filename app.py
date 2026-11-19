@@ -153,6 +153,9 @@ CALIBRACION_CATEGORIAS_V2 = {
 FACTOR_CALIBRACION_MIN = 0.90
 FACTOR_CALIBRACION_MAX = 1.10
 APLICAR_CALIBRACION_A_COMBOS = False
+# Ajuste comercial solicitado para CHOCOLATE MESA, solo noviembre 2026.
+REDUCCION_NOV_CHOCOLATE_MESA = 0.094
+FACTOR_NOV_CHOCOLATE_MESA = 1.0 - REDUCCION_NOV_CHOCOLATE_MESA
 
 # Control comercial de diciembre para LACTEOS CULINARIOS.
 # Diciembre se ancla al noviembre actualizado del escenario, no al forecast alto original.
@@ -713,6 +716,34 @@ def meses_entre_periodos(periodo_inicial, periodo_final=202610):
     return max(0, (af - ai) * 12 + (mf - mi))
 
 
+def ajustar_noviembre_chocolate_mesa(forecast):
+    """Reduce 9.4% el forecast monetario de CHOCOLATE MESA en noviembre 2026.
+
+    El factor se aplica proporcionalmente a todos los SKU de la categoria. Las
+    unidades se recalculan con el precio reconciliado para mantener coherencia.
+    Diciembre no se modifica.
+    """
+    out = forecast.copy()
+    out["Prediccion_antes_ajuste_chocolate_mesa"] = out["Prediccion_final"]
+    out["Factor_ajuste_nov_chocolate_mesa"] = 1.0
+    out["Ajuste_nov_chocolate_mesa_aplicado"] = False
+    if out.empty:
+        return out
+    cat = out["CATEGORIA"].map(normalizar_categoria_calibracion)
+    mascara = cat.eq("CHOCOLATE MESA") & out["Periodo"].eq(202611)
+    out.loc[mascara, "Prediccion_final"] *= FACTOR_NOV_CHOCOLATE_MESA
+    out.loc[mascara, "Unidades_pred"] = np.where(
+        out.loc[mascara, "Precio_pred"] > 0,
+        out.loc[mascara, "Prediccion_final"] / out.loc[mascara, "Precio_pred"],
+        0.0,
+    )
+    out.loc[mascara, "Venta_estructural"] = (
+        out.loc[mascara, "Unidades_pred"] * out.loc[mascara, "Precio_pred"]
+    )
+    out.loc[mascara, "Factor_ajuste_nov_chocolate_mesa"] = FACTOR_NOV_CHOCOLATE_MESA
+    out.loc[mascara, "Ajuste_nov_chocolate_mesa_aplicado"] = True
+    return out
+
 def ajustar_diciembre_lacteos_18(forecast):
     """Ajusta diciembre de Lácteos Culinarios a un máximo de +18% vs noviembre.
 
@@ -774,7 +805,7 @@ def reconciliar_unidades_con_venta(historial, venta_final, precio_modelo):
     return max(0.0, unidades), max(0.0, precio_reconciliado)
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="forecast-unidades-reconciliadas-v4"):
+def generar_forecast(df, version_modelo="forecast-chocolate-mesa-nov-menos-9-4-v5"):
     """Genera forecast para todos los SKU presentes en ventas 2026.
 
     Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
@@ -874,6 +905,7 @@ def generar_forecast(df, version_modelo="forecast-unidades-reconciliadas-v4"):
                 "Prediccion_final": float(final),
             })
     resultado = pd.DataFrame(filas)
+    resultado = ajustar_noviembre_chocolate_mesa(resultado)
     return ajustar_diciembre_lacteos_18(resultado)
 
 
@@ -1084,23 +1116,23 @@ if archivos:
         col_boton, col_estado = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_unidades_reconciliadas_v4", None)
+                st.session_state.pop("forecast_2026_chocolate_mesa_nov_menos_9_4_v5", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
         with col_estado:
-            st.info("Modelo activo. Diciembre de Lácteos Culinarios se limita a +18% frente a noviembre; el ajuste se distribuye proporcionalmente por SKU y unidades.")
+            st.info("Modelo activo. CHOCOLATE MESA se reduce 9.4% en noviembre; las unidades se recalculan con el precio reconciliado. Diciembre de Lácteos Culinarios conserva su control de +18%.")
 
-        if "forecast_2026_unidades_reconciliadas_v4" not in st.session_state:
+        if "forecast_2026_chocolate_mesa_nov_menos_9_4_v5" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
         if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_unidades_reconciliadas_v4"] = generar_forecast(df)
+                st.session_state["forecast_2026_chocolate_mesa_nov_menos_9_4_v5"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_unidades_reconciliadas_v4" in st.session_state:
-            forecast = st.session_state["forecast_2026_unidades_reconciliadas_v4"]
+        if "forecast_2026_chocolate_mesa_nov_menos_9_4_v5" in st.session_state:
+            forecast = st.session_state["forecast_2026_chocolate_mesa_nov_menos_9_4_v5"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -1833,7 +1865,7 @@ if archivos:
                     "Factor_calibracion_categoria", "Calibracion_categoria_aplicada",
                     "Motivo_calibracion", "Prediccion_antes_control_lacteos",
                     "Unidades_antes_control_lacteos", "Factor_control_diciembre_lacteos",
-                    "Control_diciembre_lacteos_aplicado", "Prediccion_final", "Unidades_modelo_sin_reconciliar", "Precio_modelo", "Precio_pred", "Unidades_pred",
+                    "Control_diciembre_lacteos_aplicado", "Prediccion_antes_ajuste_chocolate_mesa", "Factor_ajuste_nov_chocolate_mesa", "Ajuste_nov_chocolate_mesa_aplicado", "Prediccion_final", "Unidades_modelo_sin_reconciliar", "Precio_modelo", "Precio_pred", "Unidades_pred",
                 ]].copy()
                 resumen_categoria_v2 = (
                     diag.groupby("CATEGORIA", as_index=False)
@@ -1885,6 +1917,7 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
 
 
 
