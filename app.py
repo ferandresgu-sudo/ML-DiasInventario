@@ -159,13 +159,14 @@ APLICAR_CALIBRACION_A_COMBOS = False
 APLICAR_TOPE_DICIEMBRE_LACTEOS = True
 PISO_DIC_VS_NOV_LACTEOS = 0.95       # Diciembre no cae más de 5% vs noviembre actualizado.
 CRECIMIENTO_BASE_DIC_LACTEOS = 0.05  # Escenario central: +5% vs noviembre actualizado.
-TOPE_DIC_VS_NOV_LACTEOS = 1.10       # Máximo: +10% vs noviembre actualizado.
+TOPE_DIC_VS_NOV_LACTEOS = 1.18       # Máximo: +18% vs noviembre actualizado.
 USAR_RELACION_HISTORICA_LACTEOS = True
 
-# Control definitivo del forecast base para Lácteos Culinarios.
-# Debido a la contracción conocida, diciembre no puede superar noviembre en más de 5%.
+# Control definitivo del forecast base de Lácteos Culinarios.
+# Si el modelo supera este nivel, diciembre se ajusta a noviembre × 1.18.
 APLICAR_CONTROL_BASE_DIC_LACTEOS = True
-TOPE_BASE_DIC_VS_NOV_LACTEOS = 1.05
+CRECIMIENTO_DIC_LACTEOS = 0.18
+FACTOR_DIC_VS_NOV_LACTEOS = 1.0 + CRECIMIENTO_DIC_LACTEOS
 
 
 def normalizar_codigo(serie):
@@ -712,47 +713,38 @@ def meses_entre_periodos(periodo_inicial, periodo_final=202610):
     return max(0, (af - ai) * 12 + (mf - mi))
 
 
-def aplicar_control_base_diciembre_lacteos(forecast):
-    """Limita diciembre de Lácteos Culinarios a 105% de noviembre.
+def ajustar_diciembre_lacteos_18(forecast):
+    """Ajusta diciembre de Lácteos Culinarios a un máximo de +18% vs noviembre.
 
-    El ajuste se aplica al total de la categoría y se distribuye proporcionalmente
-    entre sus SKU. También ajusta las unidades predichas con el mismo factor para
-    mantener consistencia entre venta y volumen. Conserva columnas de auditoría.
+    La reducción se reparte proporcionalmente entre los SKU de diciembre. El mismo
+    factor se aplica a unidades para conservar coherencia entre venta y volumen.
     """
     out = forecast.copy()
     out["Prediccion_antes_control_lacteos"] = out["Prediccion_final"]
     out["Unidades_antes_control_lacteos"] = out["Unidades_pred"]
     out["Factor_control_diciembre_lacteos"] = 1.0
     out["Control_diciembre_lacteos_aplicado"] = False
-
-    if not APLICAR_CONTROL_BASE_DIC_LACTEOS or out.empty:
+    if out.empty or not APLICAR_CONTROL_BASE_DIC_LACTEOS:
         return out
-
-    categoria_norm = out["CATEGORIA"].map(normalizar_categoria_calibracion)
-    es_lacteos = categoria_norm.eq("LACTEOS CULINARIOS")
-    es_nov = out["Periodo"].eq(202611)
-    es_dic = out["Periodo"].eq(202612)
-
-    total_nov = float(out.loc[es_lacteos & es_nov, "Prediccion_final"].sum())
-    total_dic = float(out.loc[es_lacteos & es_dic, "Prediccion_final"].sum())
-    tope_dic = total_nov * TOPE_BASE_DIC_VS_NOV_LACTEOS
-
-    if total_nov > 0 and total_dic > tope_dic:
-        factor = float(np.clip(tope_dic / total_dic, 0.0, 1.0))
-        idx = es_lacteos & es_dic
-        out.loc[idx, "Prediccion_final"] *= factor
-        out.loc[idx, "Unidades_pred"] *= factor
-        out.loc[idx, "Venta_estructural"] = (
-            out.loc[idx, "Unidades_pred"] * out.loc[idx, "Precio_pred"]
-        )
-        out.loc[idx, "Factor_control_diciembre_lacteos"] = factor
-        out.loc[idx, "Control_diciembre_lacteos_aplicado"] = True
-
+    cat = out["CATEGORIA"].map(normalizar_categoria_calibracion)
+    lacteos = cat.eq("LACTEOS CULINARIOS")
+    nov = lacteos & out["Periodo"].eq(202611)
+    dic = lacteos & out["Periodo"].eq(202612)
+    total_nov = float(out.loc[nov, "Prediccion_final"].sum())
+    total_dic = float(out.loc[dic, "Prediccion_final"].sum())
+    objetivo_dic = total_nov * FACTOR_DIC_VS_NOV_LACTEOS
+    if total_nov > 0 and total_dic > objetivo_dic:
+        factor = float(objetivo_dic / total_dic)
+        out.loc[dic, "Prediccion_final"] *= factor
+        out.loc[dic, "Unidades_pred"] *= factor
+        out.loc[dic, "Venta_estructural"] = out.loc[dic, "Unidades_pred"] * out.loc[dic, "Precio_pred"]
+        out.loc[dic, "Factor_control_diciembre_lacteos"] = factor
+        out.loc[dic, "Control_diciembre_lacteos_aplicado"] = True
     return out
 
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="forecast-lacteos-diciembre-contraccion-v2"):
+def generar_forecast(df, version_modelo="forecast-lacteos-diciembre-18-v3"):
     """Genera forecast para todos los SKU presentes en ventas 2026.
 
     Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
@@ -842,9 +834,8 @@ def generar_forecast(df, version_modelo="forecast-lacteos-diciembre-contraccion-
                 "Motivo_calibracion": motivo_calibracion,
                 "Prediccion_final": float(final),
             })
-    forecast_resultado = pd.DataFrame(filas)
-    forecast_resultado = aplicar_control_base_diciembre_lacteos(forecast_resultado)
-    return forecast_resultado
+    resultado = pd.DataFrame(filas)
+    return ajustar_diciembre_lacteos_18(resultado)
 
 
 def cargar_venta_semanal_noviembre(archivo):
@@ -1054,23 +1045,23 @@ if archivos:
         col_boton, col_estado = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_lacteos_contraccion_v2", None)
+                st.session_state.pop("forecast_2026_lacteos_diciembre_18_v3", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
         with col_estado:
-            st.info("Modelo activo. Diciembre de Lácteos Culinarios queda limitado a +5% vs noviembre por la contracción conocida; el ajuste se distribuye proporcionalmente por SKU.")
+            st.info("Modelo activo. Diciembre de Lácteos Culinarios se limita a +18% frente a noviembre; el ajuste se distribuye proporcionalmente por SKU y unidades.")
 
-        if "forecast_2026_lacteos_contraccion_v2" not in st.session_state:
+        if "forecast_2026_lacteos_diciembre_18_v3" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
         if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_lacteos_contraccion_v2"] = generar_forecast(df)
+                st.session_state["forecast_2026_lacteos_diciembre_18_v3"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_lacteos_contraccion_v2" in st.session_state:
-            forecast = st.session_state["forecast_2026_lacteos_contraccion_v2"]
+        if "forecast_2026_lacteos_diciembre_18_v3" in st.session_state:
+            forecast = st.session_state["forecast_2026_lacteos_diciembre_18_v3"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -1468,7 +1459,7 @@ if archivos:
                         ratios_texto = ", ".join(f"{r:.3f}" for r in ratios_hist_lacteos) or "sin historial válido"
                         st.success(
                             "Control especial activo para Lácteos Culinarios: diciembre se calcula "
-                            "desde noviembre actualizado y queda limitado entre -5% y +10%."
+                            "desde noviembre actualizado y queda limitado entre -5% y +18%."
                         )
                         st.caption(
                             f"Relaciones históricas Dic/Nov disponibles: {ratios_texto}. "
@@ -1537,7 +1528,7 @@ if archivos:
                         dic_ritmo,
                         "Proyección por ritmo",
                         "#EF4444",
-                        (f"Azul: ventas reales | Rojo: ritmo; diciembre anclado a noviembre con tope +10%" if seleccion_exclusiva_lacteos else f"Azul: ventas reales | Rojo: ritmo; diciembre propaga {propagacion_dic:.0%} del ajuste, limitado a ±{limite_ajuste_dic:.0%}"),
+                        (f"Azul: ventas reales | Rojo: ritmo; diciembre anclado a noviembre con tope +18%" if seleccion_exclusiva_lacteos else f"Azul: ventas reales | Rojo: ritmo; diciembre propaga {propagacion_dic:.0%} del ajuste, limitado a ±{limite_ajuste_dic:.0%}"),
                     )
                     st.altair_chart(chart_ritmo, use_container_width=True)
                     st.caption(
@@ -1551,7 +1542,7 @@ if archivos:
                         dic_nowcast,
                         "Nowcast ponderado",
                         "#10B981",
-                        (f"Azul: ventas reales | Verde: nowcast con {peso_real:.0%}; diciembre anclado a noviembre con tope +10%" if seleccion_exclusiva_lacteos else f"Azul: ventas reales | Verde: nowcast con {peso_real:.0%} de peso semanal; diciembre ajustado con propagación parcial"),
+                        (f"Azul: ventas reales | Verde: nowcast con {peso_real:.0%}; diciembre anclado a noviembre con tope +18%" if seleccion_exclusiva_lacteos else f"Azul: ventas reales | Verde: nowcast con {peso_real:.0%} de peso semanal; diciembre ajustado con propagación parcial"),
                     )
                     st.altair_chart(chart_nowcast, use_container_width=True)
                     st.caption(
