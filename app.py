@@ -1113,15 +1113,13 @@ if archivos:
             )
             st.stop()
 
-        col_boton, col_estado = st.columns([1, 2])
+        col_boton, _ = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
                 st.session_state.pop("forecast_2026_chocolate_mesa_nov_menos_9_4_v5", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
-        with col_estado:
-            st.info("Modelo activo. CHOCOLATE MESA se reduce 9.4% en noviembre; las unidades se recalculan con el precio reconciliado. Diciembre de Lácteos Culinarios conserva su control de +18%.")
 
         if "forecast_2026_chocolate_mesa_nov_menos_9_4_v5" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
@@ -1917,9 +1915,3 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
-
-
-
-
-
-
