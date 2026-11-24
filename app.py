@@ -778,6 +778,74 @@ def ajustar_diciembre_lacteos_18(forecast):
     return out
 
 
+PRECIOS_WEB_VERIFICADOS = {
+    # Solo coincidencias exactas de UPC y presentacion. No se usan coincidencias por nombre.
+    "7501059233980": {"precio": 65.10, "fuente": "WEB - Superdulces", "url": "https://superdulces.com/products/apolv", "fecha_consulta": "2026-11-24"},
+    "7501059235441": {"precio": 14.00, "fuente": "WEB - Farmacia San Pablo", "url": "https://www.farmaciasanpablo.com.mx/alimentos-y-bebidas/bebidas/aguas-purificadas/sta-maria-agua-pura-de-manantial/p/000000000007790029", "fecha_consulta": "2026-11-24"},
+    "7501059200050": {"precio": 14.00, "fuente": "WEB - Veggicano", "url": "https://veggicano.com.mx/products/agua-embotellada-santa-maria-1", "fecha_consulta": "2026-11-24"},
+}
+
+
+def cargar_sabana_precios(archivo):
+    """Lee UPC y $ Precio Venta Sugerido de la hoja SABANA DE PRECIOS."""
+    if archivo is None:
+        return pd.DataFrame(columns=["CODIGO", "Precio_sugerido_sabana", "Descripcion_sabana"])
+    contenido = archivo.getvalue()
+    tabla = pd.read_excel(io.BytesIO(contenido), sheet_name="SABANA DE PRECIOS", header=2, engine="openpyxl")
+    col_upc = _buscar_columna(tabla.columns, ["UPC"])
+    col_precio = _buscar_columna(tabla.columns, ["$ PRECIO VENTA SUGERIDO", "PRECIO VENTA SUGERIDO"])
+    col_desc = _buscar_columna(tabla.columns, ["DESCRIPCION", "DESCRIPCIÓN"])
+    if col_upc is None or col_precio is None:
+        raise ValueError("La sábana debe contener las columnas UPC y $ Precio Venta Sugerido en la fila 3.")
+    out = pd.DataFrame({
+        "CODIGO": normalizar_codigo(tabla[col_upc]),
+        "Precio_sugerido_sabana": pd.to_numeric(tabla[col_precio], errors="coerce"),
+        "Descripcion_sabana": tabla[col_desc].astype(str).str.strip() if col_desc is not None else "",
+    })
+    out = out.loc[out["CODIGO"].ne("") & out["Precio_sugerido_sabana"].gt(0)].copy()
+    # Si un UPC se repite, se conserva la mediana para evitar duplicar el forecast.
+    return out.groupby("CODIGO", as_index=False).agg(
+        Precio_sugerido_sabana=("Precio_sugerido_sabana", "median"),
+        Descripcion_sabana=("Descripcion_sabana", "first"),
+    )
+
+
+def construir_referencias_precio(df, sabana, corte=202610):
+    """Prioridad: sábana por UPC, web exacta por UPC, último mes válido del mismo UPC."""
+    h = df.loc[df["Periodo"].le(corte), ["CODIGO", "Periodo", "VENTA", "UNIDADES"]].copy()
+    h["CODIGO"] = normalizar_codigo(h["CODIGO"])
+    h["VENTA"] = pd.to_numeric(h["VENTA"], errors="coerce")
+    h["UNIDADES"] = pd.to_numeric(h["UNIDADES"], errors="coerce")
+    h = h.loc[h["VENTA"].gt(0) & h["UNIDADES"].gt(0)].copy()
+    h = h.groupby(["CODIGO", "Periodo"], as_index=False)[["VENTA", "UNIDADES"]].sum()
+    h["Precio_ultimo_mes"] = h["VENTA"] / h["UNIDADES"]
+    ultimo = h.sort_values(["CODIGO", "Periodo"]).groupby("CODIGO", as_index=False).tail(1)
+    ultimo = ultimo[["CODIGO", "Periodo", "Precio_ultimo_mes"]].rename(columns={"Periodo": "Periodo_ultimo_precio"})
+    base = pd.DataFrame({"CODIGO": normalizar_codigo(df["CODIGO"]).drop_duplicates()})
+    base = base.merge(ultimo, on="CODIGO", how="left", validate="one_to_one")
+    if sabana is not None and not sabana.empty:
+        s = sabana.copy(); s["CODIGO"] = normalizar_codigo(s["CODIGO"])
+        base = base.merge(s, on="CODIGO", how="left", validate="one_to_one")
+    else:
+        base["Precio_sugerido_sabana"] = np.nan; base["Descripcion_sabana"] = np.nan
+    web = pd.DataFrame([{"CODIGO": k, "Precio_web": v["precio"], "Fuente_web": v["fuente"],
+                         "URL_precio_web": v["url"], "Fecha_precio_web": v["fecha_consulta"]}
+                        for k, v in PRECIOS_WEB_VERIFICADOS.items()])
+    base = base.merge(web, on="CODIGO", how="left", validate="one_to_one")
+    base["Precio_referencia_SKU"] = base["Precio_sugerido_sabana"].combine_first(base["Precio_web"]).combine_first(base["Precio_ultimo_mes"])
+    base["Fuente_precio"] = np.select(
+        [base["Precio_sugerido_sabana"].notna(), base["Precio_web"].notna(), base["Precio_ultimo_mes"].notna()],
+        ["SABANA - PRECIO VENTA SUGERIDO", "WEB - UPC EXACTO", "HISTORICO - ULTIMO MES"], default="SIN PRECIO")
+    base["Coincidencia_codigo_sabana"] = base["Precio_sugerido_sabana"].notna()
+    base["Precio_min_auditoria"] = base["Precio_referencia_SKU"] * 0.80
+    base["Precio_max_auditoria"] = base["Precio_referencia_SKU"] * 1.20
+    base["Calidad_referencia_precio"] = np.select(
+        [base["Fuente_precio"].eq("SABANA - PRECIO VENTA SUGERIDO"), base["Fuente_precio"].eq("WEB - UPC EXACTO"),
+         base["Fuente_precio"].eq("HISTORICO - ULTIMO MES")],
+        ["PRECIO SUGERIDO POR UPC", "PRECIO WEB VERIFICADO POR UPC", "ULTIMO MES DEL SKU"], default="SIN REFERENCIA SKU")
+    return base.set_index("CODIGO").to_dict("index")
+
+
 def referencias_precio_observado(df, corte):
     """Precios por SKU a partir de pares observados, sin precios imputados."""
     h = df.loc[df["Periodo"].le(corte), ["CODIGO", "Periodo", "VENTA", "UNIDADES"]].copy()
@@ -827,9 +895,13 @@ def auditar_y_reconciliar_unidades(forecast, referencias, columna_unidades):
         return out
     ref = pd.DataFrame([referencias.get(str(codigo), {}) for codigo in out["CODIGO"]], index=out.index)
     for col in ["Precio_referencia_SKU", "Precio_min_auditoria", "Precio_max_auditoria",
-                "Meses_precio_validos", "Ultimo_periodo_precio", "Meses_precio_atipicos"]:
+                "Precio_sugerido_sabana", "Precio_web", "Precio_ultimo_mes", "Periodo_ultimo_precio",
+                "Fuente_precio", "Coincidencia_codigo_sabana", "Fuente_web", "URL_precio_web", "Fecha_precio_web"]:
         out[col] = ref.get(col, np.nan)
     out["Calidad_referencia_precio"] = ref.get("Calidad_referencia_precio", pd.Series(index=out.index, dtype=object)).fillna("SIN REFERENCIA SKU")
+    out["Meses_precio_validos"] = np.where(out["Precio_ultimo_mes"].notna(), 1, 0)
+    out["Ultimo_periodo_precio"] = out["Periodo_ultimo_precio"]
+    out["Meses_precio_atipicos"] = 0
     venta = out["Prediccion_final"]
     anterior = pd.to_numeric(out[columna_unidades], errors="coerce")
     anterior = anterior.where(np.isfinite(anterior))
@@ -864,7 +936,7 @@ def auditar_y_reconciliar_unidades(forecast, referencias, columna_unidades):
 
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="forecast-prioridad-precio-implicito-v7"):
+def generar_forecast(df, sabana_precios, version_modelo="forecast-upc-sabana-web-v8"):
     """Genera forecast para todos los SKU presentes en ventas 2026.
 
     Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
@@ -965,7 +1037,7 @@ def generar_forecast(df, version_modelo="forecast-prioridad-precio-implicito-v7"
     resultado = ajustar_noviembre_chocolate_mesa(resultado)
     resultado = ajustar_diciembre_lacteos_18(resultado)
     return auditar_y_reconciliar_unidades(
-        resultado, referencias_precio_observado(df, 202610), "Unidades_modelo_sin_reconciliar"
+        resultado, construir_referencias_precio(df, sabana_precios, 202610), "Unidades_modelo_sin_reconciliar"
     )
 
 
@@ -1150,6 +1222,11 @@ archivo_semanal = st.file_uploader(
     key="archivo_venta_semanal_noviembre",
     help="Se lee la tabla por categoría de la hoja PREDICCIONES NOVIEMBRE.",
 )
+archivo_sabana = st.file_uploader(
+    "Carga la SÁBANA DE PRECIOS para conciliar unidades por UPC",
+    type=["xlsx"], accept_multiple_files=False, key="archivo_sabana_precios",
+    help="Prioridad: precio sugerido de la sábana por UPC; después web verificada por UPC; finalmente último mes válido del SKU.",
+)
 
 if archivos:
     try:
@@ -1165,6 +1242,7 @@ if archivos:
         st.dataframe(resumen_anual, use_container_width=True, hide_index=True)
         with st.expander("Diagnóstico detallado de cada hoja"):
             st.dataframe(diagnostico_carga, use_container_width=True, hide_index=True)
+        sabana_precios = cargar_sabana_precios(archivo_sabana)
         faltantes = sorted({2024, 2025, 2026} - anos_cargados)
         if faltantes:
             st.error(
@@ -1176,21 +1254,21 @@ if archivos:
         col_boton, _ = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_prioridad_precio_implicito_v7", None)
+                st.session_state.pop("forecast_2026_upc_sabana_web_v8", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
 
-        if "forecast_2026_prioridad_precio_implicito_v7" not in st.session_state:
+        if "forecast_2026_upc_sabana_web_v8" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
         if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_prioridad_precio_implicito_v7"] = generar_forecast(df)
+                st.session_state["forecast_2026_upc_sabana_web_v8"] = generar_forecast(df, sabana_precios)
             st.rerun()
 
-        if "forecast_2026_prioridad_precio_implicito_v7" in st.session_state:
-            forecast = st.session_state["forecast_2026_prioridad_precio_implicito_v7"]
+        if "forecast_2026_upc_sabana_web_v8" in st.session_state:
+            forecast = st.session_state["forecast_2026_upc_sabana_web_v8"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -1730,10 +1808,12 @@ if archivos:
             universo_tabla = universo if producto == "TODOS" else universo.loc[universo["CODIGO"].astype(str).eq(producto)]
             with st.expander("Auditoría de equivalencia: ventas, unidades y precio"):
                 st.caption("Precio implícito anterior = venta final / unidades originales de CatBoost. "
-                           "El precio de referencia se calcula con ventas y unidades observadas del mismo código. "
+                           "La referencia usa precio sugerido de la sábana por UPC; si falta, web verificada por UPC; y como último respaldo, el precio del último mes válido del mismo código. "
                            "Las referencias antiguas o con pocos meses requieren revisión.")
                 cols_aud = ["CATEGORIA", "CODIGO", "DESCRIPCION", "Periodo", "Prediccion_final",
                             "Unidades_antes_validacion", "Precio_implicito_anterior", "Precio_referencia_SKU",
+                            "Precio_sugerido_sabana", "Precio_web", "Precio_ultimo_mes", "Fuente_precio",
+                            "Coincidencia_codigo_sabana", "Fuente_web", "URL_precio_web",
                             "Unidades_pred", "Diferencia_unidades", "Factor_inconsistencia_precio",
                             "Prioridad_correccion_precio", "Alerta_precio_anterior",
                             "Calidad_referencia_precio", "Meses_precio_validos", "Ultimo_periodo_precio",
@@ -1789,7 +1869,7 @@ if archivos:
                 st.warning("Hay SKU sin precio histórico válido. El total de unidades del periodo queda sin estimar; el importe sí incluye todos los SKU seleccionados.")
             st.markdown("### Tabla resumen: predicción por SKU (Nov-Dic 2026)")
             st.caption(
-                "Unidades = venta monetaria final / mediana de precios observados del mismo SKU. Sin precio del SKU, las unidades quedan sin estimar. "
+                "Unidades = venta monetaria final / precio conciliado por UPC. Prioridad: sábana, web exacta y último mes válido del SKU. "
                 "La venta semanal está agregada por categoría; los escenarios por SKU se distribuyen "
                 "según la participación monetaria de cada SKU."
             )
