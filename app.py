@@ -778,34 +778,93 @@ def ajustar_diciembre_lacteos_18(forecast):
     return out
 
 
-def reconciliar_unidades_con_venta(historial, venta_final, precio_modelo):
-    """Convierte el forecast monetario final a unidades usando un precio robusto.
+def referencias_precio_observado(df, corte):
+    """Precios por SKU a partir de pares observados, sin precios imputados."""
+    h = df.loc[df["Periodo"].le(corte), ["CODIGO", "Periodo", "VENTA", "UNIDADES"]].copy()
+    for col in ["VENTA", "UNIDADES"]:
+        h[col] = pd.to_numeric(h[col], errors="coerce")
+    h = h.loc[np.isfinite(h["VENTA"]) & np.isfinite(h["UNIDADES"])]
+    h = h.loc[(h["VENTA"] > 0) & (h["UNIDADES"] > 0)].copy()
+    h = h.groupby(["CODIGO", "Periodo"], as_index=False)[["VENTA", "UNIDADES"]].sum()
+    h["Precio"] = h["VENTA"] / h["UNIDADES"]
+    h = h.loc[np.isfinite(h["Precio"]) & h["Precio"].gt(0)].sort_values("Periodo")
+    corte_mes = (corte // 100) * 12 + corte % 100
+    referencias = {}
+    for codigo, serie in h.groupby("CODIGO", sort=False):
+        edad = corte_mes - (serie["Periodo"] // 100 * 12 + serie["Periodo"] % 100)
+        ventana = serie.loc[edad.lt(12)]
+        antigua = ventana.empty
+        if antigua:
+            ventana = serie.tail(12)
+        precios = ventana["Precio"].to_numpy()
+        logp = np.log(precios)
+        centro = np.median(logp)
+        mad = np.median(np.abs(logp - centro))
+        # Tolerancia de deteccion, no conversion de piezas/cajas ni precio de mercado.
+        filtro = np.abs(logp - centro) <= max(np.log(1.5), 3.5 * 1.4826 * mad)
+        limpios = ventana.loc[filtro, "Precio"]
+        precio = float(limpios.tail(6).median())
+        inf, sup = limpios.quantile([0.10, 0.90]).tolist()
+        referencias[str(codigo)] = {
+            "Precio_referencia_SKU": precio,
+            "Precio_min_auditoria": min(float(inf), precio / 1.25),
+            "Precio_max_auditoria": max(float(sup), precio * 1.25),
+            "Meses_precio_validos": len(limpios),
+            "Ultimo_periodo_precio": int(ventana.loc[filtro, "Periodo"].iloc[-1]),
+            "Meses_precio_atipicos": int((~filtro).sum()),
+            "Calidad_referencia_precio": (
+                "HISTORICO ANTIGUO" if antigua else
+                "POCOS MESES" if len(limpios) < 3 else "HISTORICO RECIENTE"
+            ),
+        }
+    return referencias
 
-    Evita publicar unidades incompatibles con la venta. El precio de reconciliacion
-    combina 70% de la mediana ponderada de los ultimos 3 meses con venta/unidades
-    y 30% del precio CatBoost, limitado al rango historico reciente p10-p90.
-    """
-    h = historial.sort_values("Periodo").copy()
-    h = h[(h["VENTA"] > 0) & (h["UNIDADES"] > 0)].tail(12)
-    precio_modelo = float(precio_modelo) if pd.notna(precio_modelo) else np.nan
-    if h.empty:
-        precio_reconciliado = precio_modelo if pd.notna(precio_modelo) and precio_modelo > 0 else 0.0
-    else:
-        h["Precio_observado"] = h["VENTA"] / h["UNIDADES"]
-        recientes = h.tail(3)
-        precio_reciente = recientes["VENTA"].sum() / recientes["UNIDADES"].sum()
-        p10 = float(h["Precio_observado"].quantile(0.10))
-        p90 = float(h["Precio_observado"].quantile(0.90))
-        if not np.isfinite(precio_modelo) or precio_modelo <= 0:
-            precio_modelo = precio_reciente
-        precio_reconciliado = 0.70 * precio_reciente + 0.30 * precio_modelo
-        if np.isfinite(p10) and np.isfinite(p90) and p90 > 0:
-            precio_reconciliado = float(np.clip(precio_reconciliado, max(p10, 0.01), max(p90, 0.01)))
-    unidades = float(venta_final) / precio_reconciliado if precio_reconciliado > 0 else 0.0
-    return max(0.0, unidades), max(0.0, precio_reconciliado)
+
+def auditar_y_reconciliar_unidades(forecast, referencias, columna_unidades):
+    """Conserva el importe; deja sin estimar el volumen sin referencia del SKU."""
+    out = forecast.copy()
+    if out.empty:
+        return out
+    ref = pd.DataFrame([referencias.get(str(codigo), {}) for codigo in out["CODIGO"]], index=out.index)
+    for col in ["Precio_referencia_SKU", "Precio_min_auditoria", "Precio_max_auditoria",
+                "Meses_precio_validos", "Ultimo_periodo_precio", "Meses_precio_atipicos"]:
+        out[col] = ref.get(col, np.nan)
+    out["Calidad_referencia_precio"] = ref.get("Calidad_referencia_precio", pd.Series(index=out.index, dtype=object)).fillna("SIN REFERENCIA SKU")
+    venta = out["Prediccion_final"]
+    anterior = pd.to_numeric(out[columna_unidades], errors="coerce")
+    anterior = anterior.where(np.isfinite(anterior))
+    precio = out["Precio_referencia_SKU"]
+    implicito = venta.div(anterior.where(anterior.gt(0)))
+    out["Unidades_antes_validacion"] = anterior
+    out["Precio_implicito_anterior"] = implicito
+    out["Alerta_precio_anterior"] = np.select(
+        [venta.eq(0) & anterior.gt(0), venta.gt(0) & precio.isna(),
+         venta.gt(0) & (anterior.isna() | anterior.le(0)),
+         venta.gt(0) & implicito.lt(out["Precio_min_auditoria"]),
+         venta.gt(0) & implicito.gt(out["Precio_max_auditoria"])],
+        ["UNIDADES SIN VENTA", "SIN REFERENCIA SKU", "VENTA SIN UNIDADES VALIDAS",
+         "PRECIO IMPLICITO BAJO", "PRECIO IMPLICITO ALTO"], default="SIN ALERTA")
+    relacion_precio = implicito.div(precio.where(precio.gt(0)))
+    out["Factor_inconsistencia_precio"] = np.maximum(
+        relacion_precio, 1.0 / relacion_precio.where(relacion_precio.gt(0))
+    ).replace([np.inf, -np.inf], np.nan)
+    out["Prioridad_correccion_precio"] = np.select(
+        [out["Alerta_precio_anterior"].isin(["UNIDADES SIN VENTA", "VENTA SIN UNIDADES VALIDAS", "SIN REFERENCIA SKU"]),
+         out["Factor_inconsistencia_precio"].ge(3.0),
+         out["Factor_inconsistencia_precio"].ge(1.5),
+         out["Alerta_precio_anterior"].ne("SIN ALERTA")],
+        ["P1 - CRITICA", "P1 - CRITICA", "P2 - ALTA", "P3 - MEDIA"],
+        default="P4 - SIN ALERTA"
+    )
+    out["Precio_pred"] = precio
+    out["Unidades_pred"] = venta.div(precio.where(precio.gt(0))).mask(venta.eq(0), 0.0)
+    out["Venta_estructural"] = (out["Unidades_pred"] * precio).mask(venta.eq(0), 0.0)
+    out["Diferencia_unidades"] = out["Unidades_pred"] - anterior
+    return out
+
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="forecast-chocolate-mesa-nov-menos-9-4-v5"):
+def generar_forecast(df, version_modelo="forecast-prioridad-precio-implicito-v7"):
     """Genera forecast para todos los SKU presentes en ventas 2026.
 
     Los SKU activos desde agosto 2026 forman el universo base. Los SKU presentes
@@ -865,12 +924,8 @@ def generar_forecast(df, version_modelo="forecast-chocolate-mesa-nov-menos-9-4-v
                     meta.get("COMBOS", 0),
                 )
             )
-            # Reconciliacion obligatoria: las unidades publicadas se derivan de la
-            # venta monetaria final y de un precio consistente con el historial.
+            # La salida independiente se guarda para auditar antes de reconciliar.
             unidades_modelo = float(unid)
-            unidades_reconciliadas, precio_reconciliado = reconciliar_unidades_con_venta(
-                hist, final, precio_prom
-            )
             filas.append({
                 "CODIGO": str(codigo),
                 "DESCRIPCION": str(meta.get("DESCRIPCION", "")),
@@ -883,11 +938,11 @@ def generar_forecast(df, version_modelo="forecast-chocolate-mesa-nov-menos-9-4-v
                 "Meses_sin_actividad_a_octubre": int(meses_sin_actividad),
                 "Venta_directa": float(vd),
                 "Unidades_modelo_sin_reconciliar": unidades_modelo,
-                "Unidades_pred": float(unidades_reconciliadas),
+                "Unidades_pred": unidades_modelo,
                 "Precio_modelo": float(precio_prom),
-                "Precio_pred": float(precio_reconciliado),
+                "Precio_pred": float(precio_prom),
                 "Venta_estructural_modelo": float(estructural),
-                "Venta_estructural": float(unidades_reconciliadas * precio_reconciliado),
+                "Venta_estructural": float(estructural),
                 "Prediccion_base": float(base),
                 "Referencia_ultimo_ano": diag["Referencia_ultimo_ano"],
                 "Crecimiento_YTD": diag["Crecimiento_YTD"],
@@ -905,8 +960,13 @@ def generar_forecast(df, version_modelo="forecast-chocolate-mesa-nov-menos-9-4-v
                 "Prediccion_final": float(final),
             })
     resultado = pd.DataFrame(filas)
+    if resultado.empty:
+        return resultado
     resultado = ajustar_noviembre_chocolate_mesa(resultado)
-    return ajustar_diciembre_lacteos_18(resultado)
+    resultado = ajustar_diciembre_lacteos_18(resultado)
+    return auditar_y_reconciliar_unidades(
+        resultado, referencias_precio_observado(df, 202610), "Unidades_modelo_sin_reconciliar"
+    )
 
 
 def cargar_venta_semanal_noviembre(archivo):
@@ -1116,21 +1176,21 @@ if archivos:
         col_boton, _ = st.columns([1, 2])
         with col_boton:
             if st.button("Limpiar forecast anterior"):
-                st.session_state.pop("forecast_2026_chocolate_mesa_nov_menos_9_4_v5", None)
+                st.session_state.pop("forecast_2026_prioridad_precio_implicito_v7", None)
                 st.cache_data.clear()
                 st.cache_resource.clear()
                 st.rerun()
 
-        if "forecast_2026_chocolate_mesa_nov_menos_9_4_v5" not in st.session_state:
+        if "forecast_2026_prioridad_precio_implicito_v7" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
         if st.button("Generar forecast final Nov-Dic 2026", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
-                st.session_state["forecast_2026_chocolate_mesa_nov_menos_9_4_v5"] = generar_forecast(df)
+                st.session_state["forecast_2026_prioridad_precio_implicito_v7"] = generar_forecast(df)
             st.rerun()
 
-        if "forecast_2026_chocolate_mesa_nov_menos_9_4_v5" in st.session_state:
-            forecast = st.session_state["forecast_2026_chocolate_mesa_nov_menos_9_4_v5"]
+        if "forecast_2026_prioridad_precio_implicito_v7" in st.session_state:
+            forecast = st.session_state["forecast_2026_prioridad_precio_implicito_v7"]
             if forecast.empty:
                 st.error("No se encontraron SKU activos con datos recientes de 2026.")
                 st.stop()
@@ -1667,9 +1727,69 @@ if archivos:
             # ------------------------------------------------------------------
             # Tabla resumen: Categoría, Código, Descripción, Nov 2026, Dic 2026
             # ------------------------------------------------------------------
+            universo_tabla = universo if producto == "TODOS" else universo.loc[universo["CODIGO"].astype(str).eq(producto)]
+            with st.expander("Auditoría de equivalencia: ventas, unidades y precio"):
+                st.caption("Precio implícito anterior = venta final / unidades originales de CatBoost. "
+                           "El precio de referencia se calcula con ventas y unidades observadas del mismo código. "
+                           "Las referencias antiguas o con pocos meses requieren revisión.")
+                cols_aud = ["CATEGORIA", "CODIGO", "DESCRIPCION", "Periodo", "Prediccion_final",
+                            "Unidades_antes_validacion", "Precio_implicito_anterior", "Precio_referencia_SKU",
+                            "Unidades_pred", "Diferencia_unidades", "Factor_inconsistencia_precio",
+                            "Prioridad_correccion_precio", "Alerta_precio_anterior",
+                            "Calidad_referencia_precio", "Meses_precio_validos", "Ultimo_periodo_precio",
+                            "Meses_precio_atipicos"]
+                aud = universo_tabla[cols_aud].copy()
+                prioridad_orden = {"P1 - CRITICA": 1, "P2 - ALTA": 2, "P3 - MEDIA": 3, "P4 - SIN ALERTA": 4}
+                aud["Orden_prioridad"] = aud["Prioridad_correccion_precio"].map(prioridad_orden).fillna(5)
+                aud = aud.sort_values(["Orden_prioridad", "Factor_inconsistencia_precio"], ascending=[True, False])
+                resumen_cat = aud.groupby(["CATEGORIA", "Periodo"], as_index=False).agg(
+                    Venta_MXN=("Prediccion_final", "sum"),
+                    Unidades_antes=("Unidades_antes_validacion", "sum"),
+                    Unidades_corregidas=("Unidades_pred", "sum"),
+                    Precio_implicito_antes=("Precio_implicito_anterior", "median"),
+                    Precio_referencia_mediana=("Precio_referencia_SKU", "median"),
+                    Factor_inconsistencia_mediano=("Factor_inconsistencia_precio", "median"),
+                    Factor_inconsistencia_maximo=("Factor_inconsistencia_precio", "max"),
+                    SKU_analizados=("CODIGO", "nunique"),
+                    Casos_P1=("Prioridad_correccion_precio", lambda s: int((s == "P1 - CRITICA").sum())),
+                    Casos_P2=("Prioridad_correccion_precio", lambda s: int((s == "P2 - ALTA").sum())),
+                )
+                resumen_cat["Precio_categoria_antes"] = resumen_cat["Venta_MXN"].div(
+                    resumen_cat["Unidades_antes"].where(resumen_cat["Unidades_antes"].gt(0))
+                )
+                resumen_cat["Precio_categoria_corregido"] = resumen_cat["Venta_MXN"].div(
+                    resumen_cat["Unidades_corregidas"].where(resumen_cat["Unidades_corregidas"].gt(0))
+                )
+                resumen_cat["Prioridad_categoria"] = np.select(
+                    [resumen_cat["Casos_P1"].gt(0) | resumen_cat["Factor_inconsistencia_mediano"].ge(3.0),
+                     resumen_cat["Casos_P2"].gt(0) | resumen_cat["Factor_inconsistencia_mediano"].ge(1.5)],
+                    ["P1 - CRITICA", "P2 - ALTA"], default="P3 - MONITOREO"
+                )
+                resumen_cat["Orden"] = resumen_cat["Prioridad_categoria"].map(
+                    {"P1 - CRITICA": 1, "P2 - ALTA": 2, "P3 - MONITOREO": 3}
+                )
+                resumen_cat = resumen_cat.sort_values(
+                    ["Orden", "Casos_P1", "Factor_inconsistencia_mediano", "Venta_MXN"],
+                    ascending=[True, False, False, False]
+                ).drop(columns="Orden")
+                st.markdown("#### Prioridad por categoría")
+                st.dataframe(resumen_cat, hide_index=True, use_container_width=True)
+                st.download_button(
+                    "Descargar prioridad de corrección por categoría CSV",
+                    resumen_cat.to_csv(index=False).encode("utf-8-sig"),
+                    "prioridad_correccion_precio_por_categoria.csv", "text/csv"
+                )
+                alertas = aud["Alerta_precio_anterior"].ne("SIN ALERTA") | aud["Calidad_referencia_precio"].ne("HISTORICO RECIENTE")
+                solo = st.checkbox("Mostrar solo casos para revisión", value=True, key="solo_alertas_equivalencia")
+                st.dataframe(aud.loc[alertas] if solo else aud, hide_index=True, use_container_width=True)
+                aud_descarga = aud.drop(columns="Orden_prioridad")
+                st.download_button("Descargar auditoría de equivalencia CSV", aud_descarga.to_csv(index=False).encode("utf-8-sig"),
+                                   "auditoria_equivalencia_forecast.csv", "text/csv")
+            if universo_tabla["Unidades_pred"].isna().any():
+                st.warning("Hay SKU sin precio histórico válido. El total de unidades del periodo queda sin estimar; el importe sí incluye todos los SKU seleccionados.")
             st.markdown("### Tabla resumen: predicción por SKU (Nov-Dic 2026)")
             st.caption(
-                "Incluye ventas y unidades reconciliadas: Unidades = Predicción monetaria / Precio promedio robusto. "
+                "Unidades = venta monetaria final / mediana de precios observados del mismo SKU. Sin precio del SKU, las unidades quedan sin estimar. "
                 "La venta semanal está agregada por categoría; los escenarios por SKU se distribuyen "
                 "según la participación monetaria de cada SKU."
             )
@@ -1692,12 +1812,12 @@ if archivos:
                 202612: "Prediccion_Dic_2026",
             })
 
-            # Agrega las unidades predichas por el modelo CatBoost de UNIDADES.
+            # Agrega unidades reconciliadas con precio observado del SKU.
             tabla_unidades_sku = (
                 universo.groupby(
                     ["CATEGORIA", "CODIGO", "DESCRIPCION", "Periodo"],
                     as_index=False,
-                )["Unidades_pred"].sum()
+                )["Unidades_pred"].sum(min_count=1)
                 .pivot(
                     index=["CATEGORIA", "CODIGO", "DESCRIPCION"],
                     columns="Periodo",
@@ -1721,11 +1841,19 @@ if archivos:
                 "Unidades_Pred_Nov_2026", "Unidades_Pred_Dic_2026",
             ]:
                 if col not in tabla_sku.columns:
-                    tabla_sku[col] = 0.0
+                    tabla_sku[col] = np.nan
                 tabla_sku[col] = pd.to_numeric(
                     tabla_sku[col], errors="coerce"
-                ).fillna(0.0)
+                )
+                if col.startswith("Prediccion_"):
+                    tabla_sku[col] = tabla_sku[col].fillna(0.0)
 
+            tabla_sku["Precio_Implicito_Nov_2026"] = tabla_sku["Prediccion_Nov_2026"].div(
+                tabla_sku["Unidades_Pred_Nov_2026"].where(tabla_sku["Unidades_Pred_Nov_2026"].gt(0))
+            )
+            tabla_sku["Precio_Implicito_Dic_2026"] = tabla_sku["Prediccion_Dic_2026"].div(
+                tabla_sku["Unidades_Pred_Dic_2026"].where(tabla_sku["Unidades_Pred_Dic_2026"].gt(0))
+            )
             tabla_sku["Total_NovDic"] = (
                 tabla_sku["Prediccion_Nov_2026"] + tabla_sku["Prediccion_Dic_2026"]
             )
@@ -1797,29 +1925,38 @@ if archivos:
                 ["CATEGORIA", "CODIGO"]
             ).reset_index(drop=True)
 
+            if producto != "TODOS":
+                tabla_sku = tabla_sku.loc[tabla_sku["CODIGO"].astype(str).eq(producto)].copy()
+
             # Fila de totales al final
             fila_total = pd.DataFrame([{
                 "CATEGORIA": "TOTAL",
                 "CODIGO": "",
                 "DESCRIPCION": "",
                 "Prediccion_Nov_2026": tabla_sku["Prediccion_Nov_2026"].sum(),
-                "Unidades_Pred_Nov_2026": tabla_sku["Unidades_Pred_Nov_2026"].sum(),
+                "Unidades_Pred_Nov_2026": tabla_sku["Unidades_Pred_Nov_2026"].sum(skipna=False),
                 "Monto_Venta_Semana_Prediccion_SKU_Estimado": tabla_sku["Monto_Venta_Semana_Prediccion_SKU_Estimado"].sum(min_count=1),
                 "Unidades_Vendidas_Semana_Prediccion_SKU_Estimadas": tabla_sku["Unidades_Vendidas_Semana_Prediccion_SKU_Estimadas"].sum(min_count=1),
                 "Proyeccion_Ritmo_Nov_2026": tabla_sku["Proyeccion_Ritmo_Nov_2026"].sum(min_count=1),
                 "Nowcast_Ponderado_Nov_2026": tabla_sku["Nowcast_Ponderado_Nov_2026"].sum(min_count=1),
                 "Prediccion_Dic_2026": tabla_sku["Prediccion_Dic_2026"].sum(),
-                "Unidades_Pred_Dic_2026": tabla_sku["Unidades_Pred_Dic_2026"].sum(),
+                "Unidades_Pred_Dic_2026": tabla_sku["Unidades_Pred_Dic_2026"].sum(skipna=False),
                 "Total_NovDic": tabla_sku["Total_NovDic"].sum(),
-                "Total_Unidades_NovDic": tabla_sku["Total_Unidades_NovDic"].sum(),
+                "Total_Unidades_NovDic": tabla_sku["Total_Unidades_NovDic"].sum(skipna=False),
                 "Participacion_SKU_Categoria": np.nan,
                 "Participacion_Unidades_SKU_Categoria": np.nan,
             }])
+            for mes in ("Nov", "Dic"):
+                unidades_total = fila_total[f"Unidades_Pred_{mes}_2026"]
+                fila_total[f"Precio_Implicito_{mes}_2026"] = fila_total[f"Prediccion_{mes}_2026"].div(
+                    unidades_total.where(unidades_total.gt(0))
+                )
             tabla_sku_mostrar = pd.concat([tabla_sku, fila_total], ignore_index=True)
 
             st.dataframe(
                 tabla_sku_mostrar.style.format({
                     "Prediccion_Nov_2026": "${:,.2f}",
+                    "Precio_Implicito_Nov_2026": "${:,.2f}",
                     "Unidades_Pred_Nov_2026": "{:,.0f}",
                     "Monto_Venta_Semana_Prediccion_SKU_Estimado": "${:,.2f}",
                     "Unidades_Vendidas_Semana_Prediccion_SKU_Estimadas": "{:,.0f}",
@@ -1828,10 +1965,11 @@ if archivos:
                     "Participacion_SKU_Categoria": "{:.2%}",
                     "Participacion_Unidades_SKU_Categoria": "{:.2%}",
                     "Prediccion_Dic_2026": "${:,.2f}",
+                    "Precio_Implicito_Dic_2026": "${:,.2f}",
                     "Unidades_Pred_Dic_2026": "{:,.0f}",
                     "Total_NovDic": "${:,.2f}",
                     "Total_Unidades_NovDic": "{:,.0f}",
-                }),
+                }, na_rep="—"),
                 use_container_width=True,
                 hide_index=True,
                 height=440,
@@ -1845,7 +1983,7 @@ if archivos:
 
             st.download_button(
                 "Descargar forecast filtrado CSV",
-                universo.to_csv(index=False).encode("utf-8-sig"),
+                universo_tabla.to_csv(index=False).encode("utf-8-sig"),
                 "forecast_nov_dic_2026_universo_seleccionado.csv",
                 "text/csv",
             )
